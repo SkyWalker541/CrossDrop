@@ -21,7 +21,7 @@ The address you need is shown on this File Transfer screen.
 
 3 · Finish the setup on your KOReader device
 
-Switch to the device with KOReader, open the gear menu → CrossDrop, and in the
+Switch to the device with KOReader, open Tools → CrossDrop, and in the
 dashboard:
 
 - Connections → Set WiFi IP... — enter the address shown on the reader's

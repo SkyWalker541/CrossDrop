@@ -47,7 +47,7 @@ function ProgressDialog:init()
     end
     local target_line = TextWidget:new{
         text = target_txt,
-        face = Font:getFace("small"),
+        face = Font:getFace("smallinfofont"),
     }
 
     local bar_w = inner_w
@@ -79,14 +79,14 @@ function ProgressDialog:init()
     }
     self.meta_text = TextWidget:new{
         text = "",
-        face = Font:getFace("small"),
+        face = Font:getFace("smallinfofont"),
     }
 
     local header_row = VerticalGroup:new{
         align = "left",
         TextWidget:new{
             text = "Sending to CrossDrop",
-            face = Font:getFace("bold"),
+            face = Font:getFace("smallinfofontbold"),
             bold = true,
         },
         VerticalSpan:new{ width = sc(6) },

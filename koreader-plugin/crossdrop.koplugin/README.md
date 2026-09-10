@@ -11,7 +11,7 @@ required.
    reader to your Wi-Fi and makes it ready to receive — the reader's screen
    **shows its IP address** on that screen.
 2. On the device with the book (Kindle / Android / etc.), open the book in
-   KOReader, then open the **gear menu (main reader menu) → CrossDrop**. This
+   KOReader, then open **Tools** in the main reader menu → **CrossDrop**. This
    opens a full-screen, Storefront-style dashboard with three tabs:
    - **Connections** — the two ways to reach the reader, each with its own
      stored IP:

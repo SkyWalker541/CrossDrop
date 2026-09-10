@@ -232,7 +232,7 @@ function HomeDialog:header(text)
         bordersize = 0,
         TextWidget:new{
             text = text,
-            face = Font:getFace("small"),
+            face = Font:getFace("smallinfofont"),
         },
     }
 end
@@ -311,7 +311,7 @@ function HomeDialog:renderConnections()
 
     vg:addWidget(TextWidget:new{
         text = _("Books land in the CrossDropped Files folder on the reader's card.\nNothing to pick \226\128\148 Send tab handles the rest."),
-        face = Font:getFace("smallitalic"),
+        face = Font:getFace("smallinfofont"),
     })
 
     return vg
@@ -336,7 +336,7 @@ function HomeDialog:renderSend()
     else
         vg:addWidget(TextWidget:new{
             text = _("No book open yet.\n\nOpen a book in KOReader and it appears here,\nready to send to the CrossDrop reader."),
-            face = Font:getFace("small"),
+            face = Font:getFace("smallinfofont"),
         })
     end
 
@@ -359,7 +359,7 @@ function HomeDialog:renderSend()
     if reach.wifi ~= "ok" and reach.hotspot ~= "ok" then
         vg:addWidget(TextWidget:new{
             text = _("Send probes WiFi first, then the HotSpot, and uses whichever answers.\nNo connection checked yet or none reachable."),
-            face = Font:getFace("smallitalic"),
+            face = Font:getFace("smallinfofont"),
         })
     end
 
@@ -374,7 +374,7 @@ function HomeDialog:renderHistory()
     if #list == 0 then
         vg:addWidget(TextWidget:new{
             text = _("Nothing sent yet.\n\nBooks you send show up here with the\nCrossDrop reader, folder, size, and time."),
-            face = Font:getFace("small"),
+            face = Font:getFace("smallinfofont"),
         })
         return vg
     end
@@ -405,7 +405,7 @@ function HomeDialog:renderHistory()
     if #list > shown then
         vg:addWidget(TextWidget:new{
             text = string.format(_("\226\128\166 plus %d more (only the last 8 are listed)"), #list - shown),
-            face = Font:getFace("smallitalic"),
+            face = Font:getFace("smallinfofont"),
         })
     end
     vg:addWidget(self:row(_("Clear history"), {

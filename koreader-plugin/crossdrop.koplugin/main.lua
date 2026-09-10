@@ -502,8 +502,39 @@ function CROSSDROP:openHome()
     UIManager:show(homeModule():new{ plugin = self })
 end
 
+-- Pin the CrossDrop item at the top of the Tools menu (position 2, right under
+-- "Read Timer"), the same way the Storefront plugin does. Without this, the
+-- item is grouped with the other plugins at the bottom of Tools, sorted by
+-- sorting_hint ("tools") and alphabetical plugin name.
+local function injectCrossdropIntoToolsMenu()
+    local menu_orders = {
+        "ui/elements/reader_menu_order",
+        "ui/elements/filemanager_menu_order",
+    }
+    local function contains_id(tbl, id)
+        if type(tbl) ~= "table" then return false end
+        for _, val in pairs(tbl) do
+            if val == id then
+                return true
+            elseif type(val) == "table" and contains_id(val, id) then
+                return true
+            end
+        end
+        return false
+    end
+    for _, order_path in ipairs(menu_orders) do
+        local ok, order = pcall(require, order_path)
+        if ok and type(order) == "table" and type(order.tools) == "table" then
+            if not contains_id(order, "crossdrop") then
+                table.insert(order.tools, 2, "crossdrop")
+            end
+        end
+    end
+end
+
 -- The CrossDrop item opens the dashboard directly; all actions live there.
 function CROSSDROP:addToMainMenu(menu_items)
+    injectCrossdropIntoToolsMenu()
     menu_items.crossdrop = {
         text = _("CrossDrop"),
         sorting_hint = "tools",
