@@ -1,18 +1,28 @@
 --[[
 CrossDrop — KOReader plugin.
 
-Adds a "CrossDrop" entry to the reader menu that hands the currently open book
-to the reader over the local network. It uses only the built-in web-server
-endpoints — no custom firmware required:
+Adds a "CrossDrop" entry to the reader menu that opens a full-screen
+dashboard and can hand the currently open book to the reader over the local
+network. It uses only the built-in web-server endpoints — no custom firmware:
 
     GET   /api/status          device info + connection test
-    GET   /api/files?path=/    remote folder browser (destination picker)
-    MKCOL /<folder>            create a destination folder if needed
-    PUT   /<folder>/<file>     stream the book, chunk by chunk
+    MKCOL /CrossDropped Files  create the fixed destination folder if needed
+    PUT   /CrossDropped Files/<file>   stream the book, chunk by chunk
+
+Every transfer lands in the fixed **CrossDropped Files** folder on the reader's
+SD card — there is no folder picker, nothing to configure.
+
+Two connections are supported, matching the reader's two File Transfer modes:
+
+    WiFi          File Transfer → Join Network   (address shown on screen)
+    HotSpot       File Transfer → Create Hotspot (always 192.168.4.1)
+
+Each has its own stored IP. Sending a book probes both (in that order) and
+streams to whichever answers — so a user can move between a router network and
+the reader's own hotspot without re-entering anything.
 
 On the reader side, the matching "CrossDrop" SD plugin (the `crossdrop-plugin`
-folder on the SD card) is a pure instructions screen (Settings → System →
-Plugins) that explains how to install and use this plugin.
+folder on the SD card) is a setup-guide screen (Settings → System → Plugins).
 
 Pure LuaSocket (part of KOReader) — no external dependencies, and the file is
 streamed chunk-by-chunk from disk so devices with little RAM (like a Kindle)
@@ -21,7 +31,6 @@ the chunks stream (the same forceRePaint technique the Storefront plugin uses).
 ]]
 
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
-local ConfirmBox = require("ui/widget/confirmbox")
 local InputDialog = require("ui/widget/inputdialog")
 local InfoMessage = require("ui/widget/infomessage")
 local Notification = require("ui/widget/notification")
@@ -30,33 +39,8 @@ local lfs = require("libs/libkoreader-lfs")
 local logger = require("logger")
 local _ = require("gettext")
 
-local InputContainer = require("ui/widget/container/inputcontainer")
-
--- The dialog widgets (font, buttons, frames…) are required lazily, inside the
--- dialogs that use them, so loading this plugin only depends on the core
--- modules above — exactly like the old Send-to-Xteink plugin did.
-local loaded_widgets
-local function widgets()
-    if not loaded_widgets then
-        local Device = require("device")
-        loaded_widgets = {
-            Blitbuffer = require("ffi/blitbuffer"),
-            Button = require("ui/widget/button"),
-            ButtonTable = require("ui/widget/buttontable"),
-            CenterContainer = require("ui/widget/container/centercontainer"),
-            Device = Device,
-            Font = require("ui/font"),
-            FrameContainer = require("ui/widget/container/framecontainer"),
-            MovableContainer = require("ui/widget/container/movablecontainer"),
-            Size = require("ui/size"),
-            TextWidget = require("ui/widget/textwidget"),
-            VerticalGroup = require("ui/widget/verticalgroup"),
-            VerticalSpan = require("ui/widget/verticalspan"),
-            Screen = Device.screen,
-        }
-    end
-    return loaded_widgets
-end
+local DEFAULT_HOTSPOT_IP = "192.168.4.1"
+local DEFAULT_FOLDER = "/CrossDropped Files"
 
 -- UI extras (toast, live progress, full-screen Home) live in sibling modules
 -- that are only required once a dialog is opened, never at plugin load.
@@ -127,56 +111,28 @@ local function base_url(target)
     return string.format("http://%s:%d", target.ip, target.port or 80)
 end
 
--- Parent of a path; "/Books/sub" -> "/Books", "/Books" -> "/", "/" -> "/".
-local function parent_path(path)
-    local trimmed = tostring(path or ""):gsub("/+$", "")
-    if trimmed == "" then
-        return "/"
-    end
-    local parent = trimmed:match("^(.*)/[^/]+$")
-    return parent and parent or "/"
+-- ────────────────────── connections (WiFi + HotSpot) ─────────────────────
+
+local function hotspotIp()
+    return G_reader_settings:readSetting("crossdrop_hotspot_ip") or DEFAULT_HOTSPOT_IP
 end
 
--- Persisted history of recently used send targets (max 10, deduped by IP).
-local function getIpList()
-    local list = G_reader_settings:readSetting("crossdrop_ips")
-    return (type(list) == "table") and list or {}
+local function wifiIp()
+    return G_reader_settings:readSetting("crossdrop_wifi_ip")
 end
 
-local function removeFromIpList(ip)
-    local list = getIpList()
-    local newlist = {}
-    for _, target in ipairs(list) do
-        if target.ip ~= ip then
-            newlist[#newlist + 1] = target
-        end
-    end
-    G_reader_settings:saveSetting("crossdrop_ips", newlist)
-    if G_reader_settings:readSetting("crossdrop_ip") == ip then
-        G_reader_settings:saveSetting("crossdrop_ip", nil)
+local function setIp(kind, ip)
+    ip = tostring(ip or ""):match("^%s*(.-)%s*$") or ""
+    if kind == "hotspot" then
+        G_reader_settings:saveSetting("crossdrop_hotspot_ip",
+            (ip == "" and DEFAULT_HOTSPOT_IP or ip))
+    else
+        G_reader_settings:saveSetting("crossdrop_wifi_ip", (ip == "" and nil or ip))
     end
 end
 
-local function clearIpList()
-    G_reader_settings:saveSetting("crossdrop_ips", {})
-    G_reader_settings:saveSetting("crossdrop_ip", nil)
-end
-
-local function addToIpList(target)
-    if not target or not target.ip then return end
-    local list = getIpList()
-    local newlist = {}
-    for _, t in ipairs(list) do
-        if t.ip ~= target.ip then newlist[#newlist + 1] = t end
-    end
-    table.insert(newlist, 1, {
-        ip = target.ip,
-        port = target.port or 80,
-        folder = target.folder or "/Books",
-        ts = os.time(),
-    })
-    while #newlist > 10 do table.remove(newlist) end
-    G_reader_settings:saveSetting("crossdrop_ips", newlist)
+local function connectionLabel(kind)
+    return kind == "hotspot" and _("HotSpot") or _("WiFi")
 end
 
 -- ────────────────────── sent-books history ──────────────────────────────
@@ -199,15 +155,20 @@ local function addSentEntry(entry)
     saveSentList(list)
 end
 
-local function fmt_reltime(ts)
-    local dt = os.time() - (tonumber(ts) or 0)
-    if dt < 60 then return _("just now") end
-    if dt < 3600 then return string.format(_("%d m ago"), math.floor(dt / 60)) end
-    if dt < 86400 then return string.format(_("%d h ago"), math.floor(dt / 3600)) end
-    return string.format(_("%d d ago"), math.floor(dt / 86400))
+-- Exported for the Home dashboard: current history + a clear action.
+function CROSSDROP:sentList()
+    return getSentList()
+end
+
+function CROSSDROP:clearSent()
+    saveSentList({})
 end
 
 function CROSSDROP:init()
+    -- 1.x migration: the single crossdrop_ip setting becomes the WiFi slot.
+    if not wifiIp() and G_reader_settings:readSetting("crossdrop_ip") then
+        G_reader_settings:saveSetting("crossdrop_wifi_ip", G_reader_settings:readSetting("crossdrop_ip"))
+    end
     if self.ui and self.ui.menu then
         self.ui.menu:registerToMainMenu(self)
     else
@@ -216,11 +177,13 @@ function CROSSDROP:init()
 end
 
 -- Generic HTTP call. Returns (ok, code, body). On a network failure `code`
--- carries LuaSocket's error string and `ok` is nil.
-function CROSSDROP:req(method, url, headers, source_fn)
+-- carries LuaSocket's error string and `ok` is nil. `timeout` is the socket
+-- timeout in seconds (default 10; probes use a short 3s so failure is snappy).
+function CROSSDROP:req(method, url, headers, source_fn, timeout)
     if not socket_available() then
         return nil, "LuaSocket unavailable", nil
     end
+    local deadline = timeout or 10
     local ok, body, code = pcall(http.request, {
         url = url,
         method = method,
@@ -230,7 +193,7 @@ function CROSSDROP:req(method, url, headers, source_fn)
             local s = socket.tcp()
             if s then
                 pcall(function()
-                    s:settimeout(10)
+                    s:settimeout(deadline)
                 end)
             end
             return s
@@ -248,9 +211,68 @@ function CROSSDROP:req(method, url, headers, source_fn)
     return nil, tostring(code or body or "unknown error"), body
 end
 
+-- The two connections in send order: WiFi first, then the reader hotspot.
+-- Both always target the fixed CrossDropped Files folder on the reader's card.
+function CROSSDROP:configuredTargets()
+    local port = tonumber(G_reader_settings:readSetting("crossdrop_port") or 80) or 80
+    local list = {}
+    local wifi = wifiIp()
+    if wifi then
+        list[#list + 1] = { kind = "wifi", ip = wifi, port = port, folder = DEFAULT_FOLDER }
+    end
+    list[#list + 1] = { kind = "hotspot", ip = hotspotIp(), port = port, folder = DEFAULT_FOLDER }
+    return list
+end
+
+-- Primary target (WiFi when set, otherwise HotSpot). Used by dialogs that
+-- operate on "the" device (status checks, checks).
+function CROSSDROP:resolveTarget()
+    return self:configuredTargets()[1]
+end
+
+-- Probe one connection with GET /api/status. Returns (true, info_table_or_nil)
+-- or (nil, nil, error_text). The parsed JSON is optional — a device that
+-- answers with a non-JSON body still counts as reachable.
+function CROSSDROP:probeTarget(target)
+    local ok, code, body = self:req("GET", base_url(target) .. "/api/status", nil, nil, 3)
+    if ok then
+        local info
+        if JSON then
+            local okj, parsed = pcall(JSON.decode, body)
+            if okj and type(parsed) == "table" then
+                info = parsed
+            end
+        end
+        return true, info
+    end
+    return nil, nil, (type(code) == "number")
+        and string.format("device replied %s", tostring(code))
+        or tostring(code or "unknown error")
+end
+
+-- Probe every configured connection with GET /api/status; return the first
+-- that answers. Sends and "Check device" use this so either connection works.
+function CROSSDROP:probeReachable()
+    for _, target in ipairs(self:configuredTargets()) do
+        local ok, _ = self:probeTarget(target)
+        if ok then
+            return target
+        end
+    end
+    return nil
+end
+
+function CROSSDROP:saveTarget(target)
+    if not target or not target.ip then return end
+    setIp(target.kind or "wifi", target.ip)
+    if target.port then
+        G_reader_settings:saveSetting("crossdrop_port", target.port)
+    end
+end
+
 -- Make sure the destination folder exists (MKCOL; 405 = already exists).
 function CROSSDROP:ensureFolder(target)
-    local folder = tostring(target.folder or "/Books")
+    local folder = tostring(target.folder or DEFAULT_FOLDER)
     if folder == "" or folder == "/" then
         return true
     end
@@ -267,141 +289,6 @@ function CROSSDROP:ensureFolder(target)
     return nil, tostring(code or errbody or "unknown error")
 end
 
--- List the directories inside a remote folder. Returns (true, list) or (nil, err).
-function CROSSDROP:listFolders(target, folder)
-    local encoded = ""
-    if folder and folder ~= "" and folder ~= "/" then
-        encoded = encode_path(folder):gsub("^/", "")
-    end
-    local url = base_url(target) .. "/api/files?path=" .. encoded
-    local ok, code, body = self:req("GET", url)
-    if not ok then
-        return nil, (type(code) == "number")
-            and string.format("device replied %s", tostring(code))
-            or tostring(code or "unknown error")
-    end
-    if not JSON then
-        return nil, "JSON parser unavailable"
-    end
-    local parsed, perr = JSON.decode(body)
-    if type(parsed) ~= "table" then
-        return nil, "unexpected device response" .. (perr and (" (" .. tostring(perr) .. ")") or "")
-    end
-    local dirs = {}
-    for _, item in ipairs(parsed) do
-        if type(item) == "table" and item.isDirectory and type(item.name) == "string" then
-            dirs[#dirs + 1] = item.name
-        end
-    end
-    table.sort(dirs, function(a, b) return a < b end)
-    return true, dirs
-end
-
--- Build the CrossDrop submenu. `keep_menu_open = true` keeps the reader menu
--- open underneath dialogs/browser, so Back steps out one level instead of
--- closing everything.
-function CROSSDROP:buildSubItems()
-    local sub_items = {
-        {
-            text = _("CrossDrop home..."),
-            keep_menu_open = true,
-            callback = function() self:openHome() end,
-        },
-        {
-            text = _("Send current book"),
-            keep_menu_open = true,
-            callback = function() self:sendCurrentBook() end,
-        },
-    }
-    local list = getIpList()
-    if #list > 0 then
-        sub_items[#sub_items + 1] = {text = "─" .. _("Saved devices") .. "─", enabled = false}
-        for _, t in ipairs(list) do
-            local label = t.ip
-            if t.port and t.port ~= 80 then label = label .. ":" .. t.port end
-            if t.folder and t.folder ~= "" and t.folder ~= "/" then
-                label = label .. "  → " .. t.folder
-            end
-            sub_items[#sub_items + 1] = {
-                text = label,
-                keep_menu_open = true,
-                callback = function()
-                    self:saveTarget(t)
-                    self:sendCurrentBook()
-                end,
-                hold_callback = function()
-                    UIManager:show(ConfirmBox:new{
-                        text = _("Remove saved device ") .. label .. "?",
-                        ok_text = _("Remove"),
-                        ok_callback = function()
-                            removeFromIpList(t.ip)
-                            self:refreshMenu()
-                        end,
-                    })
-                end,
-            }
-        end
-        sub_items[#sub_items + 1] = {
-            text = _("Delete all stored devices"),
-            keep_menu_open = true,
-            callback = function()
-                UIManager:show(ConfirmBox:new{
-                    text = _("Forget all stored device addresses?"),
-                    ok_text = _("Delete all"),
-                    ok_callback = function()
-                        clearIpList()
-                        self:refreshMenu()
-                    end,
-                })
-            end,
-        }
-    end
-    sub_items[#sub_items + 1] = {text = "─" .. _("Device") .. "─", enabled = false}
-    sub_items[#sub_items + 1] = {
-        text = _("Device IP..."),
-        keep_menu_open = true,
-        callback = function() self:editIp() end,
-    }
-    sub_items[#sub_items + 1] = {
-        text = _("CrossDrop hotspot (192.168.4.1)"),
-        keep_menu_open = true,
-        callback = function() self:useHotspot() end,
-    }
-    sub_items[#sub_items + 1] = {
-        text = _("Destination folder..."),
-        keep_menu_open = true,
-        callback = function() self:pickFolder() end,
-    }
-    sub_items[#sub_items + 1] = {
-        text = _("Check device..."),
-        keep_menu_open = true,
-        callback = function() self:statusDialog() end,
-    }
-    sub_items[#sub_items + 1] = {
-        text = _("Sent books..."),
-        keep_menu_open = true,
-        callback = function() self:sentBooksDialog() end,
-    }
-    return sub_items
-end
-
-function CROSSDROP:addToMainMenu(menu_items)
-    menu_items.crossdrop = {
-        text = _("CrossDrop"),
-        sorting_hint = "tools",
-        sub_item_table = self:buildSubItems(),
-    }
-end
-
--- Rebuild the currently open CrossDrop submenu in place (e.g. after deleting a
--- saved device) instead of closing the whole menu.
-function CROSSDROP:refreshMenu()
-    local menu = self.ui and self.ui.menu
-    if not menu then return end
-    menu.item_table = self:buildSubItems()
-    menu:updateItems(1)
-end
-
 -- Current book file path (only file-based documents can be sent).
 function CROSSDROP:currentBookPath()
     local doc = self.ui and self.ui.document
@@ -411,39 +298,89 @@ function CROSSDROP:currentBookPath()
     return doc.file
 end
 
--- Resolve the send target from stored settings, or nil when not configured.
-function CROSSDROP:resolveTarget()
-    local ip = G_reader_settings:readSetting("crossdrop_ip")
-    if not ip then
-        return nil
+-- The "Tried:" section for the no-connection error message.
+function CROSSDROP:connectionSummary()
+    local lines = {}
+    for _, t in ipairs(self:configuredTargets()) do
+        lines[#lines + 1] = "  " .. connectionLabel(t.kind) .. "  " .. t.ip ..
+            "  →  " .. (t.folder or DEFAULT_FOLDER)
     end
-    return {
-        ip = ip,
-        port = tonumber(G_reader_settings:readSetting("crossdrop_port") or 80),
-        folder = G_reader_settings:readSetting("crossdrop_folder") or "/Books",
-        hostname = "CrossDrop",
-    }
+    return table.concat(lines, "\n")
 end
 
-function CROSSDROP:saveTarget(target)
-    G_reader_settings:saveSetting("crossdrop_ip", target.ip)
-    G_reader_settings:saveSetting("crossdrop_port", target.port or 80)
-    G_reader_settings:saveSetting("crossdrop_folder", target.folder or "/Books")
-    addToIpList(target)
+-- Edit the IP for one connection ("wifi" or "hotspot").
+function CROSSDROP:editIp(kind)
+    local is_hotspot = kind == "hotspot"
+    local current = is_hotspot and hotspotIp() or (wifiIp() or "")
+    local ip_dialog
+    ip_dialog = InputDialog:new{
+        title = (is_hotspot and _("HotSpot IP (File Transfer → Create Hotspot)")
+            or _("WiFi IP (File Transfer → Join Network)")),
+        input = current,
+        type = "text",
+        buttons = {
+            {
+                {
+                    text = _("Save"),
+                    callback = function()
+                        local value = ip_dialog:getInputText()
+                        if value then
+                            setIp(kind, value)
+                        end
+                        UIManager:close(ip_dialog)
+                    end,
+                },
+            },
+            {
+                {
+                    text = _("Cancel"),
+                    callback = function()
+                        UIManager:close(ip_dialog)
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(ip_dialog)
 end
 
--- Quick-connect for when the reader acts as its own Wi-Fi hotspot. CrossPoint
--- (and Beta 8) run the AP on the ESP32 default 192.168.4.1 — no softAPConfig
--- override — so the reader is always reachable there while it is in hotspot
--- mode. Saves the target and immediately probes via statusDialog.
-function CROSSDROP:useHotspot()
-    local target = {
-        ip = "192.168.4.1",
-        port = 80,
-        folder = G_reader_settings:readSetting("crossdrop_folder") or "/Books",
-    }
-    self:saveTarget(target)
-    self:statusDialog()
+-- GET /api/status on the first reachable connection and show the result.
+function CROSSDROP:statusDialog()
+    local target = self:probeReachable()
+    if not target then
+        UIManager:show(Notification:new{
+            text = _("Could not reach the CrossDrop reader.\n\nTried:\n") .. self:connectionSummary() ..
+                _("\n\nSame Wi-Fi? Correct IP? File Transfer open?"),
+            timeout = 6,
+        })
+        return
+    end
+    local ok, info = self:probeTarget(target)
+    if not ok then
+        UIManager:show(Notification:new{
+            text = _("Could not reach the CrossDrop reader: ") .. tostring(info or "network error") ..
+                _("\n\nSame Wi-Fi? Correct IP? File Transfer open?"),
+            timeout = 5,
+        })
+        return
+    end
+    local details
+    if type(info) == "table" then
+        details = string.format("%s:\nIP %s  ·  %s\nversion %s  ·  mode %s",
+            connectionLabel(target.kind),
+            tostring(info.ip or target.ip),
+            tostring(info.device or "CrossDrop reader"),
+            tostring(info.version or "?"),
+            tostring(info.mode or "?"))
+        if type(info.rssi) == "number" and info.mode == "STA" then
+            details = details .. string.format("\nWi-Fi RSSI %d dBm", info.rssi)
+        end
+    else
+        details = string.format("%s: %s", connectionLabel(target.kind), tostring(target.ip))
+    end
+    UIManager:show(InfoMessage:new{
+        text = _("CrossDrop device found:\n\n") .. details,
+    })
 end
 
 -- Stream a file to the target with an HTTP PUT. `on_progress(sent, total)` is
@@ -455,7 +392,7 @@ function CROSSDROP:putFile(target, file_path, on_progress)
     end
 
     local filename = file_path:match("([^/]+)$") or file_path
-    local url = base_url(target) .. encode_path(target.folder or "/Books") .. "/" .. url_encode_segment(filename)
+    local url = base_url(target) .. encode_path(target.folder or DEFAULT_FOLDER) .. "/" .. url_encode_segment(filename)
 
     local fh = io.open(file_path, "rb")
     if not fh then
@@ -492,6 +429,7 @@ function CROSSDROP:putFile(target, file_path, on_progress)
     return true, result
 end
 
+local progress_guard
 function CROSSDROP:sendCurrentBook()
     local book_path = self:currentBookPath()
     if not book_path then
@@ -501,10 +439,11 @@ function CROSSDROP:sendCurrentBook()
         return
     end
 
-    local target = self:resolveTarget()
+    local target = self:probeReachable()
     if not target then
         UIManager:show(InfoMessage:new{
-            text = _("No device configured.\n\nOn the reader open File Transfer → Join Network,\nnote the IP it shows, then set it here via\n\"Device IP...\" (or the CrossDrop home screen)."),
+            text = _("No CrossDrop reader reached.\n\nTried:\n") .. self:connectionSummary() ..
+                _("\n\nOpen File Transfer on the reader (Join Network for WiFi,\nor Create Hotspot), and keep this device on the same network."),
         })
         return
     end
@@ -531,15 +470,18 @@ function CROSSDROP:sendCurrentBook()
     if ok then
         addSentEntry({
             ts = os.time(),
+            kind = target.kind,
             ip = target.ip,
             port = target.port or 80,
-            folder = target.folder or "/Books",
+            folder = target.folder or DEFAULT_FOLDER,
             file = filename,
             size = book_size,
         })
-        toastModule().show(string.format(_("Book sent to %s  →  %s"),
-            tostring(target.ip), tostring(target.folder or "/Books")), 3)
-        logger.info("crossdrop: sent ", book_path, " to ", target.ip)
+        toastModule().show(string.format(_("Book sent  %s (WiFi  %s  →  %s)"),
+            tostring(filename),
+            tostring(target.ip),
+            tostring(target.folder or DEFAULT_FOLDER)), 3)
+        logger.info("crossdrop: sent ", book_path, " to ", target.kind, " ", target.ip)
     else
         toastModule().show(_("Send failed: ") .. tostring(result) ..
             _("\nCheck the reader has File Transfer open on the\nsame Wi-Fi network, and that the IP is correct."), 5)
@@ -547,509 +489,26 @@ function CROSSDROP:sendCurrentBook()
     end
 end
 
--- Open the full-screen CrossDrop home dashboard.
-function CROSSDROP:openHome()
-    UIManager:show(homeModule():new{ plugin = self })
-end
-
--- Set the target and immediately send the current book (used by the Home
--- screen rows and history re-send taps).
+-- Store a target and immediately send the current book (Home rows, history
+-- re-send taps).
 function CROSSDROP:sendTo(target)
     if not target or not target.ip then return end
     self:saveTarget(target)
     self:sendCurrentBook()
 end
 
--- Actions for a long-pressed saved device row in the Home screen.
-function CROSSDROP:deviceActions(target)
-    local ButtonDialog = require("ui/widget/buttondialog")
-    local ip = target.ip
-    if target.port and target.port ~= 80 then ip = ip .. ":" .. tostring(target.port) end
-    UIManager:show(ButtonDialog:new{
-        title = ip .. "  →  " .. (target.folder and target.folder ~= "" and target.folder or "/Books"),
-        buttons = {
-            {
-                {
-                    text = _("Send current book"),
-                    callback = function()
-                        self:sendTo(target)
-                    end,
-                },
-            },
-            {
-                {
-                    text = _("Check device..."),
-                    callback = function()
-                        self:statusDialog()
-                    end,
-                },
-                {
-                    text = _("Destination folder..."),
-                    callback = function()
-                        self:pickFolder()
-                    end,
-                },
-            },
-            {
-                {
-                    text = _("Edit IP..."),
-                    callback = function()
-                        self:editIp()
-                    end,
-                },
-                {
-                    text = _("Forget"),
-                    callback = function()
-                        UIManager:show(ConfirmBox:new{
-                            text = _("Remove saved device ") .. ip .. "?",
-                            ok_text = _("Remove"),
-                            ok_callback = function()
-                                removeFromIpList(target.ip)
-                                self:refreshMenu()
-                            end,
-                        })
-                    end,
-                },
-            },
-            {
-                {
-                    text = _("Close"),
-                    callback = function()
-                        UIManager:close(self.ui and self.ui.menu)
-                    end,
-                },
-            },
-        },
-    })
+-- Open the full-screen CrossDrop dashboard.
+function CROSSDROP:openHome()
+    UIManager:show(homeModule():new{ plugin = self })
 end
 
-function CROSSDROP:clearSentList()
-    saveSentList({})
-end
-
-function CROSSDROP:editIp()
-    local ip_dialog
-    ip_dialog = InputDialog:new{
-        title = _("Reader IP (File Transfer → Join Network)"),
-        input = G_reader_settings:readSetting("crossdrop_ip") or "",
-        type = "text",
-        buttons = {
-            {
-                {
-                    text = _("Save"),
-                    callback = function()
-                        local value = ip_dialog:getInputText()
-                        if value and value ~= "" then
-                            G_reader_settings:saveSetting("crossdrop_ip", value)
-                            addToIpList({ip = value, port = G_reader_settings:readSetting("crossdrop_port") or 80,
-                                folder = G_reader_settings:readSetting("crossdrop_folder") or "/Books"})
-                        else
-                            G_reader_settings:saveSetting("crossdrop_ip", nil)
-                        end
-                        UIManager:close(ip_dialog)
-                    end,
-                },
-                {
-                    text = _("Cancel"),
-                    callback = function()
-                        UIManager:close(ip_dialog)
-                    end,
-                },
-            },
-        },
+-- The CrossDrop item opens the dashboard directly; all actions live there.
+function CROSSDROP:addToMainMenu(menu_items)
+    menu_items.crossdrop = {
+        text = _("CrossDrop"),
+        sorting_hint = "tools",
+        callback = function() self:openHome() end,
     }
-    UIManager:show(ip_dialog)
-end
-
--- GET /api/status and show the result in a message.
-function CROSSDROP:statusDialog()
-    local target = self:resolveTarget()
-    if not target then
-        UIManager:show(InfoMessage:new{
-            text = _("No device configured.\n\nSet the IP address via \"Device IP...\"\n(first, on the reader: File Transfer → Join Network\n— the IP is shown on that screen)."),
-        })
-        return
-    end
-    local ok, code, body = self:req("GET", base_url(target) .. "/api/status")
-    if not ok then
-        UIManager:show(Notification:new{
-            text = _("Could not reach the CrossDrop reader: ") .. tostring(code or "network error") ..
-                _("\n\nSame Wi-Fi? Correct IP? File Transfer open?"),
-            timeout = 5,
-        })
-        return
-    end
-    local details = body or ""
-    if JSON then
-        local okj, parsed = pcall(JSON.decode, body)
-        if okj and type(parsed) == "table" then
-            details = string.format("IP %s  ·  %s\nversion %s  ·  mode %s",
-                tostring(parsed.ip or target.ip),
-                tostring(parsed.device or "CrossDrop reader"),
-                tostring(parsed.version or "?"),
-                tostring(parsed.mode or "?"))
-            if type(parsed.rssi) == "number" and parsed.mode == "STA" then
-                details = details .. string.format("\nWi-Fi RSSI %d dBm", parsed.rssi)
-            end
-        end
-    end
-    UIManager:show(InfoMessage:new{
-        text = _("CrossDrop device found:\n\n") .. details,
-    })
-end
-
--- Read-only log of books sent (shows reader, destination folder, size, time).
-function CROSSDROP:sentBooksDialog()
-    if #getSentList() == 0 then
-        UIManager:show(InfoMessage:new{
-            text = _("Nothing sent yet.\n\nBooks you send are logged here with the target\nCrossDrop reader, destination folder, and size."),
-        })
-        return
-    end
-    UIManager:show(SentBooksDialog:new{})
-end
-
--- Pick (and if needed create) the destination folder on the reader.
--- (FolderBrowser is declared before this so pickFolder can instantiate it.)
-local FolderBrowser = InputContainer:extend{
-    modal = true,
-    dismissable = false,
-    alignment = "center",
-}
-
-function CROSSDROP:pickFolder()
-    local target = self:resolveTarget()
-    if not target then
-        UIManager:show(InfoMessage:new{
-            text = _("Set the reader's IP address via \"Device IP...\" first."),
-        })
-        return
-    end
-    local browser = FolderBrowser:new{
-        builder = self,
-        target = target,
-        path = G_reader_settings:readSetting("crossdrop_folder") or "/Books",
-        onSelect = function(path)
-            self:saveTarget({ip = target.ip, port = target.port or 80, folder = path})
-        end,
-    }
-    UIManager:show(browser)
-end
-
--- ────────────────────────── remote folder browser ──────────────────────────
-
-function FolderBrowser:init()
-    local w = widgets()
-    local Screen = w.Screen
-    local TextWidget = w.TextWidget
-    local Font = w.Font
-    local Button = w.Button
-    local VerticalGroup = w.VerticalGroup
-    local ButtonTable = w.ButtonTable
-    local VerticalSpan = w.VerticalSpan
-    local FrameContainer = w.FrameContainer
-    local Blitbuffer = w.Blitbuffer
-    local Size = w.Size
-    local MovableContainer = w.MovableContainer
-    local CenterContainer = w.CenterContainer
-    local Device = w.Device
-    local max_height = Screen:getHeight()
-    local content_w = math.min(Screen:getWidth() - 60, 560)
-    local bw = content_w - 24
-
-    local rows = {}
-    local ok, list = self.builder:listFolders(self.target, self.path)
-    if ok then
-        local shown = 0
-        for i = 1, #list do
-            local name = list[i]
-            shown = shown + 1
-            rows[#rows + 1] = Button:new{
-                text = name,
-                width = bw,
-                callback = function()
-                    local newpath = (self.path == "/" and "" or self.path:gsub("/+$", "")) ..
-                        "/" .. name
-                    UIManager:replace(self, FolderBrowser:new{
-                        builder = self.builder,
-                        target = self.target,
-                        path = newpath,
-                        onSelect = self.onSelect,
-                    })
-                end,
-            }
-        end
-        if #list == 0 then
-            rows[#rows + 1] = TextWidget:new{
-                text = _("(no folders here)"),
-                face = Font:getFace("smallitalic"),
-            }
-        end
-    else
-        rows[#rows + 1] = TextWidget:new{
-            text = _("Could not list folders on the CrossDrop reader:\n") .. tostring(list) ..
-                _("\n\nYou can still pick this path — CrossDrop\ncreates it when the folder is missing."),
-            face = Font:getFace("small"),
-        }
-    end
-
-    local inner = VerticalGroup:new{
-        align = "left",
-        TextWidget:new{
-            text = _("Destination folder on the CrossDrop reader"),
-            face = Font:getFace("small"),
-        },
-        TextWidget:new{
-            text = self.path,
-            face = Font:getFace("bold"),
-        },
-    }
-    for i = 1, #rows do
-        inner:addWidget(rows[i])
-    end
-
-    local button_table = ButtonTable:new{
-        buttons = {
-            {
-                {
-                    text = _("Up one level"),
-                    enabled = self.path ~= "/",
-                    callback = function()
-                        UIManager:replace(self, FolderBrowser:new{
-                            builder = self.builder,
-                            target = self.target,
-                            path = parent_path(self.path),
-                            onSelect = self.onSelect,
-                        })
-                    end,
-                },
-                {
-                    text = _("New folder..."),
-                    callback = function() self:newFolder() end,
-                },
-            },
-            {
-                {
-                    text = _("Select this folder"),
-                    callback = function()
-                        self.onSelect(self.path)
-                        UIManager:close(self)
-                    end,
-                },
-                {text = _("Cancel"), callback = function() UIManager:close(self) end},
-            },
-        },
-        zero_sep = true,
-        show_parent = self,
-    }
-
-    local frame = FrameContainer:new{
-        background = Blitbuffer.COLOR_WHITE,
-        radius = Size.radius.window,
-        padding = Size.padding.default,
-        padding_bottom = 0,
-        VerticalGroup:new{
-            align = "left",
-            inner,
-            VerticalSpan:new{width = Size.padding.default},
-            button_table,
-        },
-    }
-    self.movable = MovableContainer:new{
-        frame,
-        unmovable = false,
-    }
-    self[1] = CenterContainer:new{
-        dimen = Screen:getSize(),
-        self.movable,
-    }
-
-    if Device:hasKeys() then
-        self.key_events.Back = { { Device.input.group.Back } }
-    end
-end
-
--- Back steps up one folder level while browsing; only at the root does it
--- close the browser and return to the (still open) reader menu.
-function FolderBrowser:onBack()
-    if self.path ~= "/" then
-        UIManager:replace(self, FolderBrowser:new{
-            builder = self.builder,
-            target = self.target,
-            path = parent_path(self.path),
-            onSelect = self.onSelect,
-        })
-    else
-        UIManager:close(self)
-    end
-    return true
-end
-
-function FolderBrowser:newFolder()
-    local dialog
-    dialog = InputDialog:new{
-        title = _("New folder in ") .. self.path,
-        input = "",
-        type = "text",
-        buttons = {
-            {
-                {
-                    text = _("Create"),
-                    callback = function()
-                        local name = dialog:getInputText()
-                        local clean = name and name:gsub("^/+", ""):gsub("/+$", "") or ""
-                        UIManager:close(dialog)
-                        if clean == "" then
-                            return
-                        end
-                        local url = base_url(self.target) ..
-                            encode_path(self.path) .. "/" .. url_encode_segment(clean)
-                        local ok, code, errbody = self.builder:req("MKCOL", url)
-                        if ok or (type(code) == "number" and code == 405) then
-                            UIManager:show(Notification:new{
-                                text = _("Folder created."),
-                                timeout = 2,
-                            })
-                            UIManager:replace(self, FolderBrowser:new{
-                                builder = self.builder,
-                                target = self.target,
-                                path = self.path,
-                                onSelect = self.onSelect,
-                            })
-                        else
-                            UIManager:show(Notification:new{
-                                text = _("Could not create folder: ") ..
-                                    (type(code) == "number" and tostring(code) or tostring(code or "error")),
-                                timeout = 4,
-                            })
-                        end
-                    end,
-                },
-                {text = _("Cancel"), callback = function() UIManager:close(dialog) end},
-            },
-        },
-    }
-    UIManager:show(dialog)
-end
-
--- ────────────────────── sent-books history dialog ───────────────────────
-
-local SentBooksDialog = InputContainer:extend{
-    modal = true,
-    dismissable = false,
-    alignment = "center",
-}
-
-function SentBooksDialog:init()
-    local w = widgets()
-    local Screen = w.Screen
-    local TextWidget = w.TextWidget
-    local Font = w.Font
-    local Button = w.Button
-    local VerticalGroup = w.VerticalGroup
-    local ButtonTable = w.ButtonTable
-    local VerticalSpan = w.VerticalSpan
-    local FrameContainer = w.FrameContainer
-    local Blitbuffer = w.Blitbuffer
-    local Size = w.Size
-    local MovableContainer = w.MovableContainer
-    local CenterContainer = w.CenterContainer
-    local Device = w.Device
-    local content_w = math.min(Screen:getWidth() - 60, 560)
-    local bw = content_w - 24
-
-    local rows = {}
-    local list = getSentList()
-    local shown = 0
-    for _, e in ipairs(list) do
-        if shown >= 8 then break end
-        shown = shown + 1
-        local ip = e.ip or "?"
-        if e.port and e.port ~= 80 then ip = ip .. ":" .. e.port end
-        local folder = (e.folder and e.folder ~= "") and e.folder or "/Books"
-        local meta = fmt_reltime(e.ts) .. "  ·  " .. ip .. "  →  " .. folder
-        if e.size and e.size > 0 then
-            meta = meta .. string.format("  ·  %.1f MB", e.size / 1048576)
-        end
-        rows[#rows + 1] = Button:new{
-            text = tostring(e.file or "?") .. "\n" .. meta,
-            width = bw,
-            callback = function() UIManager:close(self) end,
-        }
-    end
-    if #rows == 0 then
-        rows[#rows + 1] = TextWidget:new{
-            text = _("No books sent yet."),
-            face = Font:getFace("smallitalic"),
-        }
-    end
-
-    local inner = VerticalGroup:new{
-        align = "left",
-        TextWidget:new{
-            text = _("Books sent over Wi-Fi (most recent first)"),
-            face = Font:getFace("small"),
-        },
-    }
-    for i = 1, #rows do
-        inner:addWidget(rows[i])
-    end
-    if #list > shown then
-        inner:addWidget(TextWidget:new{
-            text = string.format(_("... plus %d more (only the last 8 are listed)"), #list - shown),
-            face = Font:getFace("smallitalic"),
-        })
-    end
-
-    local button_table = ButtonTable:new{
-        buttons = {
-            {
-                {
-                    text = _("Clear history"),
-                    callback = function()
-                        saveSentList({})
-                        UIManager:replace(self, SentBooksDialog:new{})
-                    end,
-                },
-                {
-                    text = _("Close"),
-                    callback = function() UIManager:close(self) end,
-                },
-            },
-        },
-        zero_sep = true,
-        show_parent = self,
-    }
-
-    local frame = FrameContainer:new{
-        background = Blitbuffer.COLOR_WHITE,
-        radius = Size.radius.window,
-        padding = Size.padding.default,
-        padding_bottom = 0,
-        VerticalGroup:new{
-            align = "left",
-            inner,
-            VerticalSpan:new{width = Size.padding.default},
-            button_table,
-        },
-    }
-    self.movable = MovableContainer:new{
-        frame,
-        unmovable = false,
-    }
-    self[1] = CenterContainer:new{
-        dimen = Screen:getSize(),
-        self.movable,
-    }
-
-    if Device:hasKeys() then
-        self.key_events.Back = { { Device.input.group.Back } }
-    end
-end
-
-function SentBooksDialog:onBack()
-    UIManager:close(self)
-    return true
 end
 
 return CROSSDROP

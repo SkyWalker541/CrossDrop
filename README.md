@@ -9,8 +9,8 @@ It contains exactly two plugins:
 
 | Plugin | Where it lives | What it does |
 |---|---|---|
-| **KOReader plugin** | `koreader-plugin/crossdrop.koplugin/` | The sender side. Gear menu → **CrossDrop** on any KOReader device (Kindle, Android, …): sends the currently open book to the reader, remembers devices, shows live progress and a Home dashboard. |
-| **CrossPoint plugin** | `crosspoint-plugin/crossdrop/` | The reader side. A **native setup guide** shown under **Settings → System → Plugins → CrossDrop**, rendered on the e‑ink screen. It pulls its steps live from this repo (`hosted/crossdrop/guide-1.json`). |
+| **KOReader plugin** | `koreader-plugin/crossdrop.koplugin/` | The sender side. Gear menu → **CrossDrop** opens a full-screen Storefront-style dashboard (Connections / Send / History) on any KOReader device (Kindle, Android, …). Sends the currently open book over Wi-Fi; every book lands in the reader's fixed **`CrossDropped Files`** folder — nothing to configure. |
+| **CrossPoint plugin** | `crosspoint-plugin/crossdrop/` | The reader side. A **native setup guide** shown under **Settings → System → Plugins → CrossDrop**, rendered on the e‑ink screen. It pulls its steps live from this repo (`hosted/crossdrop/guide-1.json`), and tapping its single item downloads the whole guide to `CrossDropped Files`. |
 
 ## Requirements — CrossPoint beta firmware
 
@@ -54,8 +54,10 @@ guide to load (File Transfer itself works offline).
 
 **On the sender (KOReader):** copy the `crossdrop.koplugin/` folder into the
 KOReader device's `koreader/plugins/`, restart KOReader, open the gear menu →
-**CrossDrop**, type the reader's IP (shown on the reader's **File Transfer →
-Join Network** screen), and hit **Send current book**.
+**CrossDrop** → **Connections → Set WiFi IP...**, type the reader's IP (shown
+on the reader's **File Transfer → Join Network** screen), then go to the
+**Send** tab and tap the book. It lands in `CrossDropped Files` on the
+reader's card.
 
 ## Updating the on-device guide
 

@@ -34,12 +34,12 @@ reinstall, no new card content needed. (Readers must be online to load it;
 previous steps work offline since File Transfer itself is built in.)
 
 **Tapping the item** downloads one file — `hosted/crossdrop/instructions.txt`,
-the whole setup guide in a single TXT — to a `CrossDrop Instructions` folder
-as `CrossDrop-Instructions.txt`. The catalog shows a single one-line item
+the whole setup guide in a single TXT — as `CrossDrop-Instructions.txt` inside
+the `CrossDropped Files` folder at the root of the card. That is the same
+folder the KOReader plugin sends books to, so this guide and every received
+book share one predictable place. The catalog shows a single one-line item
 ("Download instructions (TXT)"), so there's no list clutter and one tap gets
 the entire guide.
-
-## Files
 
 ## Files
 
@@ -52,8 +52,8 @@ the entire guide.
   served to the reader from GitHub (`raw.githubusercontent.com`). Not installed
   to the card.
 - `hosted/crossdrop/instructions.txt` — the full setup guide in one TXT file,
-  downloaded to the `CrossDrop Instructions` folder when the item is tapped
-  (wired in `device.json` → `download`).
+  downloaded to `CrossDropped Files` when the item is tapped (wired in
+  `device.json` → `download`).
 
 ## Install
 
@@ -66,9 +66,12 @@ reader. Open the plugin from **Settings → System → Plugins → CrossDrop**.
 1. Install the KOReader plugin on the sending device.
 2. Main menu → **File Transfer → Join Network** on this reader — the address
    shown there is what you type into KOReader.
-3. In KOReader: **CrossDrop → Device IP...** — enter that address.
-4. **CrossDrop → Send current book** (optional **Destination folder...**).
-5. The book lands on this SD card and appears in the reader's library.
-6. No router? **File Transfer → Create Hotspot** and use
-   **CrossDrop → CrossDrop hotspot (192.168.4.1)**.
-7/8. Done? **CrossDrop → Check device...** confirms the reader answers.
+3. In KOReader: **CrossDrop → Connections → Set WiFi IP...** — enter that
+   address.
+4. **CrossDrop → Send → tap the book** — books always land in the
+   `CrossDropped Files` folder, no destination to pick.
+5. The book appears in the reader's library.
+6. No router? **File Transfer → Create Hotspot**; the **HotSpot** connection
+   is already **192.168.4.1**.
+7/8. Done? Tap a connection to check it, or use **Send → Check device...** to
+   confirm the reader answers.

@@ -5,6 +5,9 @@ cable needed. On the sender, install the crossdrop.koplugin (KOReader plugin);
 this reader only needs a CrossPoint beta build with SD plugin support — its
 built-in File Transfer does the receiving.
 
+Books always arrive inside the CrossDropped Files folder on this reader's
+card — there is nothing to select on the sender.
+
 1 · How it works
 
 The CrossDrop plugin on your KOReader device sends the book you're reading to
@@ -15,8 +18,8 @@ built in. The only requirement is that this device runs a CrossPoint beta
 build with SD plugin support, so it can show this guide.
 
 The full flow: install the KOReader plugin, put this reader in receive mode,
-enter its address on the KOReader side, send the book, and it lands on this
-reader's card.
+enter its address on the KOReader side, send the book, and it lands in
+CrossDropped Files at the root of this reader's card.
 
 2 · Install the plugin
 
@@ -24,13 +27,13 @@ On the sending device (an e-reader, phone or tablet running KOReader):
 
 1. Copy the crossdrop.koplugin folder into koreader/plugins/ on that device.
 2. Restart KOReader.
-3. Open the gear menu → CrossDrop.
+3. Open the gear menu → CrossDrop (opens the CrossDrop dashboard).
 
 The plugin also ships as CrossDrop-Plugin.zip for easier copying.
 
 3 · Join Network
 
-Main menu → File Transfer → Join Network.
+Main menu → File Transfer → Join Network on this reader.
 
 The address that appears on this screen is the one you will type on the
 KOReader side. Leave this screen open while you set up the sender — CrossDrop
@@ -38,29 +41,28 @@ sends to the address shown here.
 
 4 · Enter the address
 
-In CrossDrop → Device IP..., type the address shown on this reader's File
-Transfer screen.
+In the CrossDrop dashboard on KOReader, go to Connections → Set WiFi IP...
+and type the address shown on this reader's File Transfer screen.
 
-Defaults on the reader side are port 80 and folder /Books. Save the address
-once and CrossDrop remembers it for next time.
+Save it once and CrossDrop remembers it for next time.
 
 Make sure the sender and this reader are on the same network (or one joined a
 hotspot of the other — see step 7).
 
 5 · Send a book
 
-Gear menu → CrossDrop → Send current book.
+In the CrossDrop dashboard, open the Send tab and tap the book shown there.
 
-Optional: choose Destination folder... first to pick where the book lands on
-this reader.
+There is no destination to pick: the book always goes to the CrossDropped
+Files folder on this reader.
 
 Watch the live progress dialog here on the device — and on the sender — while
 the book transfers.
 
 6 · Book arrives
 
-When the send finishes, the book is on this SD card in the folder you picked
-and shows up in this reader's library — nothing else to do.
+When the send finishes, the book is on this SD card in CrossDropped Files and
+shows up in this reader's library — nothing else to do.
 
 You can keep reading where you left off on the sender: CrossDrop writes the
 book as a standard EPUB, so library stores and sorting still work normally.
@@ -71,20 +73,21 @@ No Wi-Fi network handy? The reader can host its own.
 
 1. Main menu → File Transfer → Create Hotspot on this reader.
 2. From the sender device, join that Wi-Fi network.
-3. In CrossDrop on KOReader, pick CrossDrop → CrossDrop hotspot
-   (192.168.4.1) — no address to type.
+3. In the CrossDrop dashboard, Connections → Set HotSpot IP... already shows
+   192.168.4.1 — the reader's hotspot address — so there is usually nothing to
+   type; just save it.
 
 The hotspot is only meant for direct transfers: it shortens the flow to just
 "join and send".
 
 8 · Verify it works
 
-CrossDrop → Check device... on the sender confirms this reader answered.
+Tap a connection on the Connections tab to check it, or use Check device...
+on the Send tab — both confirm this reader answered.
 
 If a send fails:
-- confirm the address matches the Join Network screen (and port 80),
+- confirm the WiFi IP matches the Join Network screen,
 - make sure sender and reader are on the same network or hotspot,
 - restart File Transfer on the reader and try again.
 
-All good? You are set up — every future send is "CrossDrop → Send current
-book".
+All good? You are set up — every future send is "Send tab → tap the book".

@@ -11,36 +11,30 @@ required.
    reader to your Wi-Fi and makes it ready to receive — the reader's screen
    **shows its IP address** on that screen.
 2. On the device with the book (Kindle / Android / etc.), open the book in
-   KOReader, then use the **gear menu (main reader menu) → CrossDrop**:
-   - **CrossDrop home...** — the full-screen dashboard with **Devices**,
-     **Send** and **History** tabs.
-   - **Device IP...** — type the reader's IP (from the Join Network screen).
-     Saved for next time.
-   - **CrossDrop hotspot (192.168.4.1)** — one tap when the Kindle is joined to
-     the reader's **own hotspot** (AP mode); saves the address and immediately
-     tests the connection.
-   - **Send current book** — streams the open book to the saved device.
-   - **Destination folder...** — browse the reader's folders over the network
-     and pick where the book goes (default `/Books`). You can also create a new
-     folder from that screen.
-   - **Check device...** — asks the reader `GET /api/status` and shows its
-     model, version, mode and IP as a connection test.
-   - **Sent books...** — logs every successful send (reader, destination
-     folder, size, time, most recent first). Clear it from that screen.
-   - **Saved devices** — every address used is listed here for one-tap sending.
-     **Long-press** a saved address to forget it, or use **Delete all stored
-     devices** to clear the list.
+   KOReader, then open the **gear menu (main reader menu) → CrossDrop**. This
+   opens a full-screen, Storefront-style dashboard with three tabs:
+   - **Connections** — the two ways to reach the reader, each with its own
+     stored IP:
+     - **WiFi** — set it once via **Set WiFi IP...** to the address shown on
+       the reader's **Join Network** screen.
+     - **HotSpot** — for the reader's **Create Hotspot** mode, already filled
+       with **192.168.4.1** (nothing to type).
+   - Tap a connection to check it; CrossDrop shows whether it's reachable.
+   - **Send** — tap the book shown under "Now open" to stream it across. No
+     destination to pick: **every book lands in the `CrossDropped Files`
+     folder at the root of the reader's card**, created automatically on
+     first send.
+   - **History** — logs every successful send (connection, IP, size, time,
+     most recent first); tap an entry to send again.
 3. While sending, KOReader shows a live **CrossDrop progress dialog**: a
    percentage bar (bytes streamed / total), transfer speed and ETA, repainting
-   the e-ink screen on every chunk. On completion a CrossDrop toast confirms and
-   the book lands in the chosen folder on the reader's SD card. If the folder
-   did not exist, CrossDrop creates it automatically (`MKCOL`) — no manual setup
-   on the reader.
+   the e-ink screen on every chunk. On completion a CrossDrop toast confirms
+   and the book lands in `CrossDropped Files` on the reader's SD card.
 
-There is no automatic discovery: you enter the reader's IP once (from the Join
-Network / hotspot screen), and CrossDrop remembers it. When the reader is its
-own hotspot it is always at **192.168.4.1**, so the dedicated **CrossDrop
-hotspot** entry needs nothing typed at all.
+There is no automatic discovery and no folder selection: you enter the
+reader's WiFi IP once, and CrossDrop remembers it. If only the reader's
+hotspot is available, the fixed **192.168.4.1** slot is already there — no
+typing needed.
 
 ## Requirements
 
@@ -72,24 +66,25 @@ cp -r crossdrop.koplugin /path/to/koreader/plugins/
 
 ## Troubleshooting
 
-- **"No device configured"** — open the reader's Join Network screen, note the
-  IP, and enter it via **CrossDrop → Device IP...**.
-- **"Send failed"** — confirm the IP/port in Device IP... matches the address
-  on the reader's screen, and that the reader is still on **File Transfer →
-  Join Network** and on the same network. Use **CrossDrop → Check device...** to
-  test connectivity first. On the reader's **hotspot**, pick **CrossDrop
-  hotspot (192.168.4.1)** — the Kindle must be connected to that hotspot.
-- **Folder can't be listed** — the folder picker falls back gracefully: you can
-  still pick the path, and the send step creates it via `MKCOL` if it's missing.
-- **Stale saved address** — if the reader gets a new IP (router DHCP),
-  long-press the old address in CrossDrop to forget it and enter the new one.
+- **Connection shows "Offline"** — open the reader's Join Network screen,
+  note the IP, and fix it via **Connections → Set WiFi IP...**. The reader
+  must still be on **File Transfer → Join Network** and on the same network.
+- **Send fails** — confirm the WiFi IP matches the Join Network screen and
+  both devices are on the same network (or the sender joined the reader's
+  hotspot). Use **Send → Check device...** to test connectivity first.
+- **Reader on its own hotspot** — join that network from the sender; the
+  **HotSpot** connection is already set to **192.168.4.1**.
+- **New router IP** — the router's DHCP may give the reader a new address;
+  just update **Connections → Set WiFi IP...**.
 
 ## Protocol (for other clients)
 
 - The reader's web server listens on port **80**. Its IP + status are available
-  at `GET /api/status`; folder contents at `GET /api/files?path=<path>`.
-- Destination folder: ensured with WebDAV `MKCOL /<folder>` (405 = already
-  exists) — or by CrossDrop's own firmware which auto-creates it on PUT.
-- Transfer: `PUT http://<ip>:<port>/<folder>/<url-encoded-filename>` with the
-  raw file bytes in the body and a `Content-Length` header. Success is any 2xx.
-  (Alternatively `POST /upload?path=<folder>` with multipart form data.)
+  at `GET /api/status`.
+- Destination folder: `CrossDropped Files` at the card root, ensured with
+  WebDAV `MKCOL /CrossDropped%20Files` (405 = already exists). CrossPoint's
+  own firmware may also auto-create it on PUT.
+- Transfer: `PUT http://<ip>:<port>/CrossDropped%20Files/<url-encoded-filename>`
+  with the raw file bytes in the body and a `Content-Length` header. Success
+  is any 2xx. (Alternatively `POST /upload?path=<folder>` with multipart form
+  data.)

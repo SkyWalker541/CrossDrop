@@ -1,5 +1,5 @@
 -- Stub harness: load crossdrop.koplugin/main.lua and exercise the pure logic
--- (req/ensureFolder/listFolders/putFile/sendCurrentBook/statusDialog + FolderBrowser build)
+-- (req/ensureFolder/putFile/sendCurrentBook/statusDialog + Home dashboard)
 -- against a FAKE device, including the LuaSocket string-error case that used to crash.
 
 -- Resolve the plugin root relative to this harness file so it runs from any
@@ -181,13 +181,18 @@ stubs["ui/uimanager"] = UIManager
 -- ── fake device ───────────────────────────────────────────────────────────
 
 local FAKE = {
-    fail = false,           -- simulate "connection refused" (LuaSocket string error)
+    fail = false,           -- simulate "connection refused" on everything
+    fail_put = false,       -- network is up, but the PUT transfer drops (string error)
     mkcol_count = 0,
 }
 
 local function fake_request(args)
     if FAKE.fail then
         -- LuaSocket failure shape: (nil, "<error string>") — the old crash trigger
+        return nil, "connection refused"
+    end
+    local url, method = args.url, args.method
+    if method == "PUT" and FAKE.fail_put then
         return nil, "connection refused"
     end
     local url, method = args.url, args.method
@@ -262,110 +267,128 @@ local bfh = assert(io.open("/tmp/fakebook.epub", "wb"))
 for _ = 1, 16000 do bfh:write(string.rep("x", 16)) end
 bfh:close()
 
--- 1. listFolders
-local ok, dirs = inst:listFolders({ ip = "192.168.1.50", port = 80 }, "/Books")
-check("listFolders ok", ok == true, dirs)
-check("listFolders finds Books dir", type(dirs) == "table" and dirs[1] == "Books", dirs and dirs[1])
-
--- 2. ensureFolder: first call 201 -> true
-local eok, eerr = inst:ensureFolder({ ip = "192.168.1.50", port = 80, folder = "/Books" })
+-- 1. ensureFolder: 201 then 405 both succeed (always targets CrossDropped Files)
+local eok, eerr = inst:ensureFolder({ ip = "192.168.1.50", port = 80, folder = "/CrossDropped Files" })
 check("ensureFolder created (201)", eok == true, eerr)
--- second: 405 -> true
-local eok2, eerr2 = inst:ensureFolder({ ip = "192.168.1.50", port = 80, folder = "/Books" })
-check("ensureFolder exists (405)", eok2 == true, eerr2)
+local eok2 = inst:ensureFolder({ ip = "192.168.1.50", port = 80, folder = "/CrossDropped Files" })
+check("ensureFolder exists (405)", eok2 == true)
 
--- 3. putFile progress + success
+-- 2. putFile streams with progress
 local seen = {}
-local pok, presult = inst:putFile({ ip = "192.168.1.50", port = 80, folder = "/Books" }, "/tmp/fakebook.epub", function(s, t) seen[#seen + 1] = s end)
+local pok, presult = inst:putFile({ ip = "192.168.1.50", port = 80, folder = "/CrossDropped Files" }, "/tmp/fakebook.epub", function(s) seen[#seen + 1] = s end)
 check("putFile success", pok == true, presult)
 check("putFile progress reported", #seen > 0 and seen[#seen] == 256000, #seen and "#seen=" .. #seen)
 
--- 4. sendCurrentBook success path (records progress notifications)
+-- 3. two connections: WiFi first (when set), HotSpot always present, fixed folder
+inst:saveTarget({ ip = "192.168.1.50", port = 80 })
+local targets = inst:configuredTargets()
+check("configuredTargets: wifi first", targets[1] and targets[1].kind == "wifi" and targets[1].ip == "192.168.1.50", targets[1] and targets[1].kind)
+check("configuredTargets: hotspot always present", targets[2] and targets[2].kind == "hotspot" and targets[2].ip == "192.168.4.1", targets[2] and targets[2].ip)
+check("both connections use CrossDropped Files", targets[1].folder == "/CrossDropped Files" and targets[2].folder == "/CrossDropped Files", targets[1].folder and targets[2].folder)
+check("resolveTarget picks wifi", inst:resolveTarget() and inst:resolveTarget().kind == "wifi")
+
+-- 4b. probeReachable answers the reachable connection; falls back to hotspot
+local reached = inst:probeReachable()
+check("probeReachable finds wifi", reached and reached.kind == "wifi", reached and reached.kind)
+G_reader_settings:saveSetting("crossdrop_wifi_ip", nil)
+local reached_be = inst:probeReachable()
+check("probeReachable falls back to hotspot", reached_be and reached_be.kind == "hotspot", reached_be and reached_be.kind)
+
+-- 4c. probeTarget parses device info
+local pok2, pinfo = inst:probeTarget({ kind = "wifi", ip = "192.168.1.50", port = 80 })
+check("probeTarget ok + info", pok2 == true and pinfo and pinfo.device == "X4", pinfo and pinfo.device)
+
+-- 4d. probe failure (LuaSocket string error) does not crash
+FAKE.fail = true
+local fok, _, ferr = inst:probeTarget({ kind = "wifi", ip = "192.168.1.50", port = 80 })
+check("probeTarget failure safe", fok == nil and type(ferr) == "string", ferr)
+FAKE.fail = false
+
+-- 5. sendCurrentBook success path (records toast) + history
+inst:saveTarget({ ip = "192.168.1.50", port = 80 })
 UIManager._shown = {}
-inst:saveTarget({ ip = "192.168.1.50", port = 80, folder = "/Books" })
-local target = inst:resolveTarget()
-check("resolveTarget", target and target.ip == "192.168.1.50", target and target.ip)
 inst:sendCurrentBook()
 local last_notif = UIManager._shown[#UIManager._shown]
 check("send success shows Book sent", last_notif and type(last_notif.text) == "string" and last_notif.text:match("Book sent"), last_notif and last_notif.text)
 
--- 5. THE CRASH CASE: connection refused (string where code should be)
+-- 5b. history records the entry; sentList/clearSent work
+local sent = inst:sentList()
+check("sentList has one entry", type(sent) == "table" and #sent == 1 and sent[1].file == "fakebook.epub", sent and sent[1] and sent[1].file)
+check("history entry records kind wifi", sent[1] and sent[1].kind == "wifi", sent[1] and sent[1].kind)
+inst:clearSent()
+check("clearSent empties history", #(inst:sentList() or {}) == 0)
+
+-- 6. THE CRASH CASE: connection refused (string where code should be)
 FAKE.fail = true
 UIManager._shown = {}
 inst:sendCurrentBook()   -- must NOT raise; old code raised "attempt to compare number with string"
 local fin = UIManager._shown[#UIManager._shown]
-check("failure path does not crash", true)
-check("failure shows Send failed", fin and type(fin.text) == "string" and fin.text:match("Send failed"), fin and fin.text)
+check("connection-refused path does not crash", true)
+check("connection-refused shows no-reader message",
+    fin and type(fin.text) == "string" and fin.text:match("No CrossDrop reader reached"),
+    fin and fin.text)
 FAKE.fail = false
 
--- 6. statusDialog parses device info
+-- 6b. THE OTHER CRASH CASE: device answers, then the PUT drops mid-transfer
+FAKE.fail_put = true
+UIManager._shown = {}
+inst:sendCurrentBook()   -- must NOT raise on the string error from putFile
+local fput = UIManager._shown[#UIManager._shown]
+check("transfer-drop path does not crash", true)
+check("transfer-drop shows Send failed", fput and type(fput.text) == "string" and fput.text:match("Send failed"), fput and fput.text)
+FAKE.fail_put = false
+
+-- 7. statusDialog parses device info (via probeReachable)
 UIManager._shown = {}
 inst:statusDialog()
 local info = UIManager._shown[#UIManager._shown]
 check("status dialog shows device", info and type(info.text) == "string" and info.text:match("X4"), info and info.text)
 
--- 7. FolderBrowser builds without error (folder listing + widgets)
-local got = {}
-local _CD2 = CROSSDROP:new{ ui = { menu = { registerToMainMenu = function() end } } }
-G_reader_settings._store["crossdrop_ip"] = "192.168.1.50"
+-- 8. editIp opens an input dialog for each connection
 UIManager._shown = {}
-_CD2:pickFolder()
-local browser = UIManager._shown[#UIManager._shown]
-got.built = (browser ~= nil)
-check("FolderBrowser builds + lists remote folders", got.built == true)
+inst:editIp("wifi")
+check("editIp(wifi) opens dialog", type(UIManager._shown[#UIManager._shown]) == "table")
+UIManager._shown = {}
+inst:editIp("hotspot")
+check("editIp(hotspot) opens dialog", type(UIManager._shown[#UIManager._shown]) == "table")
 
--- 7b. Back steps UP a folder, not out (replace with parent folder)
-if browser then
-    browser.path = "/Books/sub"
-    UIManager._shown = {}
-    browser:onBack()
-    local up = UIManager._shown[#UIManager._shown]
-    check("Back goes up one folder level", up and up.path == "/Books", up and up.path)
-    -- 7c. Back at the root just closes the browser
-    browser.path = "/"
-    local closed_ok = pcall(function() browser:onBack() end)
-    check("Back at root closes browser without error", closed_ok == true)
-end
+-- 8b. send books always land in CrossDropped Files: folder setting cannot override
+G_reader_settings:saveSetting("crossdrop_folder", "/Books")
+local forced = inst:configuredTargets()
+check("folder setting ignored (always CrossDropped Files)", forced[1].folder == "/CrossDropped Files", forced[1].folder)
 
--- 7d. buildSubItems: every actionable item keeps the reader menu open
-local items = inst:buildSubItems()
-local all_keep_open = true
-for _, it in ipairs(items) do
-    if it.callback and not it.keep_menu_open then all_keep_open = false end
-end
-check("all submenu items keep menu open (keep_menu_open)", all_keep_open == true)
-
--- 7e. refreshMenu rebuilds the submenu table instead of closing it
-local refreshed_ok = false
-local fake_menu = {
-    item_table = nil,
-    updateItems = function(_, p) refreshed_ok = true end,
-    registerToMainMenu = function() end,
-}
-local inst2 = CROSSDROP:new{ ui = { menu = fake_menu } }
-inst2:refreshMenu()
-check("refreshMenu rebuilds (no menu:close)", refreshed_ok == true and type(fake_menu.item_table) == "table")
-
--- 8. menu registration
+-- 9. menu registration: CrossDrop opens the dashboard directly (no submenu)
 local menu_items = {}
 inst:addToMainMenu(menu_items)
 check("menu registered as CrossDrop", menu_items.crossdrop ~= nil and menu_items.crossdrop.text == "CrossDrop", menu_items.crossdrop and menu_items.crossdrop.text)
+check("menu item opens the dashboard", menu_items.crossdrop and type(menu_items.crossdrop.callback) == "function")
 
--- 9. Home dialog builds and renders all three tabs (Devices / Send / History)
+-- 11. Home dashboard (Storefront-style): opens full-screen, renders all tabs
 UIManager._shown = {}
 inst:openHome()
 local home = UIManager._shown[#UIManager._shown]
 check("home dialog opens", home ~= nil)
 if home then
     check("home is modal + full-screen", home.modal == true and type(home.dimen) == "table")
-    local dc = home:buildTabContent("devices", 560)
-    local sc = home:buildTabContent("send", 560)
+    local cc = home:buildTabContent("connections", 560)
+    local sc_ = home:buildTabContent("send", 560)
     local hc = home:buildTabContent("history", 560)
-    check("home Devices tab renders", type(dc) == "table")
-    check("home Send tab renders", type(sc) == "table")
+    check("home Connections tab renders", type(cc) == "table")
+    check("home Send tab renders", type(sc_) == "table")
     check("home History tab renders", type(hc) == "table")
     check("home Back closes", home:onBack() == true)
 end
+
+-- 11b. Home check() probes and remembers reachability (state survives swap)
+inst:openHome()
+home = UIManager._shown[#UIManager._shown]
+inst._reach = {}
+home:check("wifi")
+check("home check() marks wifi reachable", inst._reach.wifi == "ok", inst._reach.wifi)
+FAKE.fail = true
+home:check("hotspot")
+check("home check() marks hotspot down (no crash)", inst._reach.hotspot == "down", inst._reach.hotspot)
+FAKE.fail = false
 
 print(failures == 0 and "\nALL TESTS PASSED" or string.format("\n%d TEST(S) FAILED", failures))
 os.exit(failures == 0 and 0 or 1)

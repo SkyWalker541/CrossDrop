@@ -13,8 +13,8 @@ one for KOReader. It is not a firmware fork.
   "Download instructions (TXT)" item), fetched by the reader from
   `raw.githubusercontent.com` (see `device.json` → `browse.url`).
 - `hosted/crossdrop/instructions.txt` — the whole setup guide in one TXT
-  file; tapping the catalog item downloads it to a `CrossDrop Instructions`
-  folder (`device.json` → `download`).
+  file; tapping the catalog item downloads it into the fixed
+  `CrossDropped Files` folder (`device.json` → `download`).
 - `scripts/build-zips.sh` — builds `releases/CrossDrop-SD-Plugin.zip` and
   `releases/CrossDrop-Plugin.zip`.
 - `.github/workflows/build.yml` — validate JSON, `luajit -bl` each Lua file,
@@ -32,10 +32,15 @@ one for KOReader. It is not a firmware fork.
 - **Guide contract:** `device.json` boots a catalog screen from
   `browse.url`. The catalog lists one item ("Download instructions (TXT)");
   the step text lives in `hosted/crossdrop/instructions.txt`, downloaded on
-  tap via `device.json` → `download` to the `CrossDrop Instructions` folder.
-  If the guide outgrows a page, split as before with ≤ `page_size` items per
-  page file (`guide-1.json`, then `guide-2.json`, …). Firmware caps:
-  `device.json` < 8 KB, `page_size` ≤ 16, browse response ≤ 1 MB.
+  tap via `device.json` → `download` into the fixed `CrossDropped Files`
+  folder at the card root. If the guide outgrows a page, split as before with
+  ≤ `page_size` items per page file (`guide-1.json`, then `guide-2.json`,
+  …). Firmware caps: `device.json` < 8 KB, `page_size` ≤ 16, browse response
+  ≤ 1 MB.
+- **Fixed destination:** the koplugin has NO folder picker. Every book (and
+  the downloaded guide) goes to `/CrossDropped Files` on the reader
+  (`DEFAULT_FOLDER` in `main.lua`, `dest_dir` in `device.json`). Keep both
+  names in sync; auto-create on the reader via MKCOL before each PUT.
 - **Plugin list row:** title "CrossDrop" with a short one-line description
   ("Tap to download setup instructions (TXT file).") in `manifest.json`/
   `device.json`.
