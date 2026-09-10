@@ -11,6 +11,9 @@ one for KOReader. It is not a firmware fork.
 - `koreader-plugin/crossdrop.koplugin/` — KOReader sender plugin.
 - `hosted/crossdrop/guide-1.json` — the live on-device guide, fetched by the
   reader from `raw.githubusercontent.com` (see `device.json` → `browse.url`).
+- `hosted/crossdrop/steps/{id}.txt` — per-step text files; tapping a step
+  downloads its file to `/Books` (`device.json` → `download`). Keep one txt
+  per item id in `guide-1.json`.
 - `scripts/build-zips.sh` — builds `releases/CrossDrop-SD-Plugin.zip` and
   `releases/CrossDrop-Plugin.zip`.
 - `.github/workflows/build.yml` — validate JSON, `luajit -bl` each Lua file,

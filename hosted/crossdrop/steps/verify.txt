@@ -1,0 +1,11 @@
+Verify the connection
+
+CrossDrop → Check device... on the sender confirms this reader answered.
+
+If a send fails:
+- confirm the address matches the Join Network screen (and port 80),
+- make sure sender and reader are on the same network or hotspot,
+- restart File Transfer on the reader and try again.
+
+All good? You are set up — every future send is "CrossDrop → Send current
+book".

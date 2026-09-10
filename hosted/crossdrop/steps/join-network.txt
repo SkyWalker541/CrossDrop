@@ -1,0 +1,7 @@
+2 · Put this reader in receive mode
+
+Main menu → File Transfer → Join Network.
+
+The address that appears on this screen is the one you will type on the
+KOReader side. Leave this screen open while you set up the sender — CrossDrop
+sends to the address shown here.

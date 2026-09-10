@@ -33,6 +33,13 @@ to `main`. Every reader that opens the plugin then sees the new steps — no
 reinstall, no new card content needed. (Readers must be online to load it;
 previous steps work offline since File Transfer itself is built in.)
 
+**Tapping a step** downloads that step's full text (`hosted/crossdrop/steps/
+{id}.txt`, one per step, same list layout) into `/Books` as
+`CrossDrop-<id>.txt`, so a step can be kept or reread from the library. The
+catalog itself stays on-screen; the steps are short on purpose.
+
+## Files
+
 ## Files
 
 - `crossdrop/device.json` — declares the native on-device screen and the
@@ -42,6 +49,8 @@ previous steps work offline since File Transfer itself is built in.)
 - `crossdrop/README.md` — this file (store metadata).
 - `hosted/crossdrop/guide-1.json` — the live guide steps, served to the
   reader from GitHub (`raw.githubusercontent.com`). Not installed to the card.
+- `hosted/crossdrop/steps/{id}.txt` — per-step text files, downloaded to
+  `/Books` when an item is tapped (wired in `device.json` → `download`).
 
 ## Install
 
