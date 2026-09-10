@@ -33,11 +33,11 @@ to `main`. Every reader that opens the plugin then sees the new steps — no
 reinstall, no new card content needed. (Readers must be online to load it;
 previous steps work offline since File Transfer itself is built in.)
 
-**Tapping a step** shows its full text: the detail for each step lives in
-`hosted/crossdrop/steps/{id}.txt` (one per one-line title in the list), and
-the tap downloads it to `/Books` as `CrossDrop-<id>.txt` so it can be kept or
-reread from the library. The list itself shows only short, one-line titles so
-it scrolls cleanly on the e-ink screen; the instruction text comes on tap.
+**Tapping the item** downloads one file — `hosted/crossdrop/instructions.txt`,
+the whole setup guide in a single TXT — to `/Books` as
+`CrossDrop-Instructions.txt`. The catalog shows a single one-line item
+("Download instructions (TXT)"), so there's no list clutter and one tap gets
+the entire guide.
 
 ## Files
 
@@ -48,10 +48,12 @@ it scrolls cleanly on the e-ink screen; the instruction text comes on tap.
 - `crossdrop/manifest.json` — plugin metadata used for the Settings → System
   → Plugins row and version tracking.
 - `crossdrop/README.md` — this file (store metadata).
-- `hosted/crossdrop/guide-1.json` — the live guide steps, served to the
-  reader from GitHub (`raw.githubusercontent.com`). Not installed to the card.
-- `hosted/crossdrop/steps/{id}.txt` — per-step text files, downloaded to
-  `/Books` when an item is tapped (wired in `device.json` → `download`).
+- `hosted/crossdrop/guide-1.json` — the live list (single download item),
+  served to the reader from GitHub (`raw.githubusercontent.com`). Not installed
+  to the card.
+- `hosted/crossdrop/instructions.txt` — the full setup guide in one TXT file,
+  downloaded to `/Books` when the item is tapped (wired in `device.json` →
+  `download`).
 
 ## Install
 

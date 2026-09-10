@@ -1,36 +1,8 @@
 {
   "items": [
     {
-      "title": "1 · How it works",
-      "id": "intro"
-    },
-    {
-      "title": "2 · Install the plugin",
-      "id": "install"
-    },
-    {
-      "title": "3 · Join Network",
-      "id": "join-network"
-    },
-    {
-      "title": "4 · Enter the address",
-      "id": "address"
-    },
-    {
-      "title": "5 · Send a book",
-      "id": "send"
-    },
-    {
-      "title": "6 · Book arrives",
-      "id": "landing"
-    },
-    {
-      "title": "7 · No router? Hotspot",
-      "id": "hotspot"
-    },
-    {
-      "title": "8 · Verify it works",
-      "id": "verify"
+      "title": "Download instructions (TXT)",
+      "id": "instructions"
     }
   ]
 }

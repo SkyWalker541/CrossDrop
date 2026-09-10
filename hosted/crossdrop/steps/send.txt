@@ -1,9 +1,0 @@
-5 · Send a book
-
-Gear menu → CrossDrop → Send current book.
-
-Optional: choose Destination folder... first to pick where the book lands on
-this reader.
-
-Watch the live progress dialog here on the device — and on the sender — while
-the book transfers.

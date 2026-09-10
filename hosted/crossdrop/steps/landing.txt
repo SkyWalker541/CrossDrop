@@ -1,7 +1,0 @@
-6 · Book arrives
-
-When the send finishes, the book is on this SD card in the folder you picked
-and shows up in this reader's library — nothing else to do.
-
-You can keep reading where you left off on the sender: CrossDrop writes the
-book as a standard EPUB, so library stores and sorting still work normally.
