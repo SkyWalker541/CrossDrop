@@ -1,4 +1,4 @@
-5 · The book lands on this reader
+6 · Book arrives
 
 When the send finishes, the book is on this SD card in the folder you picked
 and shows up in this reader's library — nothing else to do.

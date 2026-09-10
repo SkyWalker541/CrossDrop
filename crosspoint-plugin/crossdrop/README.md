@@ -33,10 +33,11 @@ to `main`. Every reader that opens the plugin then sees the new steps — no
 reinstall, no new card content needed. (Readers must be online to load it;
 previous steps work offline since File Transfer itself is built in.)
 
-**Tapping a step** downloads that step's full text (`hosted/crossdrop/steps/
-{id}.txt`, one per step, same list layout) into `/Books` as
-`CrossDrop-<id>.txt`, so a step can be kept or reread from the library. The
-catalog itself stays on-screen; the steps are short on purpose.
+**Tapping a step** shows its full text: the detail for each step lives in
+`hosted/crossdrop/steps/{id}.txt` (one per one-line title in the list), and
+the tap downloads it to `/Books` as `CrossDrop-<id>.txt` so it can be kept or
+reread from the library. The list itself shows only short, one-line titles so
+it scrolls cleanly on the e-ink screen; the instruction text comes on tap.
 
 ## Files
 
@@ -68,3 +69,4 @@ reader. Open the plugin from **Settings → System → Plugins → CrossDrop**.
 5. The book lands on this SD card and appears in the reader's library.
 6. No router? **File Transfer → Create Hotspot** and use
    **CrossDrop → CrossDrop hotspot (192.168.4.1)**.
+7/8. Done? **CrossDrop → Check device...** confirms the reader answers.

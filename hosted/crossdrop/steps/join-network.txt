@@ -1,4 +1,4 @@
-2 · Put this reader in receive mode
+3 · Join Network
 
 Main menu → File Transfer → Join Network.
 

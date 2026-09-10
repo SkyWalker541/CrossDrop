@@ -1,4 +1,4 @@
-3 · Enter this address in KOReader
+4 · Enter the address
 
 In CrossDrop → Device IP..., type the address shown on this reader's
 File Transfer screen.

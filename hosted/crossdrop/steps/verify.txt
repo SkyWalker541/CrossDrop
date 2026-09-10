@@ -1,4 +1,4 @@
-Verify the connection
+8 · Verify it works
 
 CrossDrop → Check device... on the sender confirms this reader answered.
 

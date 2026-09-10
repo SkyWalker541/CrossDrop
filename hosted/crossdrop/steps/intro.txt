@@ -1,4 +1,4 @@
-How CrossDrop works
+1 · How it works
 
 The CrossDrop plugin on your KOReader device sends the book you're reading to
 this reader over Wi-Fi — no cable.
