@@ -15,17 +15,19 @@ On the device running KOReader (Kindle, phone or tablet):
 Main menu → File Transfer, then pick one of the two modes:
 
 - Join a Network — for transferring over your Wi-Fi network.
-  The address shown on this screen is what you'll enter on the KOReader side.
 - Create a Hotspot — for a direct connection, no router needed.
-  The sender just joins this reader's Wi-Fi network (address 192.168.4.1).
+
+The address you need is shown on this File Transfer screen.
 
 3 · Finish the setup on your KOReader device
 
 Switch to the device with KOReader, open the gear menu → CrossDrop, and in the
 dashboard:
 
-- Connections → Set WiFi IP... — enter the address from Join a Network, or
-- Connections → Set HotSpot IP... — already set to 192.168.4.1, just save it.
+- Connections → Set WiFi IP... — enter the address shown on the reader's
+  Join a Network screen, or
+- Connections → Set HotSpot IP... — for the reader's hotspot mode, save the
+  address shown on the Create a Hotspot screen.
 
 Then go to the Send tab and tap the book you're reading.
 
