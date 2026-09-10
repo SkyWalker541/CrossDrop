@@ -1,5 +1,9 @@
 CrossDrop — setup instructions
 
+Where this file is: after Download, it is saved on this reader as
+CrossDrop-Instructions.txt in the Books folder (/Books) — look for it in the
+library under Books, or on the SD card under /Books.
+
 Send books to this reader from the CrossDrop KOReader plugin over Wi-Fi, no
 cable needed. On the sender, install the crossdrop.koplugin (KOReader plugin);
 this reader only needs a CrossPoint beta build with SD plugin support — its
