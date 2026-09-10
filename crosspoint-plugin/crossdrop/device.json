@@ -1,0 +1,18 @@
+{
+  "title": "CrossDrop",
+  "description": "Send books to this reader from KOReader over Wi-Fi, no cable. Setup guide — requires CrossPoint beta plugin builds.",
+  "author": "CrossDrop",
+  "version": "1.0.0",
+  "browse": {
+    "format": "json",
+    "url": "https://raw.githubusercontent.com/SkyWalker541/CrossDrop/main/hosted/crossdrop/guide-1.json",
+    "method": "GET",
+    "items": "items",
+    "page_size": 8,
+    "fields": {
+      "title": "title",
+      "author": "author",
+      "id": "id"
+    }
+  }
+}

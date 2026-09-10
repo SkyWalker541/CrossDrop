@@ -1,0 +1,44 @@
+{
+  "items": [
+    {
+      "title": "How CrossDrop works",
+      "author": "The CrossDrop plugin on your KOReader device sends the book you're reading to this reader over Wi-Fi — no cable. Requires a CrossPoint beta build with plugin support; this side needs nothing installed (File Transfer is built in).",
+      "id": "intro"
+    },
+    {
+      "title": "1 · Install the KOReader plugin",
+      "author": "On the sending device, copy the crossdrop.koplugin folder into koreader/plugins/ and restart KOReader. Then open the gear menu → CrossDrop.",
+      "id": "install"
+    },
+    {
+      "title": "2 · Put this reader in receive mode",
+      "author": "Main menu → File Transfer → Join Network. The address that appears on this screen is the one you will type on the KOReader side.",
+      "id": "join-network"
+    },
+    {
+      "title": "3 · Enter this address in KOReader",
+      "author": "In CrossDrop → Device IP..., type the address shown on this reader's screen (port 80, folder /Books). Save it once and CrossDrop remembers it.",
+      "id": "address"
+    },
+    {
+      "title": "4 · Send your current book",
+      "author": "Gear menu → CrossDrop → Send current book. Optionally pick Destination folder... first. Watch the live progress dialog here and on the sender.",
+      "id": "send"
+    },
+    {
+      "title": "5 · The book lands on this reader",
+      "author": "When the send finishes, the book is on this SD card in the folder you picked and shows up in this reader's library — nothing else to do.",
+      "id": "landing"
+    },
+    {
+      "title": "No router? Use the reader hotspot",
+      "author": "Main menu → File Transfer → Create Hotspot on this reader, join that Wi-Fi from the sender, then pick CrossDrop → CrossDrop hotspot (192.168.4.1) — no address to type.",
+      "id": "hotspot"
+    },
+    {
+      "title": "Verify the connection",
+      "author": "CrossDrop → Check device... on the sender confirms this reader answered. If a send fails, confirm the address matches the Join Network screen.",
+      "id": "verify"
+    }
+  ]
+}
