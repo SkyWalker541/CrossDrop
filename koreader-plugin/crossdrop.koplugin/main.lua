@@ -230,7 +230,7 @@ function CROSSDROP:req(method, url, headers, source_fn)
             local s = socket.tcp()
             if s then
                 pcall(function()
-                    s:settimeout(20)
+                    s:settimeout(10)
                 end)
             end
             return s
@@ -681,8 +681,8 @@ function CROSSDROP:statusDialog()
     end
     local details = body or ""
     if JSON then
-        local parsed = JSON.decode(body)
-        if type(parsed) == "table" then
+        local okj, parsed = pcall(JSON.decode, body)
+        if okj and type(parsed) == "table" then
             details = string.format("IP %s  ·  %s\nversion %s  ·  mode %s",
                 tostring(parsed.ip or target.ip),
                 tostring(parsed.device or "CrossDrop reader"),
