@@ -34,8 +34,8 @@ reinstall, no new card content needed. (Readers must be online to load it;
 previous steps work offline since File Transfer itself is built in.)
 
 **Tapping the item** downloads one file — `hosted/crossdrop/instructions.txt`,
-the whole setup guide in a single TXT — to `/Books` as
-`CrossDrop-Instructions.txt`. The catalog shows a single one-line item
+the whole setup guide in a single TXT — to a `CrossDrop Instructions` folder
+as `CrossDrop-Instructions.txt`. The catalog shows a single one-line item
 ("Download instructions (TXT)"), so there's no list clutter and one tap gets
 the entire guide.
 
@@ -52,8 +52,8 @@ the entire guide.
   served to the reader from GitHub (`raw.githubusercontent.com`). Not installed
   to the card.
 - `hosted/crossdrop/instructions.txt` — the full setup guide in one TXT file,
-  downloaded to `/Books` when the item is tapped (wired in `device.json` →
-  `download`).
+  downloaded to the `CrossDrop Instructions` folder when the item is tapped
+  (wired in `device.json` → `download`).
 
 ## Install
 

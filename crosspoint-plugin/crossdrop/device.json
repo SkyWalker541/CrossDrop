@@ -16,7 +16,7 @@
   },
   "download": {
     "url": "https://raw.githubusercontent.com/SkyWalker541/CrossDrop/main/hosted/crossdrop/instructions.txt",
-    "dest_dir": "/Books",
+    "dest_dir": "/CrossDrop Instructions",
     "filename": "CrossDrop-Instructions.txt"
   }
 }
