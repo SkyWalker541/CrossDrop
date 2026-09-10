@@ -7,8 +7,8 @@ cd "$ROOT"
 rm -rf releases
 mkdir -p releases
 
-zip -r -q releases/CrossDrop-SD-Plugin.zip crosspoint-plugin/crossdrop
-zip -r -q releases/CrossDrop-Plugin.zip koreader-plugin/crossdrop.koplugin
+( cd crosspoint-plugin && zip -r -q "$ROOT/releases/CrossDrop-SD-Plugin.zip" crossdrop )
+( cd koreader-plugin && zip -r -q "$ROOT/releases/CrossDrop-Plugin.zip" crossdrop.koplugin )
 
 echo "Built:"
 ls -1 releases/
