@@ -59,18 +59,32 @@ works on the target device** — check the installed storefront plugin
 (`/Volumes/Kindle/koreader/plugins/storefront.koplugin/`) or KOReader core
 on the device (`/Volumes/Kindle/koreader/frontend/…`). If neither storefront
 nor core does it that way, don't invent it — find the closest proven pattern
-and use that instead. (Lesson: a hand-rolled text Button appended into the
-TitleBar OverlapGroup post-init painted over the ✕ and never received taps
-on-device — 1.3.11, reverted in 1.3.12 to the FileManager-style
-`right_icon` + `setRightIcon` swap.)
+and use that instead.
 
-Proven patterns used by this plugin:
-- TitleBar icon slots (`left_icon`/`right_icon` + `*_tap_callback`,
-  `allow_flash = false`) — FileManager's select mode does the
-  `setRightIcon("plus" ↔ "check")` swap on this exact build.
-- ConfirmBox/ButtonDialog buttons (`ok_text`, `ok_callback`) — storefront
-  uses the same mechanism for labeled buttons.
+Hard-won device lessons (KPW5SE, KOReader 2026.07.2):
+- **`custom_title_bar` NEVER rendered on this device** (v1.3.9–1.3.13): the
+  picker's own TitleBar (left ✕ / right ✓ icons) was silently ignored by the
+  BookList/Menu chain — the user only ever saw Menu's BUILT-IN title bar
+  (centered title, ✕ top-right, subtitle = folder path), and no ✓ icon ever
+  appeared. Don't pass `custom_title_bar` to FileChooser; use Menu's own bar.
+- **The user-visible send action is a synthetic top row** injected by
+  overriding `fc:genItemTable` (the same in-core pattern as FileChooser's own
+  "⬆ ../" row: `{text=…, path=SENTINEL, is_file=true}` → Menu routes its tap
+  to `onFileSelect`). Rows are the only picker element proven to render and
+  tap on this device. Call `fc:refreshPath()` once after the override so the
+  initial listing includes it (FileChooser:init already ran during :new).
+- **File rows dim but lose hand-edited `text`** across navigations
+  (`getListItem` regenerates `item.text` from the filename per folder
+  change) — `item.dim` survives a rebuild, the ✓ prefix does not. Treat dim
+  as the selection indicator; don't rely on edited row text persisting.
+- Menu's built-in title-bar ✕ closes via the `close_callback` option
+  (FileManager uses it) — wire exit-to-dashboard there.
+- ConfirmBox/ButtonDialog buttons (`ok_text`, `ok_callback`) are proven —
+  storefront uses the same mechanism for labeled buttons.
 - Anything that closes its container must set `allow_flash = false`
   (storefront's rule), or KOReader crashes on the destroyed widget.
-- Never pass a `selected` option to Menu-derived widgets (FocusManager
-  owns that field — the 1.3.9 crash); the picker set is named `picked`.
+- Never pass a `selected` option to Menu-derived widgets (FocusManager owns
+  that field — the 1.3.9 crash); the picker set is named `picked`.
+- **WiFi only** — the reader's hotspot mode was dropped (never worked
+  reliably); `configuredTargets()` returns exactly one `wifi` target whose
+  `ip` is `""` until the user sets it (probe answers "not set").

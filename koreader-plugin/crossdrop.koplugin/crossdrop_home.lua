@@ -14,12 +14,12 @@
 -- and "Send more books…"/"Try again" keep going from the same window.
 --
 -- Uses only the plugin API exported from main.lua:
---   configuredTargets() -> {kind, ip, port, folder}[]  (WiFi first)
---   resolveTarget()     -> primary target (WiFi when set, else HotSpot)
+--   configuredTargets() -> {kind, ip, port, folder}[]  (WiFi only)
+--   resolveTarget()     -> the WiFi target
 --   probeTarget(target) -> (ok, info?); "down" statuses are cheap (3s timeout)
---   sendCurrentBook()   -> probes WiFi then HotSpot, streams to whichever answers
---   chooseAndSend()     -> the multi-select book picker (✓ sends the selection)
---   editIp(kind)        -> input dialog for "wifi" or "hotspot"
+--   sendCurrentBook()   -> probes WiFi and streams to it
+--   chooseAndSend()     -> the multi-select book picker (the send row sends)
+--   editIp(kind)        -> input dialog for the WiFi IP
 --   statusDialog(), currentBookPath()
 
 local Blitbuffer = require("ffi/blitbuffer")
@@ -75,8 +75,6 @@ local function reach_summary(reach)
     local parts = {}
     if reach.wifi == "ok" then parts[#parts + 1] = _("WiFi \226\151\128") end
     if reach.wifi == "down" then parts[#parts + 1] = _("WiFi \226\151\138") end
-    if reach.hotspot == "ok" then parts[#parts + 1] = _("HotSpot \226\151\128") end
-    if reach.hotspot == "down" then parts[#parts + 1] = _("HotSpot \226\151\138") end
     if #parts == 0 then return nil end
     return table.concat(parts, "  " .. string.char(0xB7) .. "  ")
 end
@@ -121,7 +119,7 @@ function HomeDialog:init()
     local folder = (target and target.folder) or "/CrossDropped Files"
     local summary = reach_summary(reach)
     local subtitle
-    if reach.wifi == "down" and reach.hotspot == "down" then
+    if reach.wifi == "down" then
         subtitle = _("No reader reached \226\128\148 is File Transfer open?")
     elseif summary then
         subtitle = folder .. "  \226\134\146  " .. summary
@@ -305,7 +303,7 @@ function HomeDialog:check(kind)
     -- The probe is a bounded blocking call on the UI thread (3s, see main:req);
     -- paint a notice first so the tap never looks like a freeze.
     local checking = Notification:new{
-        text = (kind == "wifi" and _("Checking WiFi…") or _("Checking HotSpot…")),
+        text = _("Checking WiFi\226\128\166"),
         timeout = 0,
     }
     UIManager:show(checking)
@@ -318,11 +316,11 @@ function HomeDialog:check(kind)
     if ok then
         local who = info and info.device and tostring(info.device) or "CrossDrop reader"
         local ver = info and info.version and tostring(info.version) or ""
-        local text = (kind == "wifi" and _("WiFi reachable: ") or _("HotSpot reachable: "))
+        local text = _("WiFi reachable: ")
             .. who .. (ver ~= "" and ("  v" .. ver) or "")
         UIManager:show(Notification:new{ text = text, timeout = 4 })
     else
-        local text = (kind == "wifi" and _("Could not reach WiFi: ") or _("Could not reach HotSpot: "))
+        local text = _("Could not reach WiFi: ")
             .. tostring(err or "network error")
         UIManager:show(Notification:new{ text = text, timeout = 5 })
     end
@@ -357,19 +355,6 @@ function HomeDialog:renderConnections()
     end
     table.insert(vg,self:row(_("Set WiFi IP\226\128\166"), {
         callback = function() self.plugin:editIp("wifi", function() self:refresh() end) end,
-    }))
-
-    table.insert(vg,self:header(_("HotSpot connection")))
-    local hotspot = self:targetFor("hotspot")
-    if hotspot then
-        table.insert(vg,self:row(
-            string.format("HotSpot   %s\n%s  \226\128\164  %s", ip_str(hotspot),
-                _("File Transfer \226\134\146 Create Hotspot"), status_word(reach.hotspot)), {
-            callback = function() self:check("hotspot") end,
-        }))
-    end
-    table.insert(vg,self:row(_("Set HotSpot IP\226\128\166"), {
-        callback = function() self.plugin:editIp("hotspot", function() self:refresh() end) end,
     }))
 
     table.insert(vg,TextBoxWidget:new{
@@ -414,13 +399,8 @@ function HomeDialog:renderSendIdle()
     end
 
     table.insert(vg,self:header(_("Destination")))
-    local target = self.plugin:resolveTarget() or { ip = "?", port = 80, folder = "/CrossDropped Files", kind = "?" }
-    local which
-    if target.kind == "wifi" then
-        which = _("via WiFi")
-    else
-        which = _("via HotSpot (WiFi not set)")
-    end
+    local target = self.plugin:resolveTarget() or { ip = "?", port = 80, folder = "/CrossDropped Files", kind = "wifi" }
+    local which = _("via WiFi")
     table.insert(vg,self:row(
         string.format("%s  \226\134\146  %s\n%s  \226\128\164  tap to check the reader", ip_str(target), folder_str(target), which), {
         callback = function() self.plugin:statusDialog() end,
@@ -429,9 +409,9 @@ function HomeDialog:renderSendIdle()
         callback = function() self.plugin:statusDialog() end,
     }))
 
-    if reach.wifi ~= "ok" and reach.hotspot ~= "ok" then
+    if reach.wifi ~= "ok" then
         table.insert(vg,TextBoxWidget:new{
-            text = _("Send probes WiFi first, then the HotSpot, and uses whichever answers.\nNo connection checked yet or none reachable."),
+            text = _("Send uses the WiFi connection.\nNo connection checked yet or none reachable."),
             face = Font:getFace("smallinfofont"),
             width = self.row_w,
         })
@@ -564,7 +544,7 @@ function HomeDialog:renderSendConnecting()
     table.insert(vg, TextBoxWidget:new{
         text = target
             and string.format("Connected     %s\n%s  \226\134\146  %s",
-                target.kind == "hotspot" and _("HotSpot") or _("WiFi"),
+                _("WiFi"),
                 ip_str(target), folder_str(target))
             or _("Connecting to CrossDrop \226\128\166"),
         face = Font:getFace("cfont", 18),
@@ -572,7 +552,7 @@ function HomeDialog:renderSendConnecting()
     })
     if not target then
         table.insert(vg, TextBoxWidget:new{
-            text = _("Looking for the reader on your network. It probes WiFi first, then the HotSpot — each answers within seconds."),
+            text = _("Looking for the reader on your network. It answers within seconds."),
             face = Font:getFace("smallinfofont"),
             width = self.row_w,
         })
@@ -601,7 +581,7 @@ function HomeDialog:renderSendProgress()
     local subt
     if target then
         subt = string.format("%s  %s  \226\134\146  %s",
-            target.kind == "hotspot" and _("HotSpot") or _("WiFi"),
+            _("WiFi"),
             ip_str(target), folder_str(target))
     else
         subt = ""

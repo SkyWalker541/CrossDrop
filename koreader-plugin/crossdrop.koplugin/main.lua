@@ -12,14 +12,13 @@ network. It uses only the built-in web-server endpoints — no custom firmware:
 Every transfer lands in the fixed **CrossDropped Files** folder on the reader's
 SD card — there is no folder picker, nothing to configure.
 
-Two connections are supported, matching the reader's two File Transfer modes:
+One connection is supported, matching the reader's File Transfer mode:
 
     WiFi          File Transfer → Join Network   (address shown on screen)
-    HotSpot       File Transfer → Create Hotspot (always 192.168.4.1)
 
-Each has its own stored IP. Sending a book probes both (in that order) and
-streams to whichever answers — so a user can move between a router network and
-the reader's own hotspot without re-entering anything.
+Its stored IP is set on the Connections tab. Sending a book probes it and
+streams the book to the reader over the shared Wi-Fi network. (The reader's
+"Create Hotspot" mode was dropped: it never worked reliably.)
 
 On the reader side, the matching "CrossDrop" SD plugin (the `crossdrop-plugin`
 folder on the SD card) is a setup-guide screen (Settings → System → Plugins).
@@ -40,7 +39,6 @@ local lfs = require("libs/libkoreader-lfs")
 local logger = require("logger")
 local _ = require("gettext")
 
-local DEFAULT_HOTSPOT_IP = "192.168.4.1"
 local DEFAULT_FOLDER = "/CrossDropped Files"
 
 -- UI extras (toast, live progress, full-screen Home) are sibling modules in
@@ -131,34 +129,24 @@ local function base_url(target)
     return string.format("http://%s:%d", target.ip, target.port or 80)
 end
 
--- ────────────────────── connections (WiFi + HotSpot) ─────────────────────
-
-local function hotspotIp()
-    return G_reader_settings:readSetting("crossdrop_hotspot_ip") or DEFAULT_HOTSPOT_IP
-end
+-- ───────────────────────────── connection (WiFi) ────────────────────────────
 
 local function wifiIp()
     return G_reader_settings:readSetting("crossdrop_wifi_ip")
 end
 
 -- Settings keys are version-independent and only ever change when the user
--- taps "Set WiFi/HotSpot IP": crossdrop_wifi_ip / crossdrop_hotspot_ip /
--- crossdrop_port persist in KOReader's global settings (settings.reader.lua,
--- on the SD card) forever — nothing in this plugin writes a default over a
--- saved WiFi IP. WiFi empty == deliberately unset (so sends fall back to the
--- HotSpot); HotSpot empty == factory default 192.168.4.1.
+-- taps "Set WiFi IP": crossdrop_wifi_ip / crossdrop_port persist in KOReader's
+-- global settings (settings.reader.lua, on the SD card) forever — nothing in
+-- this plugin writes a default over a saved WiFi IP. WiFi empty == the user
+-- has not set it yet (the dashboard prompts for it).
 local function setIp(kind, ip)
     ip = tostring(ip or ""):match("^%s*(.-)%s*$") or ""
-    if kind == "hotspot" then
-        G_reader_settings:saveSetting("crossdrop_hotspot_ip",
-            (ip == "" and DEFAULT_HOTSPOT_IP or ip))
+    if ip == "" then
+        G_reader_settings:saveSetting("crossdrop_wifi_ip", nil)
     else
-        G_reader_settings:saveSetting("crossdrop_wifi_ip", (ip == "" and nil or ip))
+        G_reader_settings:saveSetting("crossdrop_wifi_ip", ip)
     end
-end
-
-local function connectionLabel(kind)
-    return kind == "hotspot" and _("HotSpot") or _("WiFi")
 end
 
 function CROSSDROP:init()
@@ -212,29 +200,29 @@ function CROSSDROP:req(method, url, headers, source_fn, timeout)
     return nil, tostring(code or body or "unknown error"), body
 end
 
--- The two connections in send order: WiFi first, then the reader hotspot.
--- Both always target the fixed CrossDropped Files folder on the reader's card.
+-- The single connection in send order: WiFi (the reader's File Transfer →
+-- Join Network address). It always targets the fixed CrossDropped Files
+-- folder on the reader's card. The IP is empty until the user sets it.
 function CROSSDROP:configuredTargets()
     local port = tonumber(G_reader_settings:readSetting("crossdrop_port") or 80) or 80
-    local list = {}
-    local wifi = wifiIp()
-    if wifi then
-        list[#list + 1] = { kind = "wifi", ip = wifi, port = port, folder = DEFAULT_FOLDER }
-    end
-    list[#list + 1] = { kind = "hotspot", ip = hotspotIp(), port = port, folder = DEFAULT_FOLDER }
-    return list
+    return {
+        { kind = "wifi", ip = wifiIp() or "", port = port, folder = DEFAULT_FOLDER },
+    }
 end
 
--- Primary target (WiFi when set, otherwise HotSpot). Used by dialogs that
--- operate on "the" device (status checks, checks).
+-- The connection. Used by dialogs that operate on "the" device (status
+-- checks, sends).
 function CROSSDROP:resolveTarget()
     return self:configuredTargets()[1]
 end
 
--- Probe one connection with GET /api/status. Returns (true, info_table_or_nil)
+-- Probe the connection with GET /api/status. Returns (true, info_table_or_nil)
 -- or (nil, nil, error_text). The parsed JSON is optional — a device that
 -- answers with a non-JSON body still counts as reachable.
 function CROSSDROP:probeTarget(target)
+    if not target or not target.ip or target.ip == "" then
+        return nil, nil, _("WiFi IP not set (see the Connections tab)")
+    end
     local ok, code, body = self:req("GET", base_url(target) .. "/api/status", nil, nil, 3)
     if ok then
         local info
@@ -307,40 +295,34 @@ function CROSSDROP:currentBookPath()
     return doc.file
 end
 
--- The whole "nothing answered" message: the Tried list (with each probe's own
--- error) plus the two concrete fixes. The HotSpot line matters a lot: the
--- reader's Create Hotspot screen bridges a guest network — this Kindle must
--- JOIN that network (CrossPoint firmware names it "CrossDrop-…"), it cannot
--- reach 192.168.4.1 while sitting on the home router.
+-- The whole "nothing answered" message: the Tried list (with the probe's own
+-- error) plus the concrete fixes.
 function CROSSDROP:noReaderText()
     return _("No CrossDrop reader reached.\n\nTried:\n") .. self:connectionSummary() ..
-        _("\n\nThis device must be on the reader's network:\n\226\128\162  WiFi:  same router as the reader, correct IP.\n\226\128\162  HotSpot:  join the reader's \"CrossDrop\226\128\166\" Wi-Fi\n    network (its Create Hotspot screen shows the\n    name and the IP to enter here).\n\nOpen File Transfer\226\128\148Receive Books on the reader.")
+        _("\n\nCheck:\n\226\128\162  The reader is on and shows File Transfer\226\128\148Receive Books.\n\226\128\162  This Kindle is on the SAME Wi-Fi as the reader.\n\226\128\162  The WiFi IP matches the address the reader shows on\n    its Receive Books screen (set it on the Connections tab).")
 end
 
 -- The "Tried:" section for the no-connection error message. When a probe just
--- ran, appends its per-connection result ("[timeout]", "[connection refused]")
--- so the message says what actually happened instead of just listing addresses.
+-- ran, appends its result ("[timeout]", "[connection refused]") so the message
+-- says what actually happened instead of just listing the address.
 function CROSSDROP:connectionSummary()
     local errs = self._probe_errors or {}
     local lines = {}
     for _, t in ipairs(self:configuredTargets()) do
         local result = errs[t.kind] and ("[" .. errs[t.kind] .. "]") or "no reply"
-        lines[#lines + 1] = "  " .. connectionLabel(t.kind) .. "  " .. t.ip ..
+        lines[#lines + 1] = "  WiFi  " .. t.ip ..
             "  \226\134\146  " .. (t.folder or DEFAULT_FOLDER) .. "   " .. result
     end
     return table.concat(lines, "\n")
 end
 
--- Edit the IP for one connection ("wifi" or "hotspot").
--- `on_saved` runs after the dialog closes so the open dashboard can repaint.
+-- Edit the WiFi IP. `on_saved` runs after the dialog closes so the open
+-- dashboard can repaint.
 function CROSSDROP:editIp(kind, on_saved)
-    local is_hotspot = kind == "hotspot"
-    local current = is_hotspot and hotspotIp() or (wifiIp() or "")
     local ip_dialog
     ip_dialog = InputDialog:new{
-        title = (is_hotspot and _("HotSpot IP (File Transfer → Create Hotspot)")
-            or _("WiFi IP (File Transfer → Join Network)")),
-        input = current,
+        title = _("WiFi IP (File Transfer → Join Network)"),
+        input = wifiIp() or "",
         type = "text",
         -- modal=true is REQUIRED here: Home is a modal full-screen dialog, and
         -- UIManager stacks non-modal widgets BELOW an existing modal — a plain
@@ -404,7 +386,7 @@ function CROSSDROP:statusDialog()
     local details
     if type(info) == "table" then
         details = string.format("%s:\nIP %s  ·  %s\nversion %s  ·  mode %s",
-            connectionLabel(target.kind),
+            _("WiFi"),
             tostring(info.ip or target.ip),
             tostring(info.device or "CrossDrop reader"),
             tostring(info.version or "?"),
@@ -413,7 +395,7 @@ function CROSSDROP:statusDialog()
             details = details .. string.format("\nWi-Fi RSSI %d dBm", info.rssi)
         end
     else
-        details = string.format("%s: %s", connectionLabel(target.kind), tostring(target.ip))
+        details = string.format("%s: %s", _("WiFi"), tostring(target.ip))
     end
     UIManager:show(InfoMessage:new{
         text = _("CrossDrop device found:\n\n") .. details,
@@ -616,13 +598,15 @@ end
 -- "Send A Book": open the FileManager file browser (a modal FileChooser — the
 -- same list widget FileManager hosts, shown full-screen so it paints ABOVE
 -- the Home dialog) in PICK mode: tapping a book toggles it in the selection
--- (dimmed row + a ✓ prefix), and the title-bar ✓ sends the whole selection
--- (one or many) through a confirm dialog, straight back into the open
--- dashboard — nothing closes, transfers run inside Home, more books follow.
+-- (dimmed row). THE SEND ACTION IS THE FIRST ROW of the listing — "Send to
+-- Xteink" — always visible, updated with the running count, exactly like the
+-- synthetic "⬆ ../" row FileChooser itself injects (same genItemTable
+-- pattern). Menu's OWN title bar (✕ top-right, centered title) is used as-is
+-- — the user sees and uses it already; a custom_title_bar was never picked up
+-- by this build's BookList/Menu chain, which is why no ✓ icon ever rendered.
 function CROSSDROP:chooseAndSend()
     local DocumentRegistry = require("document/documentregistry")
     local FileChooser = require("ui/widget/filechooser")
-    local TitleBar = require("ui/widget/titlebar")
     local ConfirmBox = require("ui/widget/confirmbox")
     local start_path
     local ok_util, filemanagerutil = pcall(require, "apps/filemanager/filemanagerutil")
@@ -647,7 +631,9 @@ function CROSSDROP:chooseAndSend()
 
     local plugin = self
     local fc
-    local custom_title_bar
+    -- The sentinel path of the synthetic send row (never a real file: paths
+    -- contain "/" and cannot look like this).
+    local SEND_ROW_PATH = "__crossdrop_send__"
 
     -- Lifted from Storefront's confirm flows: a "Send N book(s)?" confirm
     -- dialog gives the explicit go-ahead the user asked for, then hands the
@@ -685,63 +671,36 @@ function CROSSDROP:chooseAndSend()
         UIManager:show(confirm)
     end
 
-    -- Keep the running selection visible: the count lives in the TITLE (Menu
-    -- replaces the subtitle with the folder path on navigation — menu.lua
-    -- switchItemTable — so a count there would be lost; the title survives).
-    local function refreshSelectionTitle()
+    local function pickedCount()
         local n = 0
         for _ in pairs(fc.picked or {}) do n = n + 1 end
-        custom_title_bar:setTitle((n > 0)
-            and string.format(_("Send A Book  \226\128\164  %d selected"), n)
-            or _("Send A Book"), true)
+        return n
     end
 
-    -- The browser needs a visible way back to the CrossDrop menu (it is a
-    -- modal over Home, and a bare FileChooser has no close button). Left ✕
-    -- closes without sending — and always lands back on the CrossDrop
-    -- dashboard; the right ✓ is the send action (tap with nothing picked =
-    -- hint, with books picked = confirm dialog). Both are the core TitleBar
-    -- icon slots — the exact pattern FileManager uses on this build and the
-    -- one this picker already used successfully on-device (v1.3.10) — and
-    -- both follow the allow_flash=false rule from Storefront: any button
-    -- that closes its container must not flash after the callback runs, or
-    -- KOReader crashes on the destroyed widget.
-    custom_title_bar = TitleBar:new{
-        title = _("Send A Book"),
-        subtitle = _("Tap books to pick them  \226\128\164  then tap \226\156\147 to send"),
-        fullscreen = "true",
-        align = "center",
-        button_padding = Device.screen:scaleBySize(5),
-        left_icon = "close",
-        left_icon_size_ratio = 1,
-        left_icon_tap_callback = function()
-            -- Storefront's close idiom (explicit "ui" refresh on close)…
-            UIManager:close(fc, "ui")
-            -- …and exiting must ALWAYS land on the CrossDrop dashboard: if
-            -- Home is still open, repaint it in place; if it was closed in
-            -- the meantime (or the picker was opened without it), open it.
-            if plugin.home then
-                UIManager:setDirty(plugin.home, "ui")
-                UIManager:forceRePaint()
-            else
-                plugin:openHome()
-            end
-        end,
-        left_icon_allow_flash = false,
-        right_icon = "check", -- the send action; tap with 0 picked = hint
-        right_icon_size_ratio = 1,
-        right_icon_tap_callback = function()
-            local paths = {}
-            for p in pairs(fc.picked or {}) do paths[#paths + 1] = p end
-            if #paths == 0 then
-                toastModule().show(_("Tap a book first \226\128\148 then tap \226\156\147 (top right) to send."), 4)
-                return
-            end
-            confirmAndSend(paths)
-        end,
-        right_icon_allow_flash = false,
-        show_parent = nil, -- patched to fc right below
-    }
+    -- The send row always names the action; once books are picked it carries
+    -- the count too, so it doubles as the selection readout.
+    local function sendRowText()
+        local n = pickedCount()
+        if n > 0 then
+            return string.format(_("Send to Xteink  \226\128\162  %d book(s) selected"), n)
+        end
+        return _("Send to Xteink  \226\128\162  pick books below")
+    end
+
+    -- Keep the running selection visible in Menu's own title (the count is
+    -- also in the send row; Menu replaces the subtitle with the folder path
+    -- on navigation — switchItemTable — but the title survives).
+    local function refreshSelectionTitle()
+        local n = pickedCount()
+        if fc.title_bar and fc.title_bar.setTitle then
+            fc.title_bar:setTitle((n > 0)
+                and string.format(_("Send A Book  \226\128\164  %d selected"), n)
+                or _("Send A Book"), true)
+        end
+        if fc._send_item then
+            fc._send_item.text = sendRowText()
+        end
+    end
 
     fc = FileChooser:new{
         ui = ui_shim,
@@ -756,17 +715,54 @@ function CROSSDROP:chooseAndSend()
         -- do arithmetic on a nil `y` (FocusManager:_init copies the option's
         -- x/y) and crashed KOReader the moment the browser opened.
         picked = {}, -- path -> true, the multi-select picker set
-        -- use our title bar (with the close + send icons) instead of Menu's default
-        custom_title_bar = custom_title_bar,
+        -- Menu's built-in title bar ✕ (top-right) closes the picker; make
+        -- sure exiting always lands back on the CrossDrop dashboard.
+        close_callback = function()
+            if plugin.home then
+                UIManager:setDirty(plugin.home, "ui")
+                UIManager:forceRePaint()
+            else
+                plugin:openHome()
+            end
+        end,
     }
-    custom_title_bar.show_parent = fc
 
-    -- Tap = toggle in the picker. Dimmed rows + a ✓ prefix mark the selection;
-    -- folders keep navigating normally (Menu routes those to changeToPath).
+    -- Inject the "Send to Xteink" row at the top of every listing, the same
+    -- in-core pattern FileChooser's genItemTable itself uses for the "⬆ ../"
+    -- row: it is re-inserted on every folder change (genItemTableFromPath
+    -- runs per navigation), so it is ALWAYS the first row, everywhere.
+    local orig_genItemTable = fc.genItemTable
+    function fc:genItemTable(dirs, files, path)
+        local t = orig_genItemTable
+            and orig_genItemTable(self, dirs, files, path)
+            or {}
+        self._send_item = {
+            text = sendRowText(),
+            path = SEND_ROW_PATH,
+            is_file = true, -- Menu:onMenuSelect routes is_file taps to onFileSelect
+            bold = true,
+        }
+        table.insert(t, 1, self._send_item)
+        return t
+    end
+
+    -- Tap = toggle in the picker. Dimmed rows mark the selection; folders keep
+    -- navigating normally (Menu routes those to changeToPath). The synthetic
+    -- send row starts the transfer (or the hint when nothing is picked).
     -- Must be defined HERE, after fc exists: Lua evaluates `function fc:m()`
     -- at definition time (nil fc would raise "attempt to index local 'fc'").
     function fc:onFileSelect(item)
         local path = item and item.path
+        if path == SEND_ROW_PATH then
+            local paths = {}
+            for p in pairs(fc.picked or {}) do paths[#paths + 1] = p end
+            if #paths == 0 then
+                toastModule().show(_("Tap books below to pick them \226\128\148 then this row sends them."), 4)
+                return true
+            end
+            confirmAndSend(paths)
+            return true
+        end
         if not path then return true end
         local base = path:match("([^/]+)$") or item.text or path
         if fc.picked[path] then
@@ -781,6 +777,12 @@ function CROSSDROP:chooseAndSend()
         fc:updateItems(1, true)
         refreshSelectionTitle()
         return true
+    end
+
+    -- FileChooser:init ran inside FileChooser:new, before the overrides
+    -- above existed, so the initial listing has no send row yet: rebuild it.
+    if fc.refreshPath then
+        fc:refreshPath()
     end
 
     UIManager:show(fc)

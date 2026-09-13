@@ -425,24 +425,33 @@ local pok, presult = inst:putFile({ ip = "192.168.1.50", port = 80, folder = "/C
 check("putFile success", pok == true, presult)
 check("putFile progress reported", #seen > 0 and seen[#seen] == 256000, #seen and "#seen=" .. #seen)
 
--- 3. two connections: WiFi first (when set), HotSpot always present, fixed folder
+-- 3. ONE connection: WiFi only (hotspot was dropped), fixed folder
 inst:saveTarget({ ip = "192.168.1.50", port = 80 })
 local targets = inst:configuredTargets()
-check("configuredTargets: wifi first", targets[1] and targets[1].kind == "wifi" and targets[1].ip == "192.168.1.50", targets[1] and targets[1].kind)
-check("configuredTargets: hotspot always present", targets[2] and targets[2].kind == "hotspot" and targets[2].ip == "192.168.4.1", targets[2] and targets[2].ip)
-check("both connections use CrossDropped Files", targets[1].folder == "/CrossDropped Files" and targets[2].folder == "/CrossDropped Files", targets[1].folder and targets[2].folder)
-check("resolveTarget picks wifi", inst:resolveTarget() and inst:resolveTarget().kind == "wifi")
+check("configuredTargets: wifi only, no hotspot",
+    #targets == 1 and targets[1].kind == "wifi" and targets[1].ip == "192.168.1.50",
+    #targets and ("#targets=" .. #targets))
+check("wifi uses CrossDropped Files", targets[1].folder == "/CrossDropped Files", targets[1].folder)
+check("resolveTarget is the wifi target", inst:resolveTarget() and inst:resolveTarget().kind == "wifi")
 
--- 4b. probeReachable answers the reachable connection; falls back to hotspot
+-- 4b. probeReachable answers the reachable connection; with no IP set it
+-- reports the not-set error instead of falling back to anything
 local reached = inst:probeReachable()
 check("probeReachable finds wifi", reached and reached.kind == "wifi", reached and reached.kind)
 G_reader_settings:saveSetting("crossdrop_wifi_ip", nil)
 local reached_be = inst:probeReachable()
-check("probeReachable falls back to hotspot", reached_be and reached_be.kind == "hotspot", reached_be and reached_be.kind)
+check("probeReachable with no IP set reports 'not set'",
+    reached_be == nil and inst._probe_errors.wifi and tostring(inst._probe_errors.wifi):match("not set"),
+    inst._probe_errors and inst._probe_errors.wifi)
 
 -- 4c. probeTarget parses device info
 local pok2, pinfo = inst:probeTarget({ kind = "wifi", ip = "192.168.1.50", port = 80 })
 check("probeTarget ok + info", pok2 == true and pinfo and pinfo.device == "X4", pinfo and pinfo.device)
+
+-- 4d. probe with an unset IP is a clean "not set" answer, not a network call
+local pok3, _, perr3 = inst:probeTarget({ kind = "wifi", ip = "", port = 80 })
+check("probeTarget with empty IP answers 'not set'",
+    pok3 == nil and perr3 and tostring(perr3):match("not set"), perr3)
 
 -- 4d. probe failure (LuaSocket string error) does not crash
 FAKE.fail = true
@@ -459,11 +468,13 @@ check("send success shows Book sent", last_notif and type(last_notif.text) == "s
 
 -- 5b. "Send A Book" picker opens a MODAL file browser above the full-screen
 -- Home (non-modal would stack below it, exactly like the old IP dialog bug),
--- in multi-select mode: tapping toggles books (dimmed + ✓), the title shows
--- the running count, and the top-right ✓ is the send action — tap with 0
--- picked for a hint, with books picked for the confirm dialog whose OK
--- button is the labeled "Send to Xteink" button. Exiting (✕) always lands
--- back on the CrossDrop dashboard.
+-- in multi-select mode: tapping toggles books (dim + ✓). THE SEND ACTION IS
+-- THE FIRST ROW of the listing — "Send to Xteink", always visible, re-inserted
+-- on every folder navigation (the same genItemTable pattern as FileChooser's
+-- own "⬆ ../" row) — tap with 0 picked for a hint, with books picked for the
+-- confirm dialog whose OK button is the labeled "Send to Xteink" button.
+-- Menu's OWN title bar (✕ top-right) is used; exiting always lands back on
+-- the CrossDrop dashboard.
 
 UIManager._shown = {}
 inst:chooseAndSend()
@@ -477,31 +488,33 @@ check("chooser starts with an empty picker set",
     chooser and type(chooser.picked) == "table" and next(chooser.picked) == nil)
 check("chooser picked does NOT collide with FocusManager's selected field",
     chooser and chooser.selected == nil, chooser and chooser.selected)
-check("✕ close button stays on the title bar (left icon, wired)",
-    chooser and chooser.custom_title_bar and chooser.custom_title_bar.left_icon == "close"
-        and type(chooser.custom_title_bar.left_icon_tap_callback) == "function",
-    chooser and chooser.custom_title_bar and chooser.custom_title_bar.left_icon)
-check("✓ send mark is on the title bar from the start (right icon, wired)",
-    chooser and chooser.custom_title_bar and chooser.custom_title_bar.right_icon == "check"
-        and type(chooser.custom_title_bar.right_icon_tap_callback) == "function",
-    chooser and chooser.custom_title_bar and chooser.custom_title_bar.right_icon)
+local listing = chooser:genItemTable({}, {}, "/Books")
+check("send row is the first row of the listing",
+    listing and listing[1] and listing[1].path == "__crossdrop_send__",
+    listing and listing[1] and listing[1].text)
+check("send row is tappable (is_file → Menu routes it to onFileSelect)",
+    listing and listing[1] and listing[1].is_file == true,
+    listing and listing[1])
+check("send row names the action from the start",
+    listing and listing[1] and tostring(listing[1].text):match("Send to Xteink"),
+    listing and listing[1] and listing[1].text)
 local fa = { path = "/tmp/fakebook.epub" }
 local fb = { path = "/tmp/fakebook2.epub" }
 chooser:onFileSelect(fa)
 check("tap picks a book (dim + ✓)", fa.dim == true and tostring(fa.text):match("\226\156\147"), fa.text)
-check("picker title shows the selection count",
-    chooser.custom_title_bar and tostring(chooser.custom_title_bar.title):match("1 selected"),
-    chooser.custom_title_bar and chooser.custom_title_bar.title)
+check("send row carries the count once books are picked",
+    chooser._send_item and tostring(chooser._send_item.text):match("1 book"),
+    chooser._send_item and chooser._send_item.text)
 chooser:onFileSelect(fb)
 chooser:onFileSelect(fa)
 check("tap toggles a book back off (no send on tap)",
     fa.dim == nil and chooser.picked["/tmp/fakebook.epub"] == nil)
-check("title count follows the selection",
-    chooser.custom_title_bar and tostring(chooser.custom_title_bar.title):match("1 selected"),
-    chooser.custom_title_bar and chooser.custom_title_bar.title)
+check("send row count follows the selection",
+    chooser._send_item and tostring(chooser._send_item.text):match("1 book"),
+    chooser._send_item and chooser._send_item.text)
 chooser:onFileSelect(fa) -- re-pick fa → both books picked (fa + fb)
 
--- the Send to Xteink confirm: closes the picker and runs the whole batch IN
+-- the send row confirm: closes the picker and runs the whole batch IN
 -- the dashboard (a fake Home sink records the flow; the real Home is
 -- exercised in section 14).
 local fake_home
@@ -519,9 +532,9 @@ fake_home = {
 }
 inst.home = fake_home
 UIManager._shown = {}
-chooser.custom_title_bar.right_icon_tap_callback()
+chooser:onFileSelect(chooser._send_item)
 local cdlg = UIManager._shown[#UIManager._shown]
-check("picker ✓ opens a confirm dialog with a Send to Xteink button",
+check("send row opens a confirm dialog with a Send to Xteink button",
     cdlg and cdlg.ok_text == "Send to Xteink" and tostring(cdlg.text):match("Send 2 book"),
     cdlg and ((cdlg.ok_text or "") .. " / " .. tostring(cdlg.text or "")))
 UIManager._shown = {}
@@ -544,16 +557,17 @@ inst.home = nil
 -- Send with nothing picked is a gentle hint, never a send
 UIManager._shown = {}
 chooser.picked = {}
-chooser.custom_title_bar.right_icon_tap_callback()
+chooser:onFileSelect(chooser._send_item)
 local hint0 = UIManager._shown[#UIManager._shown]
-check("Send with no selection shows a hint",
-    hint0 and type(hint0.text) == "string" and hint0.text:match("Tap a book"), hint0 and hint0.text)
+check("send row with no selection shows a hint",
+    hint0 and type(hint0.text) == "string" and hint0.text:match("Tap books"), hint0 and hint0.text)
 
--- exiting the picker ALWAYS lands back on the CrossDrop dashboard: if Home
--- is still open it is repainted; if it was closed meanwhile, it is reopened
+-- exiting the picker (Menu's built-in ✕ → close_callback) ALWAYS lands back
+-- on the CrossDrop dashboard: if Home is still open it is repainted; if it
+-- was closed meanwhile, it is reopened
 UIManager._shown = {}
 inst.home = nil
-chooser.custom_title_bar.left_icon_tap_callback()
+chooser.close_callback()
 check("✕ exits back to the CrossDrop dashboard (reopens Home if needed)",
     inst.home ~= nil, inst.home)
 inst.home = nil -- restore the pre-section state for the checks below
@@ -603,11 +617,6 @@ inst:editIp("wifi")
 local ipw = UIManager._shown[#UIManager._shown]
 check("editIp(wifi) opens dialog", type(ipw) == "table")
 check("editIp(wifi) dialog is modal (paints above Home)", ipw ~= nil and ipw.modal == true, ipw and ipw.modal)
-UIManager._shown = {}
-inst:editIp("hotspot")
-local iph = UIManager._shown[#UIManager._shown]
-check("editIp(hotspot) opens dialog", type(iph) == "table")
-check("editIp(hotspot) dialog is modal (paints above Home)", iph ~= nil and iph.modal == true, iph and iph.modal)
 
 -- 8b. send books always land in CrossDropped Files: folder setting cannot override
 G_reader_settings:saveSetting("crossdrop_folder", "/Books")
@@ -674,8 +683,8 @@ inst._reach = {}
 home:check("wifi")
 check("home check() marks wifi reachable", inst._reach.wifi == "ok", inst._reach.wifi)
 FAKE.fail = true
-home:check("hotspot")
-check("home check() marks hotspot down (no crash)", inst._reach.hotspot == "down", inst._reach.hotspot)
+home:check("wifi")
+check("home check() marks wifi down (no crash)", inst._reach.wifi == "down", inst._reach.wifi)
 FAKE.fail = false
 
 -- 11c. Tab switching and check() must NOT use UIManager:replace (that exact
@@ -719,7 +728,7 @@ UIManager._shown = {}
 inst:openHome()
 home = UIManager._shown[#UIManager._shown]
 home:showTab("connections")
-inst._reach = { wifi = "ok", hotspot = "down" }
+inst._reach = { wifi = "ok" }
 UIManager._shown = {}
 inst:editIp("wifi", function() home:refresh() end)
 local ipd = UIManager._shown[#UIManager._shown]
@@ -732,23 +741,22 @@ check("IP save repaints the open dashboard", home.frame ~= nil and home[1] ~= ni
 check("IP save clears remembered reach (stale probe)",
     next(inst._reach or {}) == nil, inst._reach and next(inst._reach))
 
--- 12c. the file browser has a visible way back: a custom title bar whose
--- close icon closes the chooser back to the CrossDrop menu.
+-- 12c. the file browser has a visible way back: Menu's own title-bar ✕ (the
+-- close the user already sees and uses) routes through the chooser's
+-- close_callback and always lands on the CrossDrop dashboard.
 UIManager._shown = {}
 inst:chooseAndSend()
 chooser = UIManager._shown[#UIManager._shown]
-check("browser has a title bar with a close button",
-    chooser and chooser.custom_title_bar
-        and chooser.custom_title_bar.left_icon == "close"
-        and type(chooser.custom_title_bar.left_icon_tap_callback) == "function"
-        and chooser.custom_title_bar.show_parent == chooser,
-    chooser and chooser.custom_title_bar and chooser.custom_title_bar.left_icon)
+check("browser wires Menu's built-in ✕ via close_callback",
+    chooser and type(chooser.close_callback) == "function",
+    chooser and chooser.close_callback)
 local closed = false
 local save_close = UIManager.close
 UIManager.close = function(_, w) if w == chooser then closed = true end end
-chooser.custom_title_bar.left_icon_tap_callback()
+chooser.close_callback()
 UIManager.close = save_close
-check("browser close button closes the chooser", closed)
+check("browser close_callback exits to the dashboard (Home reopened)",
+    closed or inst.home ~= nil, closed and "closed" or inst.home)
 
 -- 13. THE FREEZE FIX: "Check device" / probes used raw socket.http, which
 -- forces its OWN 60s connect timeout regardless of any custom create() — an
@@ -839,14 +847,14 @@ check("no-reader batch reports failure", ok_none == false)
 check("home shows no-reader failure inline",
     home.send_state == "failed" and tostring(home.fail_reason):match("No CrossDrop reader reached"),
     home.send_state and home.fail_reason)
-check("no-reader message guides to the reader's hotspot network",
-    tostring(home.fail_reason):match("CrossDrop") and tostring(home.fail_reason):match("join the reader"),
+check("no-reader message guides to the WiFi checks",
+    tostring(home.fail_reason):match("SAME Wi%-Fi") and tostring(home.fail_reason):match("Receive Books"),
     home.fail_reason)
-check("no-reader message shows each probe's own error",
+check("no-reader message shows the probe's own error",
     tostring(home.fail_reason):match("connection refused"), home.fail_reason)
-check("reach marks both connections down",
-    inst._reach and inst._reach.wifi == "down" and inst._reach.hotspot == "down",
-    inst._reach and (inst._reach.wifi or "?") .. "/" .. (inst._reach.hotspot or "?"))
+check("reach marks the connection down",
+    inst._reach and inst._reach.wifi == "down",
+    inst._reach and (inst._reach.wifi or "?"))
 FAKE.fail = false
 
 -- renderers for every send state build without crashing and stay in-screen
@@ -862,28 +870,27 @@ home.fail_reason = "boom"
 home:init()
 check("failed state renders", home.frame ~= nil and home.frame:getSize().w <= SCREEN_W)
 
--- 15. IP PERSISTENCE: connection IPs live in KOReader's global settings; in
--- this plugin they are only ever written by the Set WiFi/HotSpot IP dialogs.
--- A "restart" (fresh instance) must read them back exactly.
+-- 15. IP PERSISTENCE: the WiFi IP lives in KOReader's global settings; in
+-- this plugin it is only ever written by the Set WiFi IP dialog.
+-- A "restart" (fresh instance) must read it back exactly.
 G_reader_settings:saveSetting("crossdrop_wifi_ip", "10.9.8.7")
-G_reader_settings:saveSetting("crossdrop_hotspot_ip", "192.168.4.1")
 local ui_r = { menu = { registerToMainMenu = function() end }, document = { file = "/tmp/fakebook.epub" } }
 local inst_r = CROSSDROP:new{ ui = ui_r }
 check("wifi IP survives a restart", inst_r:resolveTarget() and inst_r:resolveTarget().ip == "10.9.8.7",
     inst_r:resolveTarget() and inst_r:resolveTarget().ip)
-inst_r:saveTarget({ kind = "hotspot", ip = "192.168.5.1", port = 80 })
+inst_r:saveTarget({ kind = "wifi", ip = "192.168.5.1", port = 80 })
 local inst_r2 = CROSSDROP:new{ ui = ui_r }
-check("hotspot IP survives a restart",
-    inst_r2:configuredTargets()[2].ip == "192.168.5.1", inst_r2:configuredTargets()[2].ip)
+check("wifi IP change survives a restart",
+    inst_r2:configuredTargets()[1].ip == "192.168.5.1", inst_r2:configuredTargets()[1].ip)
 check("port survives a restart",
     inst_r2:configuredTargets()[1].port == 80, inst_r2:configuredTargets()[1].port)
 G_reader_settings:saveSetting("crossdrop_wifi_ip", nil)
 local inst_r3 = CROSSDROP:new{ ui = ui_r }
-check("empty wifi stays deliberately unset (falls back to HotSpot)",
-    inst_r3:resolveTarget() and inst_r3:resolveTarget().kind == "hotspot",
-    inst_r3:resolveTarget() and inst_r3:resolveTarget().kind)
+check("empty wifi stays unset (wifi-only, no fallback)",
+    inst_r3:resolveTarget() and inst_r3:resolveTarget().kind == "wifi"
+        and inst_r3:resolveTarget().ip == "",
+    inst_r3:resolveTarget() and inst_r3:resolveTarget().ip)
 inst:saveTarget({ kind = "wifi", ip = "192.168.1.50" })
-inst:saveTarget({ kind = "hotspot", ip = "192.168.4.1" })
 
 print(failures == 0 and "\nALL TESTS PASSED" or string.format("\n%d TEST(S) FAILED", failures))
 os.exit(failures == 0 and 0 or 1)
