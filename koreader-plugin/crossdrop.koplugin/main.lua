@@ -671,7 +671,7 @@ function CROSSDROP:chooseAndSend()
             ok_text = _("Send to Xteink"),
             ok_callback = function()
                 UIManager:close(confirm)
-                UIManager:close(fc)
+                UIManager:close(fc, "ui")
                 local paths_now = {}
                 for _, p in ipairs(paths) do paths_now[#paths_now + 1] = p end
                 UIManager:nextTick(function()
@@ -688,26 +688,24 @@ function CROSSDROP:chooseAndSend()
     -- Keep the running selection visible: the count lives in the TITLE (Menu
     -- replaces the subtitle with the folder path on navigation — menu.lua
     -- switchItemTable — so a count there would be lost; the title survives).
-    -- The right slot follows the selection exactly like FileManager's select
-    -- mode on this build (setRightIcon plus↔check swap): a question mark
-    -- while nothing is picked, the ✓ send mark once ≥1 book is chosen.
     local function refreshSelectionTitle()
         local n = 0
         for _ in pairs(fc.picked or {}) do n = n + 1 end
         custom_title_bar:setTitle((n > 0)
             and string.format(_("Send A Book  \226\128\164  %d selected"), n)
             or _("Send A Book"), true)
-        custom_title_bar:setRightIcon((n > 0) and "check" or "notice-question")
     end
 
     -- The browser needs a visible way back to the CrossDrop menu (it is a
     -- modal over Home, and a bare FileChooser has no close button). Left ✕
-    -- closes without sending; the right slot is the send action — the exact
-    -- TitleBar icon-slot pattern FileManager uses on this build, and the one
-    -- this picker already used successfully on-device (v1.3.10's ✓). Both
-    -- follow Storefront's allow_flash=false rule: any button that closes its
-    -- container must not flash after the callback runs, or KOReader crashes
-    -- on the destroyed widget.
+    -- closes without sending — and always lands back on the CrossDrop
+    -- dashboard; the right ✓ is the send action (tap with nothing picked =
+    -- hint, with books picked = confirm dialog). Both are the core TitleBar
+    -- icon slots — the exact pattern FileManager uses on this build and the
+    -- one this picker already used successfully on-device (v1.3.10) — and
+    -- both follow the allow_flash=false rule from Storefront: any button
+    -- that closes its container must not flash after the callback runs, or
+    -- KOReader crashes on the destroyed widget.
     custom_title_bar = TitleBar:new{
         title = _("Send A Book"),
         subtitle = _("Tap books to pick them  \226\128\164  then tap \226\156\147 to send"),
@@ -717,10 +715,20 @@ function CROSSDROP:chooseAndSend()
         left_icon = "close",
         left_icon_size_ratio = 1,
         left_icon_tap_callback = function()
-            UIManager:close(fc)
+            -- Storefront's close idiom (explicit "ui" refresh on close)…
+            UIManager:close(fc, "ui")
+            -- …and exiting must ALWAYS land on the CrossDrop dashboard: if
+            -- Home is still open, repaint it in place; if it was closed in
+            -- the meantime (or the picker was opened without it), open it.
+            if plugin.home then
+                UIManager:setDirty(plugin.home, "ui")
+                UIManager:forceRePaint()
+            else
+                plugin:openHome()
+            end
         end,
         left_icon_allow_flash = false,
-        right_icon = "notice-question", -- until ≥1 book is picked; then refreshSelectionTitle swaps in the ✓
+        right_icon = "check", -- the send action; tap with 0 picked = hint
         right_icon_size_ratio = 1,
         right_icon_tap_callback = function()
             local paths = {}

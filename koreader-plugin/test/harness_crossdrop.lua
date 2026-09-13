@@ -459,11 +459,11 @@ check("send success shows Book sent", last_notif and type(last_notif.text) == "s
 
 -- 5b. "Send A Book" picker opens a MODAL file browser above the full-screen
 -- Home (non-modal would stack below it, exactly like the old IP dialog bug),
--- in multi-select mode: tapping toggles books (dimmed + ✓). The top-right
--- slot is the send action — the core TitleBar icon-slot pattern (FileManager
--- uses the same plus↔check setRightIcon swap on this build): a question mark
--- while nothing is picked, the ✓ send mark once a book is chosen, and the
--- confirm dialog's OK button is the labeled "Send to Xteink" button.
+-- in multi-select mode: tapping toggles books (dimmed + ✓), the title shows
+-- the running count, and the top-right ✓ is the send action — tap with 0
+-- picked for a hint, with books picked for the confirm dialog whose OK
+-- button is the labeled "Send to Xteink" button. Exiting (✕) always lands
+-- back on the CrossDrop dashboard.
 
 UIManager._shown = {}
 inst:chooseAndSend()
@@ -481,17 +481,14 @@ check("✕ close button stays on the title bar (left icon, wired)",
     chooser and chooser.custom_title_bar and chooser.custom_title_bar.left_icon == "close"
         and type(chooser.custom_title_bar.left_icon_tap_callback) == "function",
     chooser and chooser.custom_title_bar and chooser.custom_title_bar.left_icon)
-chooser.custom_title_bar.left_icon_tap_callback() -- still callable: closes without sending
-check("right slot shows the question mark before any book is picked",
-    chooser and chooser.custom_title_bar and chooser.custom_title_bar.right_icon == "notice-question",
+check("✓ send mark is on the title bar from the start (right icon, wired)",
+    chooser and chooser.custom_title_bar and chooser.custom_title_bar.right_icon == "check"
+        and type(chooser.custom_title_bar.right_icon_tap_callback) == "function",
     chooser and chooser.custom_title_bar and chooser.custom_title_bar.right_icon)
 local fa = { path = "/tmp/fakebook.epub" }
 local fb = { path = "/tmp/fakebook2.epub" }
 chooser:onFileSelect(fa)
 check("tap picks a book (dim + ✓)", fa.dim == true and tostring(fa.text):match("\226\156\147"), fa.text)
-check("✓ send mark appears once a book is picked",
-    chooser.custom_title_bar and chooser.custom_title_bar.right_icon == "check",
-    chooser.custom_title_bar and chooser.custom_title_bar.right_icon)
 check("picker title shows the selection count",
     chooser.custom_title_bar and tostring(chooser.custom_title_bar.title):match("1 selected"),
     chooser.custom_title_bar and chooser.custom_title_bar.title)
@@ -502,20 +499,7 @@ check("tap toggles a book back off (no send on tap)",
 check("title count follows the selection",
     chooser.custom_title_bar and tostring(chooser.custom_title_bar.title):match("1 selected"),
     chooser.custom_title_bar and chooser.custom_title_bar.title)
-chooser:onFileSelect(fa)
-check("✓ stays while books are picked",
-    chooser.custom_title_bar and chooser.custom_title_bar.right_icon == "check",
-    chooser.custom_title_bar and chooser.custom_title_bar.right_icon)
-chooser:onFileSelect(fb) -- n=1 (fa still picked)
-chooser:onFileSelect(fa) -- n=0: last book gone
-check("question mark returns when the last book is unpicked",
-    chooser.custom_title_bar and chooser.custom_title_bar.right_icon == "notice-question",
-    chooser.custom_title_bar and chooser.custom_title_bar.right_icon)
-chooser:onFileSelect(fa) -- n=1 again
-check("✓ returns when picking resumes",
-    chooser.custom_title_bar and chooser.custom_title_bar.right_icon == "check",
-    chooser.custom_title_bar and chooser.custom_title_bar.right_icon)
-chooser:onFileSelect(fb) -- back to both books (fa + fb)
+chooser:onFileSelect(fa) -- re-pick fa → both books picked (fa + fb)
 
 -- the Send to Xteink confirm: closes the picker and runs the whole batch IN
 -- the dashboard (a fake Home sink records the flow; the real Home is
@@ -557,14 +541,22 @@ check("batch completes as done",
     fake_home.calls and fake_home.calls[#fake_home.calls])
 inst.home = nil
 
--- Send with nothing picked is a gentle hint, never a send (the button is
--- hidden at 0 anyway; the guard still protects a direct callback)
+-- Send with nothing picked is a gentle hint, never a send
 UIManager._shown = {}
 chooser.picked = {}
 chooser.custom_title_bar.right_icon_tap_callback()
 local hint0 = UIManager._shown[#UIManager._shown]
 check("Send with no selection shows a hint",
     hint0 and type(hint0.text) == "string" and hint0.text:match("Tap a book"), hint0 and hint0.text)
+
+-- exiting the picker ALWAYS lands back on the CrossDrop dashboard: if Home
+-- is still open it is repainted; if it was closed meanwhile, it is reopened
+UIManager._shown = {}
+inst.home = nil
+chooser.custom_title_bar.left_icon_tap_callback()
+check("✕ exits back to the CrossDrop dashboard (reopens Home if needed)",
+    inst.home ~= nil, inst.home)
+inst.home = nil -- restore the pre-section state for the checks below
 
 -- 5c. sending with NO book open no longer crashes (the old on-device crash);
 -- it just shows the picker hint.
