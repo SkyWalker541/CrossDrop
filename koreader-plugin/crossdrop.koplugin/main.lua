@@ -464,9 +464,10 @@ function CROSSDROP:sendCurrentBook()
     self:sendFile(book_path)
 end
 
--- "Send A Book": open KOReader's own file browser (a modal FileChooser, so it
--- paints ABOVE the full-screen Home dialog) and send whatever ebook the user
--- picks — no need to have it open first. This is the primary send path.
+-- "Send A Book": open the FileManager file browser (a modal FileChooser — the
+-- same list widget FileManager hosts, shown full-screen so it paints ABOVE
+-- the Home dialog) and send whatever ebook the user picks — no need to have
+-- it open first. This is the primary send path.
 function CROSSDROP:chooseAndSend()
     local DocumentRegistry = require("document/documentregistry")
     local FileChooser = require("ui/widget/filechooser")
@@ -476,8 +477,23 @@ function CROSSDROP:chooseAndSend()
         start_path = filemanagerutil.getHomeFolder()
     end
 
+    -- FileChooser is the file browser's list widget; FileManager is the app
+    -- that usually hosts it. Standalone, the only `ui` bits BookList/FileChooser
+    -- poke at are folder shortcuts, book metadata (for metadata sorting) and a
+    -- PathChanged event — a minimal shim avoids crashing when the reader has no
+    -- FileManager instance to borrow from.
+    local ui_shim = {
+        folder_shortcuts = {
+            getShortcutFullName = function() return nil end,
+            hasFolderShortcut = function() return false end,
+        },
+        bookinfo = { getDocProps = function() return {} end },
+        selected_files = {},
+        handleEvent = function() return false end,
+    }
+
     local fc = FileChooser:new{
-        ui = self.ui,
+        ui = ui_shim,
         path = start_path,
         title = _("Send A Book"),
         file_filter = function(filename)

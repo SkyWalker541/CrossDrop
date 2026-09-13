@@ -436,6 +436,8 @@ local chooser = UIManager._shown[#UIManager._shown]
 check("chooseAndSend opens the file browser", type(chooser) == "table")
 check("chooser is modal (paints above Home)", chooser ~= nil and chooser.modal == true, chooser and chooser.modal)
 check("chooser filters supported book files", chooser and chooser.file_filter and chooser.file_filter("MyBook.epub") == true)
+check("chooser ui has folder_shortcuts (browser needs it)",
+    chooser and chooser.ui and chooser.ui.folder_shortcuts and type(chooser.ui.folder_shortcuts.getShortcutFullName) == "function")
 UIManager._shown = {}
 chooser:onFileSelect({ path = "/tmp/fakebook.epub" })
 local picked_toast = UIManager._shown[#UIManager._shown]
