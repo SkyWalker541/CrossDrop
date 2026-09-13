@@ -31,6 +31,7 @@ the chunks stream (the same forceRePaint technique the Storefront plugin uses).
 ]]
 
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
+local Device = require("device")
 local InputDialog = require("ui/widget/inputdialog")
 local InfoMessage = require("ui/widget/infomessage")
 local Notification = require("ui/widget/notification")
@@ -42,21 +43,19 @@ local _ = require("gettext")
 local DEFAULT_HOTSPOT_IP = "192.168.4.1"
 local DEFAULT_FOLDER = "/CrossDropped Files"
 
--- UI extras (toast, live progress, full-screen Home) live in sibling modules
--- that are only required once a dialog is opened, never at plugin load.
-local toast_mod, progress_mod, home_mod
-local function toastModule()
-    if not toast_mod then toast_mod = require("crossdrop_toast") end
-    return toast_mod
-end
-local function progressModule()
-    if not progress_mod then progress_mod = require("crossdrop_progress") end
-    return progress_mod
-end
-local function homeModule()
-    if not home_mod then home_mod = require("crossdrop_home") end
-    return home_mod
-end
+-- UI extras (toast, live progress, full-screen Home) are sibling modules in
+-- this plugin folder. They must be required at plugin load (the Storefront
+-- pattern), because PluginLoader puts this folder on package.path only for the
+-- duration of loading main.lua and restores it afterwards: a lazy bare require
+-- made later, from a button/nextTick callback, would search a package.path
+-- that no longer contains this folder and crash with "module not found" even
+-- though the file exists next to main.lua.
+local toast_mod = require("crossdrop_toast")
+local progress_mod = require("crossdrop_progress")
+local home_mod = require("crossdrop_home")
+local function toastModule() return toast_mod end
+local function progressModule() return progress_mod end
+local function homeModule() return home_mod end
 
 local CROSSDROP = WidgetContainer:extend{
     name = "crossdrop",
@@ -73,6 +72,27 @@ local JSON
 pcall(function()
     JSON = require("json")
 end)
+
+-- KOReader's socketutil (the Storefront plugin's network layer): it patches
+-- socket.tcp and http.TIMEOUT so blocking ops are truly bounded. Required
+-- lazily so a build without it (or the test harness) gets a safe fallback.
+local socketutil_mod
+local function socketutilModule()
+    if not socketutil_mod then
+        local ok, su = pcall(require, "socketutil")
+        if ok and su then
+            socketutil_mod = su
+        else
+            socketutil_mod = {
+                FILE_BLOCK_TIMEOUT = 15,
+                FILE_TOTAL_TIMEOUT = 60,
+                set_timeout = function() end,
+                reset_timeout = function() end,
+            }
+        end
+    end
+    return socketutil_mod
+end
 
 local function socket_available()
     if not luasocket_ok then
@@ -149,27 +169,31 @@ end
 
 -- Generic HTTP call. Returns (ok, code, body). On a network failure `code`
 -- carries LuaSocket's error string and `ok` is nil. `timeout` is the socket
--- timeout in seconds (default 10; probes use a short 3s so failure is snappy).
+-- timeout in seconds (default: Storefront's file sizes; probes use short 3s
+-- so failure is snappy).
+--
+-- FREEZE FIX: raw socket.http forces its OWN 60s connect timeout (http.lua
+-- calls settimeout(http.TIMEOUT) AFTER any custom `create()`), so an
+-- unreachable IP made "Check device" block the UI for a minute+ and the
+-- Kindle looked hard-frozen. socketutil patches socket.tcp + http.TIMEOUT so
+-- every socket op honors our value — the same mechanism Storefront uses.
 function CROSSDROP:req(method, url, headers, source_fn, timeout)
     if not socket_available() then
         return nil, "LuaSocket unavailable", nil
     end
-    local deadline = timeout or 10
+    local su = socketutilModule()
+    if timeout and timeout > 0 then
+        su:set_timeout(timeout, timeout)
+    else
+        su:set_timeout(su.FILE_BLOCK_TIMEOUT or 15, su.FILE_TOTAL_TIMEOUT or 60)
+    end
     local ok, body, code = pcall(http.request, {
         url = url,
         method = method,
         headers = headers or {["User-Agent"] = "KOReader/crossdrop"},
         source = source_fn,
-        create = function()
-            local s = socket.tcp()
-            if s then
-                pcall(function()
-                    s:settimeout(deadline)
-                end)
-            end
-            return s
-        end,
     })
+    su:reset_timeout()
     if not ok then
         return nil, tostring(body or "request failed"), nil
     end
@@ -280,7 +304,8 @@ function CROSSDROP:connectionSummary()
 end
 
 -- Edit the IP for one connection ("wifi" or "hotspot").
-function CROSSDROP:editIp(kind)
+-- `on_saved` runs after the dialog closes so the open dashboard can repaint.
+function CROSSDROP:editIp(kind, on_saved)
     local is_hotspot = kind == "hotspot"
     local current = is_hotspot and hotspotIp() or (wifiIp() or "")
     local ip_dialog
@@ -303,6 +328,9 @@ function CROSSDROP:editIp(kind)
                             setIp(kind, value)
                         end
                         UIManager:close(ip_dialog)
+                        if on_saved then
+                            on_saved()
+                        end
                     end,
                 },
             },
@@ -320,7 +348,13 @@ function CROSSDROP:editIp(kind)
 end
 
 -- GET /api/status on the first reachable connection and show the result.
+-- The probe is a bounded blocking call on the UI thread, so paint a "Checking…"
+-- notice BEFORE blocking (the e-ink screen updates on forceRePaint) — without
+-- it an unreachable IP reads as a frozen screen for the timeout window.
 function CROSSDROP:statusDialog()
+    local checking = Notification:new{ text = _("Checking device…"), timeout = 0 }
+    UIManager:show(checking)
+    UIManager:forceRePaint()
     local target = self:probeReachable()
     if not target then
         UIManager:show(Notification:new{
@@ -331,6 +365,7 @@ function CROSSDROP:statusDialog()
         return
     end
     local ok, info = self:probeTarget(target)
+    UIManager:close(checking)
     if not ok then
         UIManager:show(Notification:new{
             text = _("Could not reach the CrossDrop reader: ") .. tostring(info or "network error") ..
@@ -411,7 +446,13 @@ local progress_guard
 function CROSSDROP:sendFile(book_path)
     if not book_path or book_path == "" then return end
 
+    -- Same bounded-but-blocking probe as statusDialog: show a notice before it
+    -- so an unreachable target never reads as a frozen screen.
+    local checking = Notification:new{ text = _("Connecting to CrossDrop…"), timeout = 0 }
+    UIManager:show(checking)
+    UIManager:forceRePaint()
     local target = self:probeReachable()
+    UIManager:close(checking)
     if not target then
         UIManager:show(InfoMessage:new{
             text = _("No CrossDrop reader reached.\n\nTried:\n") .. self:connectionSummary() ..
@@ -471,6 +512,7 @@ end
 function CROSSDROP:chooseAndSend()
     local DocumentRegistry = require("document/documentregistry")
     local FileChooser = require("ui/widget/filechooser")
+    local TitleBar = require("ui/widget/titlebar")
     local start_path
     local ok_util, filemanagerutil = pcall(require, "apps/filemanager/filemanagerutil")
     if ok_util and filemanagerutil and filemanagerutil.getHomeFolder then
@@ -492,7 +534,25 @@ function CROSSDROP:chooseAndSend()
         handleEvent = function() return false end,
     }
 
-    local fc = FileChooser:new{
+    -- The browser needs a visible way back to the CrossDrop menu (it is a
+    -- modal over Home, and a bare FileChooser has no close button). Mirroring
+    -- FileManager, we hand it our own title bar with a close icon.
+    local fc
+    local custom_title_bar = TitleBar:new{
+        title = _("Send A Book"),
+        subtitle = "",
+        fullscreen = "true",
+        align = "center",
+        button_padding = Device.screen:scaleBySize(5),
+        left_icon = "close",
+        left_icon_size_ratio = 1,
+        left_icon_tap_callback = function()
+            UIManager:close(fc)
+        end,
+        show_parent = nil, -- patched to fc right below
+    }
+
+    fc = FileChooser:new{
         ui = ui_shim,
         path = start_path,
         title = _("Send A Book"),
@@ -500,7 +560,10 @@ function CROSSDROP:chooseAndSend()
             return DocumentRegistry:hasProvider(filename)
         end,
         modal = true,
+        -- use our title bar (with the close button) instead of Menu's default
+        custom_title_bar = custom_title_bar,
     }
+    custom_title_bar.show_parent = fc
     local plugin = self
     function fc:onFileSelect(item)
         local path = item and item.path

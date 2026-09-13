@@ -152,6 +152,13 @@ function class:getSize()
     end
     if name == "FrameContainer" then
         local child = self[1]
+        -- Match the device: FrameContainer:getSize does self[1]:getSize() with
+        -- no nil guard, and OverlapGroup:init builds all children at init time —
+        -- a childless FrameContainer inside an OverlapGroup crashed the send
+        -- progress dialog on the Kindle. Fail the harness instead.
+        if child == nil then
+            error("FrameContainer:getSize on a childless FrameContainer (crashes the Kindle)")
+        end
         local cs = (type(child) == "table" and type(child.getSize) == "function") and child:getSize() or { w = 0, h = 0 }
         local p = self.padding or 0
         local b = self.bordersize or 0
@@ -176,7 +183,7 @@ end
 function class:getTextDimension() return { w = 0, h = 0 } end
 function class:isFocusable() return false end
 function class:getChildren() return {} end
-function class:setText() end
+function class:setText(t) self.text = t end
 
 function class:init() end
 function class:new(o)
@@ -241,7 +248,7 @@ local stubs = {
     ["ui/device"] = DeviceStub,
     ["device"] = DeviceStub,
     ["ui/font"] = FontStub,
-    ["ui/geometry"] = { new = function(o) return o or {} end },
+    ["ui/geometry"] = { new = function(_, o) return o or {} end },
     ["ui/gesturerange"] = { new = function(o) return o or {} end },
     ["ui/size"] = {
         radius = { window = scal(7) },
@@ -334,6 +341,19 @@ stubs["socket"] = {
     end,
 }
 stubs["socket.http"] = { request = function(args) return fake_request(args) end }
+
+-- Freeze-fix recorder: raw socket.http forces its own 60s connect timeout, so
+-- the plugin must run every request through socketutil's bounded timeouts.
+-- Record what the plugin asks socketutil for; the tests assert probes use a
+-- short 3s and sends use Storefront's file sizes.
+local su_calls = {}
+local su_resets = 0
+stubs["socketutil"] = {
+    FILE_BLOCK_TIMEOUT = 15,
+    FILE_TOTAL_TIMEOUT = 60,
+    set_timeout = function(_, b, t) su_calls[#su_calls + 1] = { b, t } end,
+    reset_timeout = function() su_resets = su_resets + 1 end,
+}
 stubs["json"] = json_mod
 
 -- lfs stub: size via io
@@ -575,6 +595,112 @@ if home then
     check("showTab no-op on same tab", home.tab == "connections")
     check("tab switch re-inits the widget", home.frame ~= nil and home[1] ~= nil)
 end
+
+-- 12. THE SEND CRASH: the progress dialog used childless FrameContainers for
+-- its bar fill/track. OverlapGroup:init calls getSize() on every child at
+-- build time and FrameContainer:getSize does self[1]:getSize() — childless
+-- frames crashed the moment a transfer started. The bar is now LineWidgets.
+local ProgressMod = require("crossdrop_progress")
+local dlg = ProgressMod.new("mybook.epub", { ip = "192.168.1.50", port = 80, folder = "/CrossDropped Files" })
+check("progress dialog builds (no childless-frame crash)", type(dlg) == "table", dlg)
+if dlg then
+    check("progress bar fill is sized (LineWidget, no crash on getSize)",
+        dlg.bar_fill and dlg.bar_fill.dimen and dlg.bar_fill.dimen.w == 0)
+    local bar = dlg[1] and dlg[1][1] and dlg[1][1][1] and dlg[1][1][1][1] and dlg[1][1][1][1][3]
+    check("progress bar paints track then fill (fill on top)",
+        bar and bar[1] and bar[1].__name and bar[1].__name:match("framecontainer") and bar[2] == dlg.bar_fill,
+        tostring(bar and bar[1] and bar[1].__name))
+    dlg:update(50, 65536, 131072, 1.0)
+    check("progress update grows the fill", dlg.bar_fill.dimen.w > 0 and dlg.bar_fill.dimen.w <= dlg.bar_w,
+        dlg.bar_fill.dimen.w)
+    check("progress update repaints in place", dlg.pct_text and dlg.pct_text.text == "50%",
+        dlg.pct_text and dlg.pct_text.text)
+end
+
+-- 12b. Saving an IP must repaint the OPEN dashboard (the reported staleness
+-- when the Connections tab stayed open). editIp takes an on_saved callback the
+-- Home refresh() runs after the modal dialog closes.
+UIManager._shown = {}
+inst:openHome()
+home = UIManager._shown[#UIManager._shown]
+home:showTab("connections")
+inst._reach = { wifi = "ok", hotspot = "down" }
+UIManager._shown = {}
+inst:editIp("wifi", function() home:refresh() end)
+local ipd = UIManager._shown[#UIManager._shown]
+ipd.getInputText = function() return "10.1.2.3" end
+ipd.buttons[1][1].callback()
+check("IP save stores the new wifi IP",
+    G_reader_settings:readSetting("crossdrop_wifi_ip") == "10.1.2.3",
+    G_reader_settings:readSetting("crossdrop_wifi_ip"))
+check("IP save repaints the open dashboard", home.frame ~= nil and home[1] ~= nil, "frame rebuilt")
+check("IP save clears remembered reach (stale probe)",
+    next(inst._reach or {}) == nil, inst._reach and next(inst._reach))
+
+-- 12c. the file browser has a visible way back: a custom title bar whose
+-- close icon closes the chooser back to the CrossDrop menu.
+UIManager._shown = {}
+inst:chooseAndSend()
+chooser = UIManager._shown[#UIManager._shown]
+check("browser has a title bar with a close button",
+    chooser and chooser.custom_title_bar
+        and chooser.custom_title_bar.left_icon == "close"
+        and type(chooser.custom_title_bar.left_icon_tap_callback) == "function"
+        and chooser.custom_title_bar.show_parent == chooser,
+    chooser and chooser.custom_title_bar and chooser.custom_title_bar.left_icon)
+local closed = false
+local save_close = UIManager.close
+UIManager.close = function(_, w) if w == chooser then closed = true end end
+chooser.custom_title_bar.left_icon_tap_callback()
+UIManager.close = save_close
+check("browser close button closes the chooser", closed)
+
+-- 13. THE FREEZE FIX: "Check device" / probes used raw socket.http, which
+-- forces its OWN 60s connect timeout regardless of any custom create() — an
+-- unreachable IP blocked the UI for a minute+ and the Kindle required a hard
+-- reset. All requests now go through KOReader's socketutil bounded timeouts.
+su_calls = {}
+inst:probeTarget({ kind = "wifi", ip = "192.168.1.50", port = 80 })
+check("probe binds its socket to 3s (no 60s http freeze)",
+    su_calls[1] and su_calls[1][1] == 3, su_calls[1] and su_calls[1][1])
+su_calls = {}
+inst:putFile({ ip = "192.168.1.50", port = 80, folder = "/CrossDropped Files" }, "/tmp/fakebook.epub", function() end)
+check("sends use Storefront file-size timeouts (15s block)",
+    su_calls[1] and su_calls[1][1] == 15, su_calls[1] and su_calls[1][1])
+check("every request restores the global timeout",
+    su_resets >= 2, su_resets)
+
+-- 13b. "Check device" paints a "Checking…" notice BEFORE the blocking probe
+-- and the result after — an unreachable IP never reads as a frozen screen.
+UIManager._shown = {}
+inst:statusDialog()
+local sd = UIManager._shown
+check("statusDialog shows Checking… before the result",
+    sd[1] and sd[1].text and sd[1].text:match("Checking"), sd[1] and sd[1].text)
+check("statusDialog still reports the device",
+    sd[#sd] and sd[#sd].text and sd[#sd].text:match("X4"), sd[#sd] and sd[#sd].text)
+
+-- 13c. THE "module not found" CRASH (recurring on the Kindle): PluginLoader
+-- prepends the plugin folder to package.path ONLY while main.lua loads, then
+-- RESTORES package.path (frontend/pluginloader.lua:242/269). A lazy bare
+-- require() from a button/nextTick callback therefore can't see the sibling
+-- files even though they exist next to main.lua. Fix: eager requires at load
+-- populate package.loaded, so later accessor calls resolve from the cache.
+check("sibling modules eager-cached at load (toast)",
+    type(package.loaded["crossdrop_toast"]) == "table", package.loaded["crossdrop_toast"])
+check("sibling modules eager-cached at load (progress)",
+    type(package.loaded["crossdrop_progress"]) == "table")
+check("sibling modules eager-cached at load (home)",
+    type(package.loaded["crossdrop_home"]) == "table")
+local saved_path = package.path
+package.path = string.gsub(package.path, PLUGIN_ROOT:gsub("%.", "%%.") .. "crossdrop%.koplugin/?.lua;", "")
+check("plugin folder off package.path (PluginLoader restore simulated)",
+    not package.path:match("crossdrop%.koplugin/?.lua"), package.path)
+UIManager._shown = {}
+inst:openHome()
+check("openHome resolves siblings after restore (no module-not-found crash)",
+    UIManager._shown[#UIManager._shown] ~= nil)
+package.path = saved_path
 
 print(failures == 0 and "\nALL TESTS PASSED" or string.format("\n%d TEST(S) FAILED", failures))
 os.exit(failures == 0 and 0 or 1)

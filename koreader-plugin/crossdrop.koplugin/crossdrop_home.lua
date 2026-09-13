@@ -126,9 +126,15 @@ function HomeDialog:init()
     local content = self:buildTabContent(self.tab, inner_w)
 
     -- A full-screen white frame (not a centered content-sized card): the
-    -- whole screen paints white on top of whatever UI sits behind it.
+    -- whole screen paints white on top of whatever UI sits behind it. Both
+    -- `dimen` AND `width`/`height` are required — FrameContainer:paintTo paints
+    -- its background at container_width/height (= self.width/self.height or the
+    -- content size), NOT at dimen. Without width/height the frame only painted
+    -- over its content bounds and a strip of the UI below showed at the bottom.
     local frame = FrameContainer:new{
         dimen = Geom:new{ w = sw, h = sh },
+        width = sw,
+        height = sh,
         bordersize = 0,
         background = Blitbuffer.COLOR_WHITE,
         padding = pad,
@@ -258,7 +264,16 @@ end
 function HomeDialog:check(kind)
     local target = self:targetFor(kind)
     if not target then return end
+    -- The probe is a bounded blocking call on the UI thread (3s, see main:req);
+    -- paint a notice first so the tap never looks like a freeze.
+    local checking = Notification:new{
+        text = (kind == "wifi" and _("Checking WiFi…") or _("Checking HotSpot…")),
+        timeout = 0,
+    }
+    UIManager:show(checking)
+    UIManager:forceRePaint()
     local ok, info, err = self.plugin:probeTarget(target)
+    UIManager:close(checking)
     local reach = self.plugin._reach or {}
     reach[kind] = ok and "ok" or "down"
     self.plugin._reach = reach
@@ -277,6 +292,18 @@ function HomeDialog:check(kind)
     self:init()
 end
 
+-- Repaint the dashboard in place after a setting change (an IP edit happens
+-- under a modal InputDialog, so the re-init must wait until that dialog is off
+-- the stack). This is what makes a saved IP show up on the Connections tab
+-- without reopening the dashboard.
+function HomeDialog:refresh()
+    UIManager:nextTick(function()
+        self.plugin._reach = {}
+        self:init()
+        UIManager:setDirty(self, "full")
+    end)
+end
+
 function HomeDialog:renderConnections()
     local vg = VerticalGroup:new{ align = "left" }
     local reach = self.plugin._reach or {}
@@ -291,7 +318,7 @@ function HomeDialog:renderConnections()
         }))
     end
     table.insert(vg,self:row(_("Set WiFi IP\226\128\166"), {
-        callback = function() self.plugin:editIp("wifi") end,
+        callback = function() self.plugin:editIp("wifi", function() self:refresh() end) end,
     }))
 
     table.insert(vg,self:header(_("HotSpot connection")))
@@ -304,7 +331,7 @@ function HomeDialog:renderConnections()
         }))
     end
     table.insert(vg,self:row(_("Set HotSpot IP\226\128\166"), {
-        callback = function() self.plugin:editIp("hotspot") end,
+        callback = function() self.plugin:editIp("hotspot", function() self:refresh() end) end,
     }))
 
     table.insert(vg,TextBoxWidget:new{

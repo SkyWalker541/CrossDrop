@@ -10,6 +10,7 @@ local Font = require("ui/font")
 local FrameContainer = require("ui/widget/container/framecontainer")
 local Geom = require("ui/geometry")
 local InputContainer = require("ui/widget/container/inputcontainer")
+local LineWidget = require("ui/widget/linewidget")
 local MovableContainer = require("ui/widget/container/movablecontainer")
 local OverlapGroup = require("ui/widget/overlapgroup")
 local Size = require("ui/size")
@@ -54,24 +55,37 @@ function ProgressDialog:init()
 
     local bar_w = inner_w
     local bar_h = sc(16)
+    local border_w = Size.border.window or 1
     self.bar_w = bar_w
-    self.bar_fill = FrameContainer:new{
+
+    -- NOTE: the old bar used CHILDLESS FrameContainers here. FrameContainer:getSize
+    -- does `self[1]:getSize()` with no nil guard, and OverlapGroup:init calls getSize()
+    -- on every child at build time — so the progress dialog crashed the instant a
+    -- transfer started. LineWidget has no children: its size is its dimen and its
+    -- paintTo is a plain bb:paintRect, so it cannot crash. The track keeps a border,
+    -- so it stays a FrameContainer but with a LineWidget child that guarantees getSize.
+    self.bar_fill = LineWidget:new{
         dimen = Geom:new{ w = 0, h = bar_h },
-        bordersize = 0,
         background = Blitbuffer.COLOR_BLACK,
-        padding = 0,
     }
     local bar_track = FrameContainer:new{
         dimen = Geom:new{ w = bar_w, h = bar_h },
-        bordersize = Size.border.window,
+        bordersize = border_w,
         color = Blitbuffer.COLOR_DARK_GRAY,
         background = Blitbuffer.COLOR_LIGHT_GRAY,
         padding = 0,
+        LineWidget:new{
+            dimen = Geom:new{ w = bar_w - border_w * 2, h = bar_h - border_w * 2 },
+            background = Blitbuffer.COLOR_LIGHT_GRAY,
+        },
     }
+    -- Track FIRST, fill LAST: OverlapGroup paints its children in order, so later
+    -- children sit on top. The old order painted the track OVER the fill — even
+    -- without the crash the progress bar would never have shown any fill.
     local bar = OverlapGroup:new{
         dimen = Geom:new{ w = bar_w, h = bar_h },
-        self.bar_fill,
         bar_track,
+        self.bar_fill,
     }
 
     self.pct_text = TextWidget:new{
@@ -82,6 +96,7 @@ function ProgressDialog:init()
     self.meta_text = TextWidget:new{
         text = "",
         face = Font:getFace("smallinfofont"),
+        max_width = inner_w,
     }
 
     local header_row = VerticalGroup:new{
