@@ -95,7 +95,6 @@ end
 -- ── KOReader module stubs ────────────────────────────────────────────────
 
 local class = {}
-function class:addWidget() end
 function class:getSize() return { w = 0, h = 0 } end
 function class:getTextDimension() return { w = 0, h = 0 } end
 function class:isFocusable() return false end
@@ -133,6 +132,30 @@ local function widget_stub(name, extra)
     return c
 end
 
+local reader_menu_order = { tools = { "read_timer" } }
+local filemanager_menu_order = { tools = { "read_timer" } }
+
+local SAFE_FACES = {
+    cfont = true, tfont = true, smalltfont = true, x_smalltfont = true,
+    ffont = true, smallffont = true, largeffont = true, pgfont = true,
+    scfont = true, rifont = true, hpkfont = true, hfont = true,
+    infont = true, smallinfont = true, infofont = true, smallinfofont = true,
+    smallinfofontbold = true, x_smallinfofont = true, xx_smallinfofont = true,
+}
+
+-- The Kindle's KOReader crashes on Font:getFace("small") etc. — those named
+-- fonts have NO default size in its sizemap (that was the plugin crash). The
+-- stub mirrors that so a regression fails the harness instead of the device.
+local FontStub = {
+    getFace = function(_, name, size)
+        if size then return { f = name, s = size } end
+        if SAFE_FACES[name] then return { f = name } end
+        error(string.format("Font:getFace(%q) without a size crashed here (exactly what killed the plugin on the Kindle)",
+            tostring(name)))
+    end,
+    getSize = function() return 20 end,
+}
+
 local stubs = {
     ["logger"] = { warn = function() end, info = function() end },
     ["gettext"] = function(s) return s end,
@@ -140,12 +163,14 @@ local stubs = {
     ["ffi/blitbuffer"] = { COLOR_WHITE = "white", COLOR_BLACK = "black", COLOR_DARK_GRAY = "dgray", COLOR_LIGHT_GRAY = "lgray" },
     ["ui/device"] = DeviceStub,
     ["device"] = DeviceStub,
-    ["ui/font"] = { getFace = function() return { f = "face" } end, getSize = function() return 20 end },
+    ["ui/font"] = FontStub,
     ["ui/geometry"] = { new = function(o) return o or {} end },
     ["ui/gesturerange"] = { new = function(o) return o or {} end },
     ["ui/size"] = { radius = { window = 4 }, padding = { default = 9, large = 15 }, span = { horizontal_default = 4 }, border = { window = 1 } },
     ["ui/widget/container/widgetcontainer"] = class:extend{},
     ["ui/widget/container/inputcontainer"] = class:extend{},
+    ["ui/elements/reader_menu_order"] = reader_menu_order,
+    ["ui/elements/filemanager_menu_order"] = filemanager_menu_order,
 }
 
 local function make_require()
@@ -362,6 +387,19 @@ local menu_items = {}
 inst:addToMainMenu(menu_items)
 check("menu registered as CrossDrop", menu_items.crossdrop ~= nil and menu_items.crossdrop.text == "CrossDrop", menu_items.crossdrop and menu_items.crossdrop.text)
 check("menu item opens the dashboard", menu_items.crossdrop and type(menu_items.crossdrop.callback) == "function")
+
+-- 9b. CrossDrop is pinned to the TOP of the Tools list (position 2, below
+-- Read Timer) in both the reader and file manager menus — the same trick
+-- Storefront uses.
+check("crossdrop pinned at top of reader Tools",
+    reader_menu_order.tools and reader_menu_order.tools[2] == "crossdrop",
+    reader_menu_order.tools and reader_menu_order.tools[2])
+check("crossdrop pinned at top of file manager Tools",
+    filemanager_menu_order.tools and filemanager_menu_order.tools[2] == "crossdrop",
+    filemanager_menu_order.tools and filemanager_menu_order.tools[2])
+check("no duplicate crossdrop entries",
+    select(2, table.concat({ reader_menu_order.tools[1], reader_menu_order.tools[2] }, ","):gsub("crossdrop", "")) == 1,
+    "dup check")
 
 -- 11. Home dashboard (Storefront-style): opens full-screen, renders all tabs
 UIManager._shown = {}

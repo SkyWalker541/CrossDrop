@@ -283,33 +283,33 @@ function HomeDialog:renderConnections()
     local vg = VerticalGroup:new{ align = "left" }
     local reach = self.plugin._reach or {}
 
-    vg:addWidget(self:header(_("WiFi connection")))
+    table.insert(vg,self:header(_("WiFi connection")))
     local wifi = self:targetFor("wifi")
     if wifi then
-        vg:addWidget(self:row(
+        table.insert(vg,self:row(
             string.format("WiFi   %s\n%s  \226\128\164  %s", ip_str(wifi),
                 _("File Transfer \226\134\146 Join Network"), status_word(reach.wifi)), {
             callback = function() self:check("wifi") end,
         }))
     end
-    vg:addWidget(self:row(_("Set WiFi IP\226\128\166"), {
+    table.insert(vg,self:row(_("Set WiFi IP\226\128\166"), {
         callback = function() self.plugin:editIp("wifi") end,
     }))
 
-    vg:addWidget(self:header(_("HotSpot connection")))
+    table.insert(vg,self:header(_("HotSpot connection")))
     local hotspot = self:targetFor("hotspot")
     if hotspot then
-        vg:addWidget(self:row(
+        table.insert(vg,self:row(
             string.format("HotSpot   %s\n%s  \226\128\164  %s", ip_str(hotspot),
                 _("File Transfer \226\134\146 Create Hotspot"), status_word(reach.hotspot)), {
             callback = function() self:check("hotspot") end,
         }))
     end
-    vg:addWidget(self:row(_("Set HotSpot IP\226\128\166"), {
+    table.insert(vg,self:row(_("Set HotSpot IP\226\128\166"), {
         callback = function() self.plugin:editIp("hotspot") end,
     }))
 
-    vg:addWidget(TextWidget:new{
+    table.insert(vg,TextWidget:new{
         text = _("Books land in the CrossDropped Files folder on the reader's card.\nNothing to pick \226\128\148 Send tab handles the rest."),
         face = Font:getFace("smallinfofont"),
     })
@@ -324,23 +324,23 @@ function HomeDialog:renderSend()
     local reach = self.plugin._reach or {}
     local book = self.plugin:currentBookPath()
 
-    vg:addWidget(self:header(_("Now open")))
+    table.insert(vg,self:header(_("Now open")))
     if book and book ~= "" then
         local name = book:match("([^/]+)$") or book
         local size = file_size(book)
-        vg:addWidget(self:row(
+        table.insert(vg,self:row(
             string.format("\226\151\128  %s\n%s  \226\128\164  tap to send", name,
                 (size > 0 and string.format(_("%.1f MB"), size / 1048576) or "ebook")), {
             callback = function() self.plugin:sendCurrentBook() end,
         }))
     else
-        vg:addWidget(TextWidget:new{
+        table.insert(vg,TextWidget:new{
             text = _("No book open yet.\n\nOpen a book in KOReader and it appears here,\nready to send to the CrossDrop reader."),
             face = Font:getFace("smallinfofont"),
         })
     end
 
-    vg:addWidget(self:header(_("Destination")))
+    table.insert(vg,self:header(_("Destination")))
     local target = self.plugin:resolveTarget() or { ip = "?", port = 80, folder = "/CrossDropped Files", kind = "?" }
     local which
     if target.kind == "wifi" then
@@ -348,16 +348,16 @@ function HomeDialog:renderSend()
     else
         which = _("via HotSpot (WiFi not set)")
     end
-    vg:addWidget(self:row(
+    table.insert(vg,self:row(
         string.format("%s  \226\134\146  %s\n%s  \226\128\164  tap to check the reader", ip_str(target), folder_str(target), which), {
         callback = function() self.plugin:statusDialog() end,
     }))
-    vg:addWidget(self:row(_("Check device\226\128\166"), {
+    table.insert(vg,self:row(_("Check device\226\128\166"), {
         callback = function() self.plugin:statusDialog() end,
     }))
 
     if reach.wifi ~= "ok" and reach.hotspot ~= "ok" then
-        vg:addWidget(TextWidget:new{
+        table.insert(vg,TextWidget:new{
             text = _("Send probes WiFi first, then the HotSpot, and uses whichever answers.\nNo connection checked yet or none reachable."),
             face = Font:getFace("smallinfofont"),
         })
@@ -372,14 +372,14 @@ function HomeDialog:renderHistory()
     local vg = VerticalGroup:new{ align = "left" }
     local list = self.plugin:sentList() or {}
     if #list == 0 then
-        vg:addWidget(TextWidget:new{
+        table.insert(vg,TextWidget:new{
             text = _("Nothing sent yet.\n\nBooks you send show up here with the\nCrossDrop reader, folder, size, and time."),
             face = Font:getFace("smallinfofont"),
         })
         return vg
     end
 
-    vg:addWidget(self:header(_("Books sent (most recent first)")))
+    table.insert(vg,self:header(_("Books sent (most recent first)")))
     local shown = 0
     for i, e in ipairs(list) do
         if shown >= 8 then break end
@@ -391,7 +391,7 @@ function HomeDialog:renderHistory()
             meta = meta .. string.format("  \226\128\164  %.1f MB", e.size / 1048576)
         end
         local entry = e
-        vg:addWidget(self:row((e.file or "?") .. "\n" .. meta .. _("  (tap to send again)"), {
+        table.insert(vg,self:row((e.file or "?") .. "\n" .. meta .. _("  (tap to send again)"), {
             callback = function()
                 self.plugin:sendTo{
                     kind = entry.kind or "wifi",
@@ -403,12 +403,12 @@ function HomeDialog:renderHistory()
         }))
     end
     if #list > shown then
-        vg:addWidget(TextWidget:new{
+        table.insert(vg,TextWidget:new{
             text = string.format(_("\226\128\166 plus %d more (only the last 8 are listed)"), #list - shown),
             face = Font:getFace("smallinfofont"),
         })
     end
-    vg:addWidget(self:row(_("Clear history"), {
+    table.insert(vg,self:row(_("Clear history"), {
         callback = function()
             UIManager:show(ConfirmBox:new{
                 text = _("Forget all sent-book history?"),
