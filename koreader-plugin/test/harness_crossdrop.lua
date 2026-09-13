@@ -275,10 +275,12 @@ G_reader_settings = {
 }
 
 UIManager = {
+    -- NOTE: this build has NO UIManager:replace (it crashed the plugin on
+    -- device, and the harness must not provide one either, or Home's tab
+    -- switch and check() would be tested against an API that doesn't exist).
     _shown = {},
     show = function(_, w) table.insert(UIManager._shown, w) end,
     close = function() end,
-    replace = function(_, o, n) table.insert(UIManager._shown, n) end,
     setDirty = function() end,
     forceRePaint = function() end,
     nextTick = function(_, f) return f() end,
@@ -558,6 +560,19 @@ FAKE.fail = true
 home:check("hotspot")
 check("home check() marks hotspot down (no crash)", inst._reach.hotspot == "down", inst._reach.hotspot)
 FAKE.fail = false
+
+-- 11c. Tab switching and check() must NOT use UIManager:replace (that exact
+-- call crashed KOReader on the Kindle — the method does not exist). They
+-- re-init the same widget in place and repaint.
+if home then
+    home.tab = "send"
+    home:init()
+    home:showTab("connections")
+    check("showTab switches tab (no replace)", home.tab == "connections")
+    home:showTab("connections")
+    check("showTab no-op on same tab", home.tab == "connections")
+    check("tab switch re-inits the widget", home.frame ~= nil and home[1] ~= nil)
+end
 
 print(failures == 0 and "\nALL TESTS PASSED" or string.format("\n%d TEST(S) FAILED", failures))
 os.exit(failures == 0 and 0 or 1)

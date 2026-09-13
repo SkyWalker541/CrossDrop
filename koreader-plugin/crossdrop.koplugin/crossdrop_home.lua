@@ -79,7 +79,7 @@ local HomeDialog = InputContainer:extend{
     modal = true,
     dismissable = false,
     plugin = nil,
-    tab = "connections",
+    tab = "send",
 }
 
 function HomeDialog:init()
@@ -157,11 +157,21 @@ end
 
 -- ─────────────────────────────── tab bar ─────────────────────────────────
 
+function HomeDialog:showTab(key)
+    if self.tab == key then return end
+    -- NOTE: there is NO UIManager:replace in this KOReader build (it crashed
+    -- the plugin on the Kindle). Re-init the SAME widget for its new tab and
+    -- repaint it in place instead.
+    self.tab = key
+    self:init()
+    UIManager:setDirty(self, "full")
+end
+
 function HomeDialog:buildTabBar(content_w)
     local sc = function(v) return Device.screen:scaleBySize(v) end
     local tabs = {
         { key = "connections", label = _("Connections") },
-        { key = "send", label = _("Send") },
+        { key = "send", label = _("Send A Book") },
     }
     local tabs_widgets = {}
     for i, t in ipairs(tabs) do
@@ -174,12 +184,7 @@ function HomeDialog:buildTabBar(content_w)
             menu_style = true,
             bold = active,
             callback = function()
-                if self.tab ~= t.key then
-                    UIManager:replace(self, HomeDialog:new{
-                        plugin = self.plugin,
-                        tab = t.key,
-                    })
-                end
+                self:showTab(t.key)
             end,
         }
         local underline
@@ -268,7 +273,8 @@ function HomeDialog:check(kind)
             .. tostring(err or "network error")
         UIManager:show(Notification:new{ text = text, timeout = 5 })
     end
-    UIManager:replace(self, HomeDialog:new{ plugin = self.plugin, tab = self.tab })
+    UIManager:setDirty(self, "full")
+    self:init()
 end
 
 function HomeDialog:renderConnections()
