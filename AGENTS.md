@@ -51,3 +51,26 @@ one for KOReader. It is not a firmware fork.
   side; keep that stated in the READMEs and guide.
 - No secrets, no tokens, no hosting outside this repo for the guide.
 - Don't commit or push unless asked.
+
+## UI patterns: always confirm against storefront / core first
+
+Before shipping any widget/UI change, **verify the exact pattern exists and
+works on the target device** — check the installed storefront plugin
+(`/Volumes/Kindle/koreader/plugins/storefront.koplugin/`) or KOReader core
+on the device (`/Volumes/Kindle/koreader/frontend/…`). If neither storefront
+nor core does it that way, don't invent it — find the closest proven pattern
+and use that instead. (Lesson: a hand-rolled text Button appended into the
+TitleBar OverlapGroup post-init painted over the ✕ and never received taps
+on-device — 1.3.11, reverted in 1.3.12 to the FileManager-style
+`right_icon` + `setRightIcon` swap.)
+
+Proven patterns used by this plugin:
+- TitleBar icon slots (`left_icon`/`right_icon` + `*_tap_callback`,
+  `allow_flash = false`) — FileManager's select mode does the
+  `setRightIcon("plus" ↔ "check")` swap on this exact build.
+- ConfirmBox/ButtonDialog buttons (`ok_text`, `ok_callback`) — storefront
+  uses the same mechanism for labeled buttons.
+- Anything that closes its container must set `allow_flash = false`
+  (storefront's rule), or KOReader crashes on the destroyed widget.
+- Never pass a `selected` option to Menu-derived widgets (FocusManager
+  owns that field — the 1.3.9 crash); the picker set is named `picked`.

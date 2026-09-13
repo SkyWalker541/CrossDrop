@@ -186,6 +186,9 @@ function class:getChildren() return {} end
 function class:setText(t) self.text = t end
 function class:setTitle(t) self.title = t end
 function class:setSubTitle(t) self.subtitle = t end
+-- Real TitleBar API (iconbutton swap): record the glyph like the device does
+function class:setLeftIcon(icon) self.left_icon = icon end
+function class:setRightIcon(icon) self.right_icon = icon end
 function class:updateItems() return true end
 function class:switchItemTable() return true end
 
@@ -456,19 +459,11 @@ check("send success shows Book sent", last_notif and type(last_notif.text) == "s
 
 -- 5b. "Send A Book" picker opens a MODAL file browser above the full-screen
 -- Home (non-modal would stack below it, exactly like the old IP dialog bug),
--- in multi-select mode: tapping toggles books (dimmed + ✓) and a "Send to
--- Xteink" button appears top-right (opposite the ✕) once a book is picked,
--- sending the whole selection through a confirm dialog into the OPEN
--- dashboard — nothing closes on tap.
-
--- True while the Send button is actually overlapping the title bar.
-local function sendBtnInBar(bar)
-    if not (bar and bar.send_button) then return false end
-    for i, w in ipairs(bar) do
-        if w == bar.send_button then return true end
-    end
-    return false
-end
+-- in multi-select mode: tapping toggles books (dimmed + ✓). The top-right
+-- slot is the send action — the core TitleBar icon-slot pattern (FileManager
+-- uses the same plus↔check setRightIcon swap on this build): a question mark
+-- while nothing is picked, the ✓ send mark once a book is chosen, and the
+-- confirm dialog's OK button is the labeled "Send to Xteink" button.
 
 UIManager._shown = {}
 inst:chooseAndSend()
@@ -482,19 +477,21 @@ check("chooser starts with an empty picker set",
     chooser and type(chooser.picked) == "table" and next(chooser.picked) == nil)
 check("chooser picked does NOT collide with FocusManager's selected field",
     chooser and chooser.selected == nil, chooser and chooser.selected)
-check("no Send button before any book is picked",
-    not sendBtnInBar(chooser and chooser.custom_title_bar), chooser and chooser.custom_title_bar)
 check("✕ close button stays on the title bar (left icon, wired)",
     chooser and chooser.custom_title_bar and chooser.custom_title_bar.left_icon == "close"
         and type(chooser.custom_title_bar.left_icon_tap_callback) == "function",
     chooser and chooser.custom_title_bar and chooser.custom_title_bar.left_icon)
 chooser.custom_title_bar.left_icon_tap_callback() -- still callable: closes without sending
+check("right slot shows the question mark before any book is picked",
+    chooser and chooser.custom_title_bar and chooser.custom_title_bar.right_icon == "notice-question",
+    chooser and chooser.custom_title_bar and chooser.custom_title_bar.right_icon)
 local fa = { path = "/tmp/fakebook.epub" }
 local fb = { path = "/tmp/fakebook2.epub" }
 chooser:onFileSelect(fa)
 check("tap picks a book (dim + ✓)", fa.dim == true and tostring(fa.text):match("\226\156\147"), fa.text)
-check("Send button appears once a book is picked",
-    sendBtnInBar(chooser.custom_title_bar), chooser.custom_title_bar)
+check("✓ send mark appears once a book is picked",
+    chooser.custom_title_bar and chooser.custom_title_bar.right_icon == "check",
+    chooser.custom_title_bar and chooser.custom_title_bar.right_icon)
 check("picker title shows the selection count",
     chooser.custom_title_bar and tostring(chooser.custom_title_bar.title):match("1 selected"),
     chooser.custom_title_bar and chooser.custom_title_bar.title)
@@ -506,15 +503,18 @@ check("title count follows the selection",
     chooser.custom_title_bar and tostring(chooser.custom_title_bar.title):match("1 selected"),
     chooser.custom_title_bar and chooser.custom_title_bar.title)
 chooser:onFileSelect(fa)
-check("Send button stays while books are picked",
-    sendBtnInBar(chooser.custom_title_bar), chooser.custom_title_bar)
+check("✓ stays while books are picked",
+    chooser.custom_title_bar and chooser.custom_title_bar.right_icon == "check",
+    chooser.custom_title_bar and chooser.custom_title_bar.right_icon)
 chooser:onFileSelect(fb) -- n=1 (fa still picked)
 chooser:onFileSelect(fa) -- n=0: last book gone
-check("Send button hides when the last book is unpicked",
-    not sendBtnInBar(chooser.custom_title_bar), chooser.custom_title_bar)
+check("question mark returns when the last book is unpicked",
+    chooser.custom_title_bar and chooser.custom_title_bar.right_icon == "notice-question",
+    chooser.custom_title_bar and chooser.custom_title_bar.right_icon)
 chooser:onFileSelect(fa) -- n=1 again
-check("Send button returns when picking resumes",
-    sendBtnInBar(chooser.custom_title_bar), chooser.custom_title_bar)
+check("✓ returns when picking resumes",
+    chooser.custom_title_bar and chooser.custom_title_bar.right_icon == "check",
+    chooser.custom_title_bar and chooser.custom_title_bar.right_icon)
 chooser:onFileSelect(fb) -- back to both books (fa + fb)
 
 -- the Send to Xteink confirm: closes the picker and runs the whole batch IN
@@ -535,10 +535,10 @@ fake_home = {
 }
 inst.home = fake_home
 UIManager._shown = {}
-chooser.custom_title_bar.send_button.callback()
+chooser.custom_title_bar.right_icon_tap_callback()
 local cdlg = UIManager._shown[#UIManager._shown]
-check("picker Send opens a confirm dialog",
-    cdlg and cdlg.ok_text == "Send" and tostring(cdlg.text):match("Send 2 book"),
+check("picker ✓ opens a confirm dialog with a Send to Xteink button",
+    cdlg and cdlg.ok_text == "Send to Xteink" and tostring(cdlg.text):match("Send 2 book"),
     cdlg and ((cdlg.ok_text or "") .. " / " .. tostring(cdlg.text or "")))
 UIManager._shown = {}
 cdlg.ok_callback()
@@ -561,7 +561,7 @@ inst.home = nil
 -- hidden at 0 anyway; the guard still protects a direct callback)
 UIManager._shown = {}
 chooser.picked = {}
-chooser.custom_title_bar.send_button.callback()
+chooser.custom_title_bar.right_icon_tap_callback()
 local hint0 = UIManager._shown[#UIManager._shown]
 check("Send with no selection shows a hint",
     hint0 and type(hint0.text) == "string" and hint0.text:match("Tap a book"), hint0 and hint0.text)
