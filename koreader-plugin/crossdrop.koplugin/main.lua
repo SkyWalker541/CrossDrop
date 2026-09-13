@@ -497,9 +497,12 @@ function CROSSDROP:sendTo(target)
     self:sendCurrentBook()
 end
 
--- Open the full-screen CrossDrop dashboard.
+-- Open the full-screen CrossDrop dashboard. Shown with a "ui" refresh (the
+-- same call Storefront uses) so the whole screen paints cleanly on e-ink.
 function CROSSDROP:openHome()
-    UIManager:show(homeModule():new{ plugin = self })
+    local home = homeModule():new{ plugin = self }
+    UIManager:show(home, "ui")
+    UIManager:forceRePaint()
 end
 
 -- Pin the CrossDrop item at the top of the Tools menu (position 2, right under

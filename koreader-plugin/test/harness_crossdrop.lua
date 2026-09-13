@@ -94,8 +94,85 @@ end
 
 -- ── KOReader module stubs ────────────────────────────────────────────────
 
+-- Geometry emulation: the Kindle PW5 SE reports 1236x1648 (portrait) and
+-- scaleBySize(px) = ceil(px * min(w,h)/600) (see its ffi/framebuffer.lua).
+-- The stubs measure auto-sized text instead of returning {0,0}, so a layout
+-- that runs past the screen edges on the device fails the harness too.
+local SCREEN_W, SCREEN_H = 1236, 1648
+local SCREEN_SCALE = SCREEN_W / 600
+local function scal(v) return math.ceil((v or 0) * SCREEN_SCALE) end
+
+local FACE_SIZES = {
+    cfont = 24, tfont = 26, smalltfont = 24, x_smalltfont = 22,
+    ffont = 20, smallffont = 15, largeffont = 25, pgfont = 20,
+    scfont = 20, rifont = 16, hpkfont = 20, hfont = 24,
+    infont = 22, smallinfont = 16, infofont = 24, smallinfofont = 22,
+    smallinfofontbold = 22, x_smallinfofont = 20, xx_smallinfofont = 18,
+}
+
+local function utf8_chars(s)
+    local n = 0
+    for _ in (s .. ""):gmatch("[\1-\127\194-\244][\128-\191]*") do n = n + 1 end
+    return n
+end
+
+local function measure_text(text, face, max_width)
+    local fsize = (face and face.s) or 22
+    local cw = math.ceil(fsize * 0.5)
+    local w, lines = 0, 1
+    for part in (tostring(text or "") .. "\n"):gmatch("(.-)\n") do
+        w = math.max(w, utf8_chars(part) * cw)
+        lines = lines + 1
+    end
+    if max_width then w = math.min(w, max_width) end
+    return { w = w, h = lines * math.ceil(fsize * 1.2) }
+end
+
 local class = {}
-function class:getSize() return { w = 0, h = 0 } end
+function class:getSize()
+    local name = self.__name
+    if name == "VerticalSpan" or name == "HorizontalSpan" then
+        local w = self.width or 0
+        return { w = name == "HorizontalSpan" and w or 0, h = name == "VerticalSpan" and w or 0 }
+    end
+    if name == "VerticalGroup" or name == "HorizontalGroup" then
+        local w, h = 0, 0
+        for i = 1, #self do
+            local kid = self[i]
+            if type(kid) == "table" and type(kid.getSize) == "function" then
+                local s = kid:getSize()
+                if name == "VerticalGroup" then
+                    w = math.max(w, s.w); h = h + s.h
+                else
+                    w = w + s.w; h = math.max(h, s.h)
+                end
+            end
+        end
+        return { w = w, h = h }
+    end
+    if name == "FrameContainer" then
+        local child = self[1]
+        local cs = (type(child) == "table" and type(child.getSize) == "function") and child:getSize() or { w = 0, h = 0 }
+        local p = self.padding or 0
+        local b = self.bordersize or 0
+        local m = self.margin or 0
+        local pad_l = self.padding_left or p
+        local pad_r = self.padding_right or p
+        local pad_t = self.padding_top or p
+        local pad_b = self.padding_bottom or p
+        return { w = cs.w + (b + m) * 2 + pad_l + pad_r, h = cs.h + (b + m) * 2 + pad_t + pad_b }
+    end
+    if name == "CenterContainer" then
+        return { w = self.dimen and self.dimen.w or 0, h = self.dimen and self.dimen.h or 0 }
+    end
+    if self.dimen and self.dimen.w then
+        return { w = self.dimen.w, h = self.dimen.h or 0 }
+    end
+    if self.text ~= nil then
+        return measure_text(self.text, self.face, self.width or self.max_width)
+    end
+    return { w = 0, h = 0 }
+end
 function class:getTextDimension() return { w = 0, h = 0 } end
 function class:isFocusable() return false end
 function class:getChildren() return {} end
@@ -114,10 +191,10 @@ function class:extend(over)
 end
 
 local ScreenStub = {}
-function ScreenStub:getWidth() return 600 end
-function ScreenStub:getHeight() return 800 end
-function ScreenStub:getSize() return { w = 600, h = 800 } end
-function ScreenStub:scaleBySize(v) return v end
+function ScreenStub:getWidth() return SCREEN_W end
+function ScreenStub:getHeight() return SCREEN_H end
+function ScreenStub:getSize() return { w = SCREEN_W, h = SCREEN_H } end
+function ScreenStub:scaleBySize(v) return scal(v) end
 
 local DevInputStub = { group = { Back = "back", Any = "any" } }
 local DeviceStub = {
@@ -149,7 +226,7 @@ local SAFE_FACES = {
 local FontStub = {
     getFace = function(_, name, size)
         if size then return { f = name, s = size } end
-        if SAFE_FACES[name] then return { f = name } end
+        if SAFE_FACES[name] then return { f = name, s = FACE_SIZES[name] or 22 } end
         error(string.format("Font:getFace(%q) without a size crashed here (exactly what killed the plugin on the Kindle)",
             tostring(name)))
     end,
@@ -166,7 +243,12 @@ local stubs = {
     ["ui/font"] = FontStub,
     ["ui/geometry"] = { new = function(o) return o or {} end },
     ["ui/gesturerange"] = { new = function(o) return o or {} end },
-    ["ui/size"] = { radius = { window = 4 }, padding = { default = 9, large = 15 }, span = { horizontal_default = 4 }, border = { window = 1 } },
+    ["ui/size"] = {
+        radius = { window = scal(7) },
+        padding = { default = scal(5), large = scal(10) },
+        span = { horizontal_default = scal(10) },
+        border = { window = scal(1.5) },
+    },
     ["ui/widget/container/widgetcontainer"] = class:extend{},
     ["ui/widget/container/inputcontainer"] = class:extend{},
     ["ui/elements/reader_menu_order"] = reader_menu_order,
@@ -198,6 +280,7 @@ UIManager = {
     close = function() end,
     replace = function(_, o, n) table.insert(UIManager._shown, n) end,
     setDirty = function() end,
+    forceRePaint = function() end,
     scheduleIn = function() return { cancel = function() end } end,
     unschedule = function() end,
 }
@@ -415,6 +498,26 @@ if home then
     check("home Send tab renders", type(sc_) == "table")
     check("home History tab renders", type(hc) == "table")
     check("home Back closes", home:onBack() == true)
+end
+
+-- 11a. Layout never spills past the screen edges on the Kindle (the sizing
+-- must be device-scaled + width-capped like Storefront, regardless of screen).
+check("home frame fits within screen width",
+    home and home.frame and home.frame:getSize().w <= SCREEN_W,
+    home and home.frame and home.frame:getSize().w or "no frame")
+for _, tab in ipairs({ "connections", "send", "history" }) do
+    UIManager._shown = {}
+    inst:openHome()
+    local h = UIManager._shown[#UIManager._shown]
+    if h then
+        if h.tab ~= tab then
+            h.tab = tab
+            h:init()
+        end
+        check("frame fits screen on '" .. tab .. "' tab",
+            h.frame and h.frame:getSize().w <= SCREEN_W,
+            h.frame and h.frame:getSize().w or 0)
+    end
 end
 
 -- 11b. Home check() probes and remembers reachability (state survives swap)

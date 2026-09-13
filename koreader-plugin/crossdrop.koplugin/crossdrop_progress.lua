@@ -37,6 +37,7 @@ function ProgressDialog:init()
         text = self.book or "?",
         face = Font:getFace("cfont", 18),
         bold = true,
+        max_width = inner_w,
     }
     local target_txt = (self.target and self.target.ip or "?")
     if self.target and self.target.port and self.target.port ~= 80 then
@@ -48,6 +49,7 @@ function ProgressDialog:init()
     local target_line = TextWidget:new{
         text = target_txt,
         face = Font:getFace("smallinfofont"),
+        max_width = inner_w,
     }
 
     local bar_w = inner_w

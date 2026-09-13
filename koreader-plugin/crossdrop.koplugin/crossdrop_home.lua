@@ -28,6 +28,7 @@ local InputContainer = require("ui/widget/container/inputcontainer")
 local LineWidget = require("ui/widget/linewidget")
 local Notification = require("ui/widget/notification")
 local Size = require("ui/size")
+local TextBoxWidget = require("ui/widget/textboxwidget")
 local TextWidget = require("ui/widget/textwidget")
 local TitleBar = require("ui/widget/titlebar")
 local UIManager = require("ui/uimanager")
@@ -95,9 +96,15 @@ function HomeDialog:init()
     local sw = Device.screen:getWidth()
     local sh = Device.screen:getHeight()
     self.dimen = Geom:new{ w = sw, h = sh }
+
+    -- Storefront-style sizing: every dimension is derived from the device via
+    -- scaleBySize, the card width is capped with a scaled side margin, and no
+    -- text widget is allowed to auto-size past the card — so the dashboard
+    -- fills the screen without ever spilling past its edges on any device.
+    local dialog_w = math.min(sw - sc(20), math.floor(math.min(sw, sh) * 0.95))
     local pad = Size.padding.default
-    local inner_w = sw - pad * 2
-    self.row_w = inner_w - sc(14)
+    local inner_w = dialog_w - pad * 2
+    self.row_w = inner_w
 
     local reach = self.plugin._reach or {}
     local target = self.plugin:resolveTarget()
@@ -125,15 +132,12 @@ function HomeDialog:init()
         show_parent = self,
     }
 
-    local content = self:buildTabContent(self.tab, inner_w - sc(8))
+    local content = self:buildTabContent(self.tab, inner_w)
 
     local frame = FrameContainer:new{
-        dimen = self.dimen,
         bordersize = 0,
         background = Blitbuffer.COLOR_WHITE,
-        padding = 0,
-        padding_left = pad,
-        padding_right = pad,
+        padding = pad,
         VerticalGroup:new{
             align = "left",
             title_bar,
@@ -144,6 +148,7 @@ function HomeDialog:init()
             VerticalSpan:new{ width = sc(8) },
         },
     }
+    self.frame = frame
 
     self[1] = CenterContainer:new{
         dimen = self.dimen,
@@ -309,9 +314,10 @@ function HomeDialog:renderConnections()
         callback = function() self.plugin:editIp("hotspot") end,
     }))
 
-    table.insert(vg,TextWidget:new{
+    table.insert(vg,TextBoxWidget:new{
         text = _("Books land in the CrossDropped Files folder on the reader's card.\nNothing to pick \226\128\148 Send tab handles the rest."),
         face = Font:getFace("smallinfofont"),
+        width = self.row_w,
     })
 
     return vg
@@ -334,9 +340,10 @@ function HomeDialog:renderSend()
             callback = function() self.plugin:sendCurrentBook() end,
         }))
     else
-        table.insert(vg,TextWidget:new{
+        table.insert(vg,TextBoxWidget:new{
             text = _("No book open yet.\n\nOpen a book in KOReader and it appears here,\nready to send to the CrossDrop reader."),
             face = Font:getFace("smallinfofont"),
+            width = self.row_w,
         })
     end
 
@@ -357,9 +364,10 @@ function HomeDialog:renderSend()
     }))
 
     if reach.wifi ~= "ok" and reach.hotspot ~= "ok" then
-        table.insert(vg,TextWidget:new{
+        table.insert(vg,TextBoxWidget:new{
             text = _("Send probes WiFi first, then the HotSpot, and uses whichever answers.\nNo connection checked yet or none reachable."),
             face = Font:getFace("smallinfofont"),
+            width = self.row_w,
         })
     end
 
@@ -372,9 +380,10 @@ function HomeDialog:renderHistory()
     local vg = VerticalGroup:new{ align = "left" }
     local list = self.plugin:sentList() or {}
     if #list == 0 then
-        table.insert(vg,TextWidget:new{
+        table.insert(vg,TextBoxWidget:new{
             text = _("Nothing sent yet.\n\nBooks you send show up here with the\nCrossDrop reader, folder, size, and time."),
             face = Font:getFace("smallinfofont"),
+            width = self.row_w,
         })
         return vg
     end
