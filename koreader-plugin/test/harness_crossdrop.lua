@@ -184,6 +184,10 @@ function class:getTextDimension() return { w = 0, h = 0 } end
 function class:isFocusable() return false end
 function class:getChildren() return {} end
 function class:setText(t) self.text = t end
+function class:setTitle(t) self.title = t end
+function class:setSubTitle(t) self.subtitle = t end
+function class:updateItems() return true end
+function class:switchItemTable() return true end
 
 function class:init() end
 function class:new(o)
@@ -402,6 +406,9 @@ local inst = CROSSDROP:new{ ui = { menu = { registerToMainMenu = function() end 
 local bfh = assert(io.open("/tmp/fakebook.epub", "wb"))
 for _ = 1, 16000 do bfh:write(string.rep("x", 16)) end
 bfh:close()
+local bfh2 = assert(io.open("/tmp/fakebook2.epub", "wb"))
+for _ = 1, 16000 do bfh2:write(string.rep("y", 16)) end
+bfh2:close()
 
 -- 1. ensureFolder: 201 then 405 both succeed (always targets CrossDropped Files)
 local eok, eerr = inst:ensureFolder({ ip = "192.168.1.50", port = 80, folder = "/CrossDropped Files" })
@@ -449,7 +456,9 @@ check("send success shows Book sent", last_notif and type(last_notif.text) == "s
 
 -- 5b. "Send A Book" picker opens a MODAL file browser above the full-screen
 -- Home (non-modal would stack below it, exactly like the old IP dialog bug),
--- and picking a file streams it without needing a book open.
+-- in multi-select mode: tapping toggles books (dimmed + ✓) and the title-bar
+-- ✓ sends the whole selection through a confirm dialog into the OPEN
+-- dashboard — nothing closes on tap.
 UIManager._shown = {}
 inst:chooseAndSend()
 local chooser = UIManager._shown[#UIManager._shown]
@@ -458,10 +467,70 @@ check("chooser is modal (paints above Home)", chooser ~= nil and chooser.modal =
 check("chooser filters supported book files", chooser and chooser.file_filter and chooser.file_filter("MyBook.epub") == true)
 check("chooser ui has folder_shortcuts (browser needs it)",
     chooser and chooser.ui and chooser.ui.folder_shortcuts and type(chooser.ui.folder_shortcuts.getShortcutFullName) == "function")
+check("chooser starts with an empty selection set",
+    chooser and type(chooser.selected) == "table" and next(chooser.selected) == nil)
+local fa = { path = "/tmp/fakebook.epub" }
+local fb = { path = "/tmp/fakebook2.epub" }
+chooser:onFileSelect(fa)
+check("tap picks a book (dim + ✓)", fa.dim == true and tostring(fa.text):match("\226\156\147"), fa.text)
+check("picker title shows the selection count",
+    chooser.custom_title_bar and tostring(chooser.custom_title_bar.title):match("1 selected"),
+    chooser.custom_title_bar and chooser.custom_title_bar.title)
+chooser:onFileSelect(fb)
+chooser:onFileSelect(fa)
+check("tap toggles a book back off (no send on tap)",
+    fa.dim == nil and chooser.selected["/tmp/fakebook.epub"] == nil)
+check("title count follows the selection",
+    chooser.custom_title_bar and tostring(chooser.custom_title_bar.title):match("1 selected"),
+    chooser.custom_title_bar and chooser.custom_title_bar.title)
+chooser:onFileSelect(fa)
+
+-- the ✓ confirm: closes the picker and runs the whole batch IN the dashboard
+-- (a fake Home sink records the flow; the real Home is exercised in section 14).
+local fake_home
+fake_home = {
+    calls = {},
+    -- the plugin colon-calls its sink: onConnected(self, target), onFileSent(self, path, target), etc.
+    onConnecting = function() table.insert(fake_home.calls, "connecting") end,
+    onConnected = function(_, t) table.insert(fake_home.calls, "connected:" .. t.kind) end,
+    onBeginFile = function() table.insert(fake_home.calls, "begin") end,
+    onProgress = function() table.insert(fake_home.calls, "progress") end,
+    onFileSent = function() table.insert(fake_home.calls, "sent") end,
+    onFileFailed = function() table.insert(fake_home.calls, "failed") end,
+    onUnreachable = function() table.insert(fake_home.calls, "unreachable") end,
+    onDone = function(_, ok) table.insert(fake_home.calls, "done:" .. tostring(ok)) end,
+}
+inst.home = fake_home
 UIManager._shown = {}
-chooser:onFileSelect({ path = "/tmp/fakebook.epub" })
-local picked_toast = UIManager._shown[#UIManager._shown]
-check("picked book is sent", picked_toast and type(picked_toast.text) == "string" and picked_toast.text:match("Book sent"), picked_toast and picked_toast.text)
+chooser.custom_title_bar.right_icon_tap_callback()
+local cdlg = UIManager._shown[#UIManager._shown]
+check("picker ✓ opens a Send confirm dialog",
+    cdlg and cdlg.ok_text == "Send" and tostring(cdlg.text):match("Send 2 book"),
+    cdlg and ((cdlg.ok_text or "") .. " / " .. tostring(cdlg.text or "")))
+UIManager._shown = {}
+cdlg.ok_callback()
+check("confirm keeps the dashboard open (no close on transfer)",
+    inst.home == fake_home)
+check("flow opens with the Connecting state",
+    fake_home.calls and fake_home.calls[1] == "connecting", fake_home.calls and fake_home.calls[1])
+check("flow connected through the reachable connection",
+    fake_home.calls and fake_home.calls[2] == "connected:wifi",
+    fake_home.calls and fake_home.calls[2])
+local sent_count = 0
+for _, c in ipairs(fake_home.calls) do if c == "sent" then sent_count = sent_count + 1 end end
+check("every picked book reported sent", sent_count == 2, sent_count)
+check("batch completes as done",
+    fake_home.calls and fake_home.calls[#fake_home.calls] == "done:true",
+    fake_home.calls and fake_home.calls[#fake_home.calls])
+inst.home = nil
+
+-- ✓ with nothing picked is a gentle hint, never a send
+UIManager._shown = {}
+chooser.selected = {}
+chooser.custom_title_bar.right_icon_tap_callback()
+local hint0 = UIManager._shown[#UIManager._shown]
+check("✓ with no selection shows a hint",
+    hint0 and type(hint0.text) == "string" and hint0.text:match("Tap a book"), hint0 and hint0.text)
 
 -- 5c. sending with NO book open no longer crashes (the old on-device crash);
 -- it just shows the picker hint.
@@ -701,6 +770,89 @@ inst:openHome()
 check("openHome resolves siblings after restore (no module-not-found crash)",
     UIManager._shown[#UIManager._shown] ~= nil)
 package.path = saved_path
+
+-- 14. THE IN-DASHBOARD TRANSFER: sendBooks sinks into the OPEN Home dialog,
+-- which repaints its OWN Send tab in place (connecting → live bar → done) —
+-- nothing closes between picking, connecting, transferring, and sending more.
+UIManager._shown = {}
+inst:openHome()
+home = UIManager._shown[#UIManager._shown]
+FAKE.fail, FAKE.fail_put = false, false
+local ok_batch = inst:sendBooks({ "/tmp/fakebook.epub", "/tmp/fakebook2.epub" }, home)
+check("in-dashboard batch sends every book", ok_batch == true)
+check("home ends in the done state", home.send_state == "done", home.send_state)
+check("home stays open the whole time", inst.home == home)
+check("home rendered the sent-books list", #home.send_file_list == 2, #home.send_file_list)
+check("reach dot recorded the connection", inst._reach and inst._reach.wifi == "ok", inst._reach and inst._reach.wifi)
+check("done tab offers Send more (loop back into the picker)",
+    home.frame ~= nil and type(home.sendMore) == "function")
+home:onCloseWidget()
+check("closing home clears plugin.home (sendBooks falls back)",
+    inst.home == nil)
+
+-- transfer-drop: the send fails INSIDE the dashboard, list it and stay open
+FAKE.fail_put = true
+UIManager._shown = {}
+inst:openHome()
+home = UIManager._shown[#UIManager._shown]
+local ok_bad = inst:sendBooks({ "/tmp/fakebook.epub" }, home)
+check("put-drop batch reports failure", ok_bad == false)
+check("home ends in the failed state", home.send_state == "failed", home.send_state)
+check("failed state carries the reason",
+    home.fail_reason ~= nil and tostring(home.fail_reason) ~= "", tostring(home.fail_reason))
+check("dashboard stays open after a failure", inst.home == home)
+FAKE.fail_put = false
+
+-- no connection at all: the failure summary lives on the Send tab too
+FAKE.fail = true
+UIManager._shown = {}
+inst:openHome()
+home = UIManager._shown[#UIManager._shown]
+local ok_none = inst:sendBooks({ "/tmp/fakebook.epub" }, home)
+check("no-reader batch reports failure", ok_none == false)
+check("home shows no-reader failure inline",
+    home.send_state == "failed" and tostring(home.fail_reason):match("No CrossDrop reader reached"),
+    home.send_state and home.fail_reason)
+check("reach marks both connections down",
+    inst._reach and inst._reach.wifi == "down" and inst._reach.hotspot == "down",
+    inst._reach and (inst._reach.wifi or "?") .. "/" .. (inst._reach.hotspot or "?"))
+FAKE.fail = false
+
+-- renderers for every send state build without crashing and stay in-screen
+home.send_state = "connecting"
+home:init()
+check("connecting state renders", home.frame ~= nil and home.frame:getSize().w <= SCREEN_W)
+home.send_state = "done"
+home.send_file_list = { "A.epub", "B.epub" }
+home:init()
+check("done state renders (count + list)", home.frame ~= nil and home.frame:getSize().w <= SCREEN_W)
+home.send_state = "failed"
+home.fail_reason = "boom"
+home:init()
+check("failed state renders", home.frame ~= nil and home.frame:getSize().w <= SCREEN_W)
+
+-- 15. IP PERSISTENCE: connection IPs live in KOReader's global settings; in
+-- this plugin they are only ever written by the Set WiFi/HotSpot IP dialogs.
+-- A "restart" (fresh instance) must read them back exactly.
+G_reader_settings:saveSetting("crossdrop_wifi_ip", "10.9.8.7")
+G_reader_settings:saveSetting("crossdrop_hotspot_ip", "192.168.4.1")
+local ui_r = { menu = { registerToMainMenu = function() end }, document = { file = "/tmp/fakebook.epub" } }
+local inst_r = CROSSDROP:new{ ui = ui_r }
+check("wifi IP survives a restart", inst_r:resolveTarget() and inst_r:resolveTarget().ip == "10.9.8.7",
+    inst_r:resolveTarget() and inst_r:resolveTarget().ip)
+inst_r:saveTarget({ kind = "hotspot", ip = "192.168.5.1", port = 80 })
+local inst_r2 = CROSSDROP:new{ ui = ui_r }
+check("hotspot IP survives a restart",
+    inst_r2:configuredTargets()[2].ip == "192.168.5.1", inst_r2:configuredTargets()[2].ip)
+check("port survives a restart",
+    inst_r2:configuredTargets()[1].port == 80, inst_r2:configuredTargets()[1].port)
+G_reader_settings:saveSetting("crossdrop_wifi_ip", nil)
+local inst_r3 = CROSSDROP:new{ ui = ui_r }
+check("empty wifi stays deliberately unset (falls back to HotSpot)",
+    inst_r3:resolveTarget() and inst_r3:resolveTarget().kind == "hotspot",
+    inst_r3:resolveTarget() and inst_r3:resolveTarget().kind)
+inst:saveTarget({ kind = "wifi", ip = "192.168.1.50" })
+inst:saveTarget({ kind = "hotspot", ip = "192.168.4.1" })
 
 print(failures == 0 and "\nALL TESTS PASSED" or string.format("\n%d TEST(S) FAILED", failures))
 os.exit(failures == 0 and 0 or 1)

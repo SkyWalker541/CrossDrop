@@ -6,12 +6,19 @@
 -- load. Reachability is checked on demand (it is a blocking probe) and
 -- remembered on the plugin instance across tab switches.
 --
+-- Every send happens INSIDE this dashboard: beginSendBatch hands the picked
+-- files to plugin:sendBooks with this Home as the repaint sink, whose
+-- onConnecting/onConnected/onBeginFile/onProgress/onDone callbacks rebuild the
+-- Send tab in place (the same forceRePaint recipe the standalone progress
+-- dialog and Storefront use). The dashboard never closes during a transfer,
+-- and "Send more books…"/"Try again" keep going from the same window.
+--
 -- Uses only the plugin API exported from main.lua:
 --   configuredTargets() -> {kind, ip, port, folder}[]  (WiFi first)
 --   resolveTarget()     -> primary target (WiFi when set, else HotSpot)
 --   probeTarget(target) -> (ok, info?); "down" statuses are cheap (3s timeout)
 --   sendCurrentBook()   -> probes WiFi then HotSpot, streams to whichever answers
---   chooseAndSend()     -> open KOReader's file browser to pick a book to send
+--   chooseAndSend()     -> the multi-select book picker (✓ sends the selection)
 --   editIp(kind)        -> input dialog for "wifi" or "hotspot"
 --   statusDialog(), currentBookPath()
 
@@ -26,6 +33,7 @@ local HorizontalSpan = require("ui/widget/horizontalspan")
 local InputContainer = require("ui/widget/container/inputcontainer")
 local LineWidget = require("ui/widget/linewidget")
 local Notification = require("ui/widget/notification")
+local OverlapGroup = require("ui/widget/overlapgroup")
 local Size = require("ui/size")
 local TextBoxWidget = require("ui/widget/textboxwidget")
 local TextWidget = require("ui/widget/textwidget")
@@ -80,6 +88,17 @@ local HomeDialog = InputContainer:extend{
     dismissable = false,
     plugin = nil,
     tab = "send",
+    -- In-dashboard send state machine (see renderSend dispatch).
+    send_state = "idle",  -- "idle" | "connecting" | "sending" | "done" | "failed"
+    send_paths = nil,     -- full list passed to beginSendBatch
+    send_target = nil,    -- {kind,ip,port,folder} of the resolved connection
+    send_index = 0,       -- 1-based: current file number within the batch
+    send_total = 0,       -- total files in the batch
+    send_path = nil,      -- path of the file currently being sent
+    send_filename = nil,  -- basename of send_path (for display)
+    send_file_list = {},  -- basenames of files sent so far
+    send_widgets = nil,   -- live {bar_w, fill, pct, meta} during "sending"
+    fail_reason = nil,    -- text shown on "failed"
 }
 
 function HomeDialog:init()
@@ -158,6 +177,13 @@ end
 
 function HomeDialog:onBack()
     UIManager:close(self)
+    return true
+end
+
+function HomeDialog:onCloseWidget()
+    if self.plugin then
+        self.plugin.home = nil
+    end
     return true
 end
 
@@ -247,7 +273,19 @@ function HomeDialog:buildTabContent(tab, width)
     if tab == "connections" then
         return self:renderConnections()
     end
-    return self:renderSend()
+    if self.send_state == "connecting" then
+        return self:renderSendConnecting()
+    end
+    if self.send_state == "sending" then
+        return self:renderSendProgress()
+    end
+    if self.send_state == "done" then
+        return self:renderSendDone()
+    end
+    if self.send_state == "failed" then
+        return self:renderSendFailed()
+    end
+    return self:renderSendIdle()
 end
 
 -- ─────────────────────── Connections tab ────────────────────────────────
@@ -345,7 +383,10 @@ end
 
 -- ─────────────────────────── Send tab ───────────────────────────────────
 
-function HomeDialog:renderSend()
+-- Idle: the pick-anything entry points, exactly as before. All sends now run
+-- inside this dashboard (beginSendBatch → plugin:sendBooks with this Home as
+-- the repaint sink), so the CrossDrop UI never closes while transferring.
+function HomeDialog:renderSendIdle()
     local vg = VerticalGroup:new{ align = "left" }
     local reach = self.plugin._reach or {}
     local book = self.plugin:currentBookPath()
@@ -362,7 +403,7 @@ function HomeDialog:renderSend()
         table.insert(vg,self:row(
             string.format("\226\151\128  %s\n%s  \226\128\164  tap to send", name,
                 (size > 0 and string.format(_("%.1f MB"), size / 1048576) or "ebook")), {
-            callback = function() self.plugin:sendCurrentBook() end,
+            callback = function() self:beginSendBatch({ book }) end,
         }))
     else
         table.insert(vg,TextBoxWidget:new{
@@ -396,6 +437,273 @@ function HomeDialog:renderSend()
         })
     end
 
+    return vg
+end
+
+-- ─────────────── in-dashboard send: the progress sink ─────────────────────
+-- plugin:sendBooks(paths, self) drives these callbacks synchronously while the
+-- connection probes and the chunked PUT run on the UI thread. Each one rebuilds
+-- the Send tab in place and force-paints, so the whole flow is visible inside
+-- CrossDrop — the dashboard never closes, and afterwards Send More / Try Again
+-- keep controlling the same window.
+
+function HomeDialog:beginSendBatch(paths)
+    self.send_state = "connecting"
+    self.send_paths = type(paths) == "table" and paths or {}
+    self.send_total = #self.send_paths
+    self.send_index = 0
+    self.send_file_list = {}
+    self.send_target = nil
+    self.fail_reason = nil
+    self.plugin:sendBooks(self.send_paths, self)
+end
+
+function HomeDialog:onConnecting()
+    self.send_state = "connecting"
+    self:init()
+    UIManager:forceRePaint()
+end
+
+function HomeDialog:onConnected(target)
+    self.send_target = target
+end
+
+function HomeDialog:onUnreachable()
+    self.send_state = "failed"
+    self.fail_reason = _("No CrossDrop reader reached.\n\nTried:\n") .. self.plugin:connectionSummary() ..
+        _("\n\nOpen File Transfer on the reader (Join Network for WiFi,\nor Create Hotspot), and keep this device on the same network.")
+    self:init()
+    UIManager:forceRePaint()
+end
+
+function HomeDialog:onBeginFile(path, target, idx, total)
+    self.send_state = "sending"
+    self.send_target = target
+    self.send_path = path
+    self.send_filename = path:match("([^/]+)$") or path
+    self.send_index = idx
+    self.send_total = total
+    self.send_widgets = nil
+    self:init()
+    UIManager:forceRePaint()
+end
+
+function HomeDialog:onProgress(path, pct, sent, total, elapsed)
+    local w = self.send_widgets
+    if not w then return end
+    pct = math.max(0, math.min(100, math.floor(pct + 0.5)))
+    w.pct:setText(string.format("%d%%", pct))
+    w.fill.dimen.w = math.max(1, math.floor(w.bar_w * pct / 100))
+
+    local meta = {}
+    if total and total > 0 then
+        meta[#meta + 1] = string.format("%.1f / %.1f MB", sent / 1048576, total / 1048576)
+    else
+        meta[#meta + 1] = string.format("%.1f MB", sent / 1048576)
+    end
+    if elapsed and elapsed > 0 then
+        local rate = sent / elapsed
+        meta[#meta + 1] = string.format("%.2f MB/s", rate / 1048576)
+        if total and total > 0 and pct > 0 then
+            local remaining = total - sent
+            local eta = remaining / math.max(rate, 1)
+            meta[#meta + 1] = string.format("ETA %d:%02d", math.floor(eta / 60), math.floor(eta % 60))
+        end
+    end
+    w.meta:setText(table.concat(meta, "  \194\183  "))
+    UIManager:forceRePaint()
+end
+
+function HomeDialog:onFileSent(path, target)
+    self.send_file_list[#self.send_file_list + 1] = path:match("([^/]+)$") or path
+end
+
+function HomeDialog:onFileFailed(path, reason)
+    self.fail_reason = (path:match("([^/]+)$") or path) .. "\n" .. tostring(reason)
+end
+
+function HomeDialog:onDone(all_ok)
+    self.send_state = all_ok and "done" or "failed"
+    if not all_ok and not self.fail_reason then
+        self.fail_reason = _("The transfer did not complete.")
+    end
+    self:init()
+    UIManager:forceRePaint()
+end
+
+function HomeDialog:sendMore()
+    self.send_state = "idle"
+    self.send_paths = nil
+    self.send_file_list = {}
+    self:init()
+    UIManager:forceRePaint()
+    self.plugin:chooseAndSend()
+end
+
+function HomeDialog:tryAgain()
+    self:beginSendBatch(self.send_paths or {})
+end
+
+function HomeDialog:backToIdle()
+    self.send_state = "idle"
+    self.send_paths = nil
+    self.send_target = nil
+    self.send_file_list = {}
+    self.fail_reason = nil
+    self.send_widgets = nil
+    self:init()
+    UIManager:setDirty(self, "full")
+end
+
+-- Connecting: painted BEFORE the blocking 3s probes start (the Storefront
+-- "paint progress first, then block" rule), so no reachable state ever reads
+-- as a frozen screen.
+function HomeDialog:renderSendConnecting()
+    local vg = VerticalGroup:new{ align = "left" }
+    table.insert(vg, self:header(_("Sending")))
+    local target = self.send_target
+    table.insert(vg, TextBoxWidget:new{
+        text = target
+            and string.format("Connected     %s\n%s  \226\134\146  %s",
+                target.kind == "hotspot" and _("HotSpot") or _("WiFi"),
+                ip_str(target), folder_str(target))
+            or _("Connecting to CrossDrop \226\128\166"),
+        face = Font:getFace("cfont", 18),
+        width = self.row_w,
+    })
+    if not target then
+        table.insert(vg, TextBoxWidget:new{
+            text = _("Looking for the reader on your network. It probes WiFi first, then the HotSpot — each answers within seconds."),
+            face = Font:getFace("smallinfofont"),
+            width = self.row_w,
+        })
+    end
+    return vg
+end
+
+-- Live transfer: the same LineWidget bar + forceRePaint recipe the standalone
+-- progress dialog used, but rendered as one of THIS dashboard's tabs — nothing
+-- sits on top of CrossDrop while a book streams.
+function HomeDialog:renderSendProgress()
+    local sc = function(v) return Device.screen:scaleBySize(v) end
+    local vg = VerticalGroup:new{ align = "left" }
+    local inner_w = self.row_w
+
+    table.insert(vg, self:header(string.format(_("Sending %d of %d"),
+        self.send_index, self.send_total)))
+
+    table.insert(vg, TextWidget:new{
+        text = tostring(self.send_filename or "?"),
+        face = Font:getFace("cfont", 18),
+        bold = true,
+        max_width = inner_w,
+    })
+    local target = self.send_target
+    local subt
+    if target then
+        subt = string.format("%s  %s  \226\134\146  %s",
+            target.kind == "hotspot" and _("HotSpot") or _("WiFi"),
+            ip_str(target), folder_str(target))
+    else
+        subt = ""
+    end
+    table.insert(vg, VerticalSpan:new{ width = sc(2) })
+    table.insert(vg, TextWidget:new{
+        text = subt,
+        face = Font:getFace("smallinfofont"),
+        max_width = inner_w,
+    })
+
+    local bar_w = inner_w
+    local bar_h = sc(16)
+    local border_w = Size.border.window or 1
+    local fill = LineWidget:new{
+        dimen = Geom:new{ w = 0, h = bar_h },
+        background = Blitbuffer.COLOR_BLACK,
+    }
+    local track = FrameContainer:new{
+        dimen = Geom:new{ w = bar_w, h = bar_h },
+        bordersize = border_w,
+        color = Blitbuffer.COLOR_DARK_GRAY,
+        background = Blitbuffer.COLOR_LIGHT_GRAY,
+        padding = 0,
+        LineWidget:new{
+            dimen = Geom:new{ w = bar_w - border_w * 2, h = bar_h - border_w * 2 },
+            background = Blitbuffer.COLOR_LIGHT_GRAY,
+        },
+    }
+    -- Track FIRST, fill LAST (OverlapGroup paints children in order).
+    local bar = OverlapGroup:new{
+        dimen = Geom:new{ w = bar_w, h = bar_h },
+        track,
+        fill,
+    }
+    local pct = TextWidget:new{
+        text = "0%",
+        face = Font:getFace("cfont", 20),
+        bold = true,
+    }
+    local meta = TextWidget:new{
+        text = "",
+        face = Font:getFace("smallinfofont"),
+        max_width = inner_w,
+    }
+    self.send_widgets = { bar_w = bar_w, fill = fill, pct = pct, meta = meta }
+
+    table.insert(vg, VerticalSpan:new{ width = sc(14) })
+    table.insert(vg, bar)
+    table.insert(vg, VerticalSpan:new{ width = sc(8) })
+    table.insert(vg, pct)
+    table.insert(vg, VerticalSpan:new{ width = sc(2) })
+    table.insert(vg, meta)
+
+    return vg
+end
+
+function HomeDialog:renderSendDone()
+    local sc = function(v) return Device.screen:scaleBySize(v) end
+    local names = self.send_file_list or {}
+    local lines = {}
+    for _, n in ipairs(names) do
+        lines[#lines + 1] = "\226\156\147  " .. n
+    end
+    local vg = VerticalGroup:new{ align = "left" }
+    table.insert(vg, self:header(_("Done")))
+    table.insert(vg, TextBoxWidget:new{
+        text = string.format(_("Sent %d book(s) to the reader."), #names)
+            .. (#lines > 0 and ("\n\n" .. table.concat(lines, "\n")) or ""),
+        face = Font:getFace("smallinfofont"),
+        width = self.row_w,
+    })
+    table.insert(vg, VerticalSpan:new{ width = sc(8) })
+    table.insert(vg, self:row(_("Send more books\226\128\166"), {
+        callback = function() self:sendMore() end,
+    }))
+    table.insert(vg, self:row(_("Back"), {
+        callback = function() self:backToIdle() end,
+    }))
+    return vg
+end
+
+function HomeDialog:renderSendFailed()
+    local sc = function(v) return Device.screen:scaleBySize(v) end
+    local vg = VerticalGroup:new{ align = "left" }
+    table.insert(vg, self:header(_("Send failed")))
+    table.insert(vg, TextBoxWidget:new{
+        text = tostring(self.fail_reason or _("The transfer did not complete.")),
+        face = Font:getFace("smallinfofont"),
+        width = self.row_w,
+    })
+    table.insert(vg, VerticalSpan:new{ width = sc(8) })
+    table.insert(vg, self:row(_("Try again"), {
+        callback = function() self:tryAgain() end,
+    }))
+    table.insert(vg, self:row(_("Send more books\226\128\166"), {
+        callback = function() self:sendMore() end,
+    }))
+    table.insert(vg, self:row(_("Back"), {
+        callback = function() self:backToIdle() end,
+    }))
     return vg
 end
 

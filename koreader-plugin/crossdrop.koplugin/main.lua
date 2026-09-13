@@ -141,6 +141,12 @@ local function wifiIp()
     return G_reader_settings:readSetting("crossdrop_wifi_ip")
 end
 
+-- Settings keys are version-independent and only ever change when the user
+-- taps "Set WiFi/HotSpot IP": crossdrop_wifi_ip / crossdrop_hotspot_ip /
+-- crossdrop_port persist in KOReader's global settings (settings.reader.lua,
+-- on the SD card) forever — nothing in this plugin writes a default over a
+-- saved WiFi IP. WiFi empty == deliberately unset (so sends fall back to the
+-- HotSpot); HotSpot empty == factory default 192.168.4.1.
 local function setIp(kind, ip)
     ip = tostring(ip or ""):match("^%s*(.-)%s*$") or ""
     if kind == "hotspot" then
@@ -439,10 +445,92 @@ function CROSSDROP:putFile(target, file_path, on_progress)
     return true, result
 end
 
-local progress_guard
--- Send an explicit book file. Used both by "Send A Book" (picked through
--- KOReader's own file browser) and sendCurrentBook. Requires no book to be
--- open, so there is no path that can crash from a missing document.
+-- Resolve the first reachable connection through a progress sink. Sink
+-- callbacks: onConnecting() before the probe, onConnected(target), or
+-- onUnreachable() when nothing answers. Probes are bounded (3s each, via
+-- socketutil) and the caller paints each state on screen, so the UI never
+-- closes and never looks frozen.
+function CROSSDROP:connect(sink)
+    sink = sink or {}
+    if sink.onConnecting then sink:onConnecting() end
+    local target = self:probeReachable()
+    if not target then
+        self._reach = {}
+        for _, t in ipairs(self:configuredTargets()) do
+            self._reach[t.kind] = "down"
+        end
+        if sink.onUnreachable then sink:onUnreachable() end
+        return nil
+    end
+    self._reach = { [target.kind] = "ok" }
+    if sink.onConnected then sink:onConnected(target) end
+    return target
+end
+
+-- Send a batch of picked books. The whole flow — connect + each transfer —
+-- happens INSIDE the open CrossDrop dashboard: `sink` is the Home dialog,
+-- whose callbacks repaint its own tabs in place, so nothing is ever closed and
+-- more books can be sent when the batch finishes. Without an in-dashboard sink
+-- (programmatic use) it falls back to the standalone per-file dialog.
+function CROSSDROP:sendBooks(paths, sink)
+    sink = sink or {}
+    local seen, ordered = {}, {}
+    for _, p in ipairs(paths or {}) do
+        p = tostring(p or "")
+        if p ~= "" and not seen[p] then
+            seen[p] = true
+            ordered[#ordered + 1] = p
+        end
+    end
+    if #ordered == 0 then return false end
+    table.sort(ordered)
+
+    -- No Home on screen (e.g. called programmatically): use the standalone
+    -- progress dialog instead, one file at a time.
+    if type(sink.onProgress) ~= "function" then
+        for _, p in ipairs(ordered) do
+            self:sendFile(p)
+        end
+        return true
+    end
+
+    local target = self:connect(sink)
+    if not target then return false end
+
+    local batch_start = os.clock()
+
+    local all_ok = true
+    for i, path in ipairs(ordered) do
+        if sink.onBeginFile then sink:onBeginFile(path, target, i, #ordered) end
+        local folder_ok, folder_err = self:ensureFolder(target)
+        if not folder_ok then
+            all_ok = false
+            if sink.onFileFailed then
+                sink:onFileFailed(path, _("could not create the destination folder: ") .. tostring(folder_err))
+            end
+            break
+        end
+        local ok, result = self:putFile(target, path, function(sent, total)
+            if sink.onProgress then
+                sink:onProgress(path, sent / total * 100, sent, total, os.clock() - batch_start)
+            end
+        end)
+        if not ok then
+            all_ok = false
+            if sink.onFileFailed then
+                sink:onFileFailed(path, tostring(result))
+            end
+            break
+        end
+        if sink.onFileSent then sink:onFileSent(path, target) end
+        logger.info("crossdrop: sent ", path, " to ", target.kind, " ", target.ip)
+    end
+    if sink.onDone then sink:onDone(all_ok) end
+    return all_ok
+end
+
+-- Send an explicit book file (standalone dialog flow: probe + progress +
+-- toast). Used by sendCurrentBook and as the no-Home fallback of sendBooks.
 function CROSSDROP:sendFile(book_path)
     if not book_path or book_path == "" then return end
 
@@ -507,12 +595,15 @@ end
 
 -- "Send A Book": open the FileManager file browser (a modal FileChooser — the
 -- same list widget FileManager hosts, shown full-screen so it paints ABOVE
--- the Home dialog) and send whatever ebook the user picks — no need to have
--- it open first. This is the primary send path.
+-- the Home dialog) in PICK mode: tapping a book toggles it in the selection
+-- (dimmed row + a ✓ prefix), and the title-bar ✓ sends the whole selection
+-- (one or many) through a confirm dialog, straight back into the open
+-- dashboard — nothing closes, transfers run inside Home, more books follow.
 function CROSSDROP:chooseAndSend()
     local DocumentRegistry = require("document/documentregistry")
     local FileChooser = require("ui/widget/filechooser")
     local TitleBar = require("ui/widget/titlebar")
+    local ConfirmBox = require("ui/widget/confirmbox")
     local start_path
     local ok_util, filemanagerutil = pcall(require, "apps/filemanager/filemanagerutil")
     if ok_util and filemanagerutil and filemanagerutil.getHomeFolder then
@@ -534,13 +625,63 @@ function CROSSDROP:chooseAndSend()
         handleEvent = function() return false end,
     }
 
-    -- The browser needs a visible way back to the CrossDrop menu (it is a
-    -- modal over Home, and a bare FileChooser has no close button). Mirroring
-    -- FileManager, we hand it our own title bar with a close icon.
+    local plugin = self
     local fc
-    local custom_title_bar = TitleBar:new{
+    local custom_title_bar
+
+    -- Lifted from Storefront's confirm flows: a "Send N book(s)?" confirm
+    -- dialog gives the explicit go-ahead the user asked for, then hands the
+    -- batch to the open dashboard (self.home) which repaints in place.
+    local function confirmAndSend(paths)
+        table.sort(paths)
+        local names = {}
+        for i = 1, math.min(3, #paths) do
+            names[#names + 1] = "  " .. (paths[i]:match("([^/]+)$") or paths[i])
+        end
+        if #paths > 3 then
+            names[#names + 1] = string.format("  \226\128\166  %d more", #paths - 3)
+        end
+        local confirm
+        confirm = ConfirmBox:new{
+            text = string.format(_("Send %d book(s) to the reader?"), #paths)
+                .. "\n" .. table.concat(names, "\n"),
+            ok_text = _("Send"),
+            ok_callback = function()
+                UIManager:close(confirm)
+                UIManager:close(fc)
+                local paths_now = {}
+                for _, p in ipairs(paths) do paths_now[#paths_now + 1] = p end
+                UIManager:nextTick(function()
+                    plugin:sendBooks(paths_now, plugin.home)
+                end)
+            end,
+            cancel_callback = function()
+                UIManager:close(confirm)
+            end,
+        }
+        UIManager:show(confirm)
+    end
+
+    -- Keep the running selection visible: the count lives in the TITLE (Menu
+    -- replaces the subtitle with the folder path on navigation — menu.lua
+    -- switchItemTable — so a count there would be lost; the title survives).
+    local function refreshSelectionTitle()
+        local n = 0
+        for _ in pairs(fc.selected or {}) do n = n + 1 end
+        custom_title_bar:setTitle((n > 0)
+            and string.format(_("Send A Book  \226\128\164  %d selected"), n)
+            or _("Send A Book"), true)
+    end
+
+    -- The browser needs a visible way back to the CrossDrop menu (it is a
+    -- modal over Home, and a bare FileChooser has no close button). Left icon
+    -- closes without sending; the right ✓ is the "Send selected" confirm
+    -- (following Storefront's IconButton allow_flash=false rule: any button
+    -- that closes its container must not flash after the callback runs, or
+    -- KOReader crashes on the destroyed widget).
+    custom_title_bar = TitleBar:new{
         title = _("Send A Book"),
-        subtitle = "",
+        subtitle = _("Tap books to pick them \226\128\164  \226\156\147 sends"),
         fullscreen = "true",
         align = "center",
         button_padding = Device.screen:scaleBySize(5),
@@ -549,6 +690,19 @@ function CROSSDROP:chooseAndSend()
         left_icon_tap_callback = function()
             UIManager:close(fc)
         end,
+        left_icon_allow_flash = false,
+        right_icon = "check",
+        right_icon_size_ratio = 1,
+        right_icon_tap_callback = function()
+            local paths = {}
+            for p in pairs(fc.selected or {}) do paths[#paths + 1] = p end
+            if #paths == 0 then
+                toastModule().show(_("Tap a book first \226\128\148 then \226\156\147 sends your selection."), 4)
+                return
+            end
+            confirmAndSend(paths)
+        end,
+        right_icon_allow_flash = false,
         show_parent = nil, -- patched to fc right below
     }
 
@@ -560,28 +714,45 @@ function CROSSDROP:chooseAndSend()
             return DocumentRegistry:hasProvider(filename)
         end,
         modal = true,
-        -- use our title bar (with the close button) instead of Menu's default
+        selected = {}, -- path -> true, the multi-select picker set
+        -- use our title bar (with the close + send icons) instead of Menu's default
         custom_title_bar = custom_title_bar,
     }
     custom_title_bar.show_parent = fc
-    local plugin = self
+
+    -- Tap = toggle in the picker. Dimmed rows + a ✓ prefix mark the selection;
+    -- folders keep navigating normally (Menu routes those to changeToPath).
+    -- Must be defined HERE, after fc exists: Lua evaluates `function fc:m()`
+    -- at definition time (nil fc would raise "attempt to index local 'fc'").
     function fc:onFileSelect(item)
         local path = item and item.path
-        UIManager:close(fc)
-        if path then
-            UIManager:nextTick(function()
-                plugin:sendFile(path)
-            end)
+        if not path then return true end
+        local base = path:match("([^/]+)$") or item.text or path
+        if fc.selected[path] then
+            fc.selected[path] = nil
+            item.dim = nil
+            item.text = base
+        else
+            fc.selected[path] = true
+            item.dim = true
+            item.text = "\226\156\147  " .. base
         end
+        fc:updateItems(1, true)
+        refreshSelectionTitle()
         return true
     end
+
     UIManager:show(fc)
+    refreshSelectionTitle()
 end
 
 -- Open the full-screen CrossDrop dashboard. Shown with a "ui" refresh (the
 -- same call Storefront uses) so the whole screen paints cleanly on e-ink.
+-- The open instance is stored on the plugin so send flows can target it and
+-- keep every transfer inside the dashboard (see sendBooks/chooseAndSend).
 function CROSSDROP:openHome()
     local home = homeModule():new{ plugin = self }
+    self.home = home
     UIManager:show(home, "ui")
     UIManager:forceRePaint()
 end
