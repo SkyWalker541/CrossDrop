@@ -281,6 +281,7 @@ UIManager = {
     replace = function(_, o, n) table.insert(UIManager._shown, n) end,
     setDirty = function() end,
     forceRePaint = function() end,
+    nextTick = function(_, f) return f() end,
     scheduleIn = function() return { cancel = function() end } end,
     unschedule = function() end,
 }
@@ -347,6 +348,11 @@ stubs["libs/libkoreader-lfs"] = {
         f:close()
         return nil
     end,
+}
+
+-- documentregistry: any filename the test picks is a supported book
+stubs["document/documentregistry"] = {
+    hasProvider = function() return true end,
 }
 
 -- ── run the tests ─────────────────────────────────────────────────────────
@@ -419,12 +425,30 @@ inst:sendCurrentBook()
 local last_notif = UIManager._shown[#UIManager._shown]
 check("send success shows Book sent", last_notif and type(last_notif.text) == "string" and last_notif.text:match("Book sent"), last_notif and last_notif.text)
 
--- 5b. history records the entry; sentList/clearSent work
-local sent = inst:sentList()
-check("sentList has one entry", type(sent) == "table" and #sent == 1 and sent[1].file == "fakebook.epub", sent and sent[1] and sent[1].file)
-check("history entry records kind wifi", sent[1] and sent[1].kind == "wifi", sent[1] and sent[1].kind)
-inst:clearSent()
-check("clearSent empties history", #(inst:sentList() or {}) == 0)
+-- 5b. "Send A Book" picker opens a MODAL file browser above the full-screen
+-- Home (non-modal would stack below it, exactly like the old IP dialog bug),
+-- and picking a file streams it without needing a book open.
+UIManager._shown = {}
+inst:chooseAndSend()
+local chooser = UIManager._shown[#UIManager._shown]
+check("chooseAndSend opens the file browser", type(chooser) == "table")
+check("chooser is modal (paints above Home)", chooser ~= nil and chooser.modal == true, chooser and chooser.modal)
+check("chooser filters supported book files", chooser and chooser.file_filter and chooser.file_filter("MyBook.epub") == true)
+UIManager._shown = {}
+chooser:onFileSelect({ path = "/tmp/fakebook.epub" })
+local picked_toast = UIManager._shown[#UIManager._shown]
+check("picked book is sent", picked_toast and type(picked_toast.text) == "string" and picked_toast.text:match("Book sent"), picked_toast and picked_toast.text)
+
+-- 5c. sending with NO book open no longer crashes (the old on-device crash);
+-- it just shows the picker hint.
+inst.ui.document = { file = nil }
+UIManager._shown = {}
+inst:sendCurrentBook()
+local no_book = UIManager._shown[#UIManager._shown]
+check("no-book send shows hint (no crash)",
+    no_book and type(no_book.text) == "string" and no_book.text:match("Send A Book"),
+    no_book and no_book.text)
+inst.ui.document = { file = "/tmp/fakebook.epub" }
 
 -- 6. THE CRASH CASE: connection refused (string where code should be)
 FAKE.fail = true
@@ -452,13 +476,19 @@ inst:statusDialog()
 local info = UIManager._shown[#UIManager._shown]
 check("status dialog shows device", info and type(info.text) == "string" and info.text:match("X4"), info and info.text)
 
--- 8. editIp opens an input dialog for each connection
+-- 8. editIp opens an input dialog for each connection — and it must be MODAL,
+-- otherwise UIManager stacks it below the modal Home dialog and it shows
+-- behind the dashboard (the reported "dialog opens behind CrossDrop" bug).
 UIManager._shown = {}
 inst:editIp("wifi")
-check("editIp(wifi) opens dialog", type(UIManager._shown[#UIManager._shown]) == "table")
+local ipw = UIManager._shown[#UIManager._shown]
+check("editIp(wifi) opens dialog", type(ipw) == "table")
+check("editIp(wifi) dialog is modal (paints above Home)", ipw ~= nil and ipw.modal == true, ipw and ipw.modal)
 UIManager._shown = {}
 inst:editIp("hotspot")
-check("editIp(hotspot) opens dialog", type(UIManager._shown[#UIManager._shown]) == "table")
+local iph = UIManager._shown[#UIManager._shown]
+check("editIp(hotspot) opens dialog", type(iph) == "table")
+check("editIp(hotspot) dialog is modal (paints above Home)", iph ~= nil and iph.modal == true, iph and iph.modal)
 
 -- 8b. send books always land in CrossDropped Files: folder setting cannot override
 G_reader_settings:saveSetting("crossdrop_folder", "/Books")
@@ -493,10 +523,8 @@ if home then
     check("home is modal + full-screen", home.modal == true and type(home.dimen) == "table")
     local cc = home:buildTabContent("connections", 560)
     local sc_ = home:buildTabContent("send", 560)
-    local hc = home:buildTabContent("history", 560)
     check("home Connections tab renders", type(cc) == "table")
     check("home Send tab renders", type(sc_) == "table")
-    check("home History tab renders", type(hc) == "table")
     check("home Back closes", home:onBack() == true)
 end
 
@@ -505,7 +533,7 @@ end
 check("home frame fits within screen width",
     home and home.frame and home.frame:getSize().w <= SCREEN_W,
     home and home.frame and home.frame:getSize().w or "no frame")
-for _, tab in ipairs({ "connections", "send", "history" }) do
+for _, tab in ipairs({ "connections", "send" }) do
     UIManager._shown = {}
     inst:openHome()
     local h = UIManager._shown[#UIManager._shown]

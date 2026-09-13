@@ -1,31 +1,31 @@
 # CrossDrop (KOReader plugin)
 
-A KOReader plugin that hands the **currently open book** to your **CrossDrop**
-reader over your local network — no USB cable, no webserver on the Kindle. It
-talks only to the reader's built-in web server (port 80) — no custom firmware
-required.
+A KOReader plugin that hands books to your **CrossDrop** reader over your local
+network — no USB cable, no webserver on the Kindle. Pick any ebook with
+KOReader's file browser (or send the currently open one) and it streams across
+to the reader's own web server (port 80) — no custom firmware required.
 
 ## How it works
 
 1. On the reader, open **File Transfer → Join Network**. That connects the
    reader to your Wi-Fi and makes it ready to receive — the reader's screen
    **shows its IP address** on that screen.
-2. On the device with the book (Kindle / Android / etc.), open the book in
-   KOReader, then open **Tools** in the main reader menu → **CrossDrop**. This
-   opens a full-screen, Storefront-style dashboard with three tabs:
-   - **Connections** — the two ways to reach the reader, each with its own
-     stored IP:
-     - **WiFi** — set it once via **Set WiFi IP...** to the address shown on
-       the reader's **Join Network** screen.
-     - **HotSpot** — for the reader's **Create Hotspot** mode, already filled
-       with **192.168.4.1** (nothing to type).
-   - Tap a connection to check it; CrossDrop shows whether it's reachable.
-   - **Send** — tap the book shown under "Now open" to stream it across. No
-     destination to pick: **every book lands in the `CrossDropped Files`
-     folder at the root of the reader's card**, created automatically on
-     first send.
-   - **History** — logs every successful send (connection, IP, size, time,
-     most recent first); tap an entry to send again.
+2. On the device with the book (Kindle / Android / etc.), open **Tools** in
+    the main reader menu → **CrossDrop**. This opens a full-screen,
+    Storefront-style dashboard with two tabs:
+    - **Connections** — the two ways to reach the reader, each with its own
+      stored IP:
+      - **WiFi** — set it once via **Set WiFi IP...** to the address shown on
+        the reader's **Join Network** screen.
+      - **HotSpot** — for the reader's **Create Hotspot** mode, already filled
+        with **192.168.4.1** (nothing to type).
+    - Tap a connection to check it; CrossDrop shows whether it's reachable.
+    - **Send** — tap **Send A Book...** to browse the filesystem with
+      KOReader's own file browser and pick any ebook to send (no need to have
+      it open first). If a book is already open it also appears here with a
+      tap-to-send row. No destination to pick: **every book lands in the
+      `CrossDropped Files` folder at the root of the reader's card**, created
+      automatically on first send.
 3. While sending, KOReader shows a live **CrossDrop progress dialog**: a
    percentage bar (bytes streamed / total), transfer speed and ETA, repainting
    the e-ink screen on every chunk. On completion a CrossDrop toast confirms

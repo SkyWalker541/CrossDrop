@@ -1,23 +1,22 @@
 -- CrossDrop Home: the plugin's app-style dashboard (the "Storefront" look).
--- A TitleBar header, an underlined tab bar (Connections / Send / History),
--- rich rows with live status dots and short hints, tap-to-act. Loaded lazily
--- from main.lua, so all widget requires happen when the dashboard opens,
--- never at plugin load. Reachability is checked on demand (it is a blocking
--- probe) and remembered on the plugin instance across tab switches.
+-- A TitleBar header, an underlined tab bar (Connections / Send), rich rows
+-- with live status dots and short hints, tap-to-act. The white card covers
+-- the whole screen so nothing shows behind it. Loaded lazily from main.lua,
+-- so all widget requires happen when the dashboard opens, never at plugin
+-- load. Reachability is checked on demand (it is a blocking probe) and
+-- remembered on the plugin instance across tab switches.
 --
 -- Uses only the plugin API exported from main.lua:
 --   configuredTargets() -> {kind, ip, port, folder}[]  (WiFi first)
 --   resolveTarget()     -> primary target (WiFi when set, else HotSpot)
 --   probeTarget(target) -> (ok, info?); "down" statuses are cheap (3s timeout)
 --   sendCurrentBook()   -> probes WiFi then HotSpot, streams to whichever answers
---   sendTo(target)      -> store + send immediately (used by History re-send)
+--   chooseAndSend()     -> open KOReader's file browser to pick a book to send
 --   editIp(kind)        -> input dialog for "wifi" or "hotspot"
---   statusDialog(), currentBookPath(), sentList(), clearSent()
+--   statusDialog(), currentBookPath()
 
 local Blitbuffer = require("ffi/blitbuffer")
 local Button = require("ui/widget/button")
-local CenterContainer = require("ui/widget/container/centercontainer")
-local ConfirmBox = require("ui/widget/confirmbox")
 local Device = require("device")
 local Font = require("ui/font")
 local FrameContainer = require("ui/widget/container/framecontainer")
@@ -45,14 +44,6 @@ local function file_size(path)
         return lfs.attributes(path, "size") or 0
     end
     return 0
-end
-
-local function reltime(ts)
-    local dt = os.time() - (tonumber(ts) or 0)
-    if dt < 60 then return _("just now") end
-    if dt < 3600 then return string.format(_("%d m ago"), math.floor(dt / 60)) end
-    if dt < 86400 then return string.format(_("%d h ago"), math.floor(dt / 3600)) end
-    return string.format(_("%d d ago"), math.floor(dt / 86400))
 end
 
 local function ip_str(t)
@@ -98,12 +89,12 @@ function HomeDialog:init()
     self.dimen = Geom:new{ w = sw, h = sh }
 
     -- Storefront-style sizing: every dimension is derived from the device via
-    -- scaleBySize, the card width is capped with a scaled side margin, and no
-    -- text widget is allowed to auto-size past the card — so the dashboard
-    -- fills the screen without ever spilling past its edges on any device.
-    local dialog_w = math.min(sw - sc(20), math.floor(math.min(sw, sh) * 0.95))
+    -- scaleBySize, and no text widget is allowed to auto-size past the card
+    -- (every TextBoxWidget/row gets an explicit width). The white card covers
+    -- the WHOLE screen (frame.dimen = sw x sh) so no other app shows behind
+    -- it, while still never spilling past the edges on any device.
     local pad = Size.padding.default
-    local inner_w = dialog_w - pad * 2
+    local inner_w = sw - pad * 2
     self.row_w = inner_w
 
     local reach = self.plugin._reach or {}
@@ -134,7 +125,10 @@ function HomeDialog:init()
 
     local content = self:buildTabContent(self.tab, inner_w)
 
+    -- A full-screen white frame (not a centered content-sized card): the
+    -- whole screen paints white on top of whatever UI sits behind it.
     local frame = FrameContainer:new{
+        dimen = Geom:new{ w = sw, h = sh },
         bordersize = 0,
         background = Blitbuffer.COLOR_WHITE,
         padding = pad,
@@ -149,11 +143,7 @@ function HomeDialog:init()
         },
     }
     self.frame = frame
-
-    self[1] = CenterContainer:new{
-        dimen = self.dimen,
-        frame,
-    }
+    self[1] = frame
 
     if Device:hasKeys() then
         self.key_events.Back = { { Device.input.group.Back } }
@@ -172,7 +162,6 @@ function HomeDialog:buildTabBar(content_w)
     local tabs = {
         { key = "connections", label = _("Connections") },
         { key = "send", label = _("Send") },
-        { key = "history", label = _("History") },
     }
     local tabs_widgets = {}
     for i, t in ipairs(tabs) do
@@ -246,10 +235,8 @@ function HomeDialog:buildTabContent(tab, width)
     self.row_w = width
     if tab == "connections" then
         return self:renderConnections()
-    elseif tab == "send" then
-        return self:renderSend()
     end
-    return self:renderHistory()
+    return self:renderSend()
 end
 
 -- ─────────────────────── Connections tab ────────────────────────────────
@@ -315,7 +302,7 @@ function HomeDialog:renderConnections()
     }))
 
     table.insert(vg,TextBoxWidget:new{
-        text = _("Books land in the CrossDropped Files folder on the reader's card.\nNothing to pick \226\128\148 Send tab handles the rest."),
+        text = _("Books land in the CrossDropped Files folder on the reader's card.\nSend A Book picks any ebook \226\128\148 no need to open it first."),
         face = Font:getFace("smallinfofont"),
         width = self.row_w,
     })
@@ -330,7 +317,12 @@ function HomeDialog:renderSend()
     local reach = self.plugin._reach or {}
     local book = self.plugin:currentBookPath()
 
-    table.insert(vg,self:header(_("Now open")))
+    table.insert(vg,self:header(_("Send a book")))
+    table.insert(vg,self:row(_("Send A Book\226\128\166"), {
+        callback = function() self.plugin:chooseAndSend() end,
+    }))
+
+    table.insert(vg,self:header(_("Currently open")))
     if book and book ~= "" then
         local name = book:match("([^/]+)$") or book
         local size = file_size(book)
@@ -341,7 +333,7 @@ function HomeDialog:renderSend()
         }))
     else
         table.insert(vg,TextBoxWidget:new{
-            text = _("No book open yet.\n\nOpen a book in KOReader and it appears here,\nready to send to the CrossDrop reader."),
+            text = _("No book open just now \226\128\148 Send A Book picks any ebook."),
             face = Font:getFace("smallinfofont"),
             width = self.row_w,
         })
@@ -372,72 +364,6 @@ function HomeDialog:renderSend()
     end
 
     return vg
-end
-
--- ─────────────────────────── History tab ────────────────────────────────
-
-function HomeDialog:renderHistory()
-    local vg = VerticalGroup:new{ align = "left" }
-    local list = self.plugin:sentList() or {}
-    if #list == 0 then
-        table.insert(vg,TextBoxWidget:new{
-            text = _("Nothing sent yet.\n\nBooks you send show up here with the\nCrossDrop reader, folder, size, and time."),
-            face = Font:getFace("smallinfofont"),
-            width = self.row_w,
-        })
-        return vg
-    end
-
-    table.insert(vg,self:header(_("Books sent (most recent first)")))
-    local shown = 0
-    for i, e in ipairs(list) do
-        if shown >= 8 then break end
-        shown = shown + 1
-        local meta = reltime(e.ts) .. "  \226\128\164  " ..
-            (e.kind and (connection_label(e.kind) .. " ") or "") ..
-            ip_str(e) .. "  \226\134\146  " .. folder_str(e)
-        if e.size and e.size > 0 then
-            meta = meta .. string.format("  \226\128\164  %.1f MB", e.size / 1048576)
-        end
-        local entry = e
-        table.insert(vg,self:row((e.file or "?") .. "\n" .. meta .. _("  (tap to send again)"), {
-            callback = function()
-                self.plugin:sendTo{
-                    kind = entry.kind or "wifi",
-                    ip = entry.ip,
-                    port = entry.port or 80,
-                    folder = entry.folder or "/CrossDropped Files",
-                }
-            end,
-        }))
-    end
-    if #list > shown then
-        table.insert(vg,TextWidget:new{
-            text = string.format(_("\226\128\166 plus %d more (only the last 8 are listed)"), #list - shown),
-            face = Font:getFace("smallinfofont"),
-        })
-    end
-    table.insert(vg,self:row(_("Clear history"), {
-        callback = function()
-            UIManager:show(ConfirmBox:new{
-                text = _("Forget all sent-book history?"),
-                ok_text = _("Clear"),
-                ok_callback = function()
-                    self.plugin:clearSent()
-                    UIManager:replace(self, HomeDialog:new{
-                        plugin = self.plugin,
-                        tab = self.tab,
-                    })
-                end,
-            })
-        end,
-    }))
-    return vg
-end
-
--- Like main.lua's connectionLabel, so History can show which hop was used.
-local function connection_label(kind)
-    return kind == "hotspot" and _("HotSpot") or _("WiFi")
 end
 
 return HomeDialog

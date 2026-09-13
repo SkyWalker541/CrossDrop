@@ -135,35 +135,6 @@ local function connectionLabel(kind)
     return kind == "hotspot" and _("HotSpot") or _("WiFi")
 end
 
--- ────────────────────── sent-books history ──────────────────────────────
-
-local SENT_MAX = 20
-
-local function getSentList()
-    local list = G_reader_settings:readSetting("crossdrop_sent")
-    return (type(list) == "table") and list or {}
-end
-
-local function saveSentList(list)
-    G_reader_settings:saveSetting("crossdrop_sent", list)
-end
-
-local function addSentEntry(entry)
-    local list = getSentList()
-    table.insert(list, 1, entry)
-    while #list > SENT_MAX do table.remove(list) end
-    saveSentList(list)
-end
-
--- Exported for the Home dashboard: current history + a clear action.
-function CROSSDROP:sentList()
-    return getSentList()
-end
-
-function CROSSDROP:clearSent()
-    saveSentList({})
-end
-
 function CROSSDROP:init()
     -- 1.x migration: the single crossdrop_ip setting becomes the WiFi slot.
     if not wifiIp() and G_reader_settings:readSetting("crossdrop_ip") then
@@ -318,6 +289,10 @@ function CROSSDROP:editIp(kind)
             or _("WiFi IP (File Transfer → Join Network)")),
         input = current,
         type = "text",
+        -- modal=true is REQUIRED here: Home is a modal full-screen dialog, and
+        -- UIManager stacks non-modal widgets BELOW an existing modal — a plain
+        -- InputDialog would render behind the dashboard and be unusable.
+        modal = true,
         buttons = {
             {
                 {
@@ -430,14 +405,11 @@ function CROSSDROP:putFile(target, file_path, on_progress)
 end
 
 local progress_guard
-function CROSSDROP:sendCurrentBook()
-    local book_path = self:currentBookPath()
-    if not book_path then
-        UIManager:show(InfoMessage:new{
-            text = _("There is no book file to send. Open a book first."),
-        })
-        return
-    end
+-- Send an explicit book file. Used both by "Send A Book" (picked through
+-- KOReader's own file browser) and sendCurrentBook. Requires no book to be
+-- open, so there is no path that can crash from a missing document.
+function CROSSDROP:sendFile(book_path)
+    if not book_path or book_path == "" then return end
 
     local target = self:probeReachable()
     if not target then
@@ -449,7 +421,6 @@ function CROSSDROP:sendCurrentBook()
     end
 
     local filename = book_path:match("([^/]+)$") or book_path
-    local book_size = lfs.attributes(book_path, "size") or 0
 
     local progress = progressModule().new(filename, target)
     local start = os.clock()
@@ -468,16 +439,7 @@ function CROSSDROP:sendCurrentBook()
     UIManager:close(progress)
 
     if ok then
-        addSentEntry({
-            ts = os.time(),
-            kind = target.kind,
-            ip = target.ip,
-            port = target.port or 80,
-            folder = target.folder or DEFAULT_FOLDER,
-            file = filename,
-            size = book_size,
-        })
-        toastModule().show(string.format(_("Book sent  %s (WiFi  %s  →  %s)"),
+        toastModule().show(string.format(_("Book sent  %s (WiFi  %s  \226\134\146  %s)"),
             tostring(filename),
             tostring(target.ip),
             tostring(target.folder or DEFAULT_FOLDER)), 3)
@@ -489,12 +451,52 @@ function CROSSDROP:sendCurrentBook()
     end
 end
 
--- Store a target and immediately send the current book (Home rows, history
--- re-send taps).
-function CROSSDROP:sendTo(target)
-    if not target or not target.ip then return end
-    self:saveTarget(target)
-    self:sendCurrentBook()
+-- Send the currently open book. Guarded so a nil document just shows a hint
+-- instead of crashing (the Home "Send A Book" picker never hits this path).
+function CROSSDROP:sendCurrentBook()
+    local book_path = self:currentBookPath()
+    if not book_path then
+        UIManager:show(InfoMessage:new{
+            text = _("There is no book file to send. Use Send A Book to pick one."),
+        })
+        return
+    end
+    self:sendFile(book_path)
+end
+
+-- "Send A Book": open KOReader's own file browser (a modal FileChooser, so it
+-- paints ABOVE the full-screen Home dialog) and send whatever ebook the user
+-- picks — no need to have it open first. This is the primary send path.
+function CROSSDROP:chooseAndSend()
+    local DocumentRegistry = require("document/documentregistry")
+    local FileChooser = require("ui/widget/filechooser")
+    local start_path
+    local ok_util, filemanagerutil = pcall(require, "apps/filemanager/filemanagerutil")
+    if ok_util and filemanagerutil and filemanagerutil.getHomeFolder then
+        start_path = filemanagerutil.getHomeFolder()
+    end
+
+    local fc = FileChooser:new{
+        ui = self.ui,
+        path = start_path,
+        title = _("Send A Book"),
+        file_filter = function(filename)
+            return DocumentRegistry:hasProvider(filename)
+        end,
+        modal = true,
+    }
+    local plugin = self
+    function fc:onFileSelect(item)
+        local path = item and item.path
+        UIManager:close(fc)
+        if path then
+            UIManager:nextTick(function()
+                plugin:sendFile(path)
+            end)
+        end
+        return true
+    end
+    UIManager:show(fc)
 end
 
 -- Open the full-screen CrossDrop dashboard. Shown with a "ui" refresh (the
