@@ -467,8 +467,10 @@ check("chooser is modal (paints above Home)", chooser ~= nil and chooser.modal =
 check("chooser filters supported book files", chooser and chooser.file_filter and chooser.file_filter("MyBook.epub") == true)
 check("chooser ui has folder_shortcuts (browser needs it)",
     chooser and chooser.ui and chooser.ui.folder_shortcuts and type(chooser.ui.folder_shortcuts.getShortcutFullName) == "function")
-check("chooser starts with an empty selection set",
-    chooser and type(chooser.selected) == "table" and next(chooser.selected) == nil)
+check("chooser starts with an empty picker set",
+    chooser and type(chooser.picked) == "table" and next(chooser.picked) == nil)
+check("chooser picked does NOT collide with FocusManager's selected field",
+    chooser and chooser.selected == nil, chooser and chooser.selected)
 local fa = { path = "/tmp/fakebook.epub" }
 local fb = { path = "/tmp/fakebook2.epub" }
 chooser:onFileSelect(fa)
@@ -479,7 +481,7 @@ check("picker title shows the selection count",
 chooser:onFileSelect(fb)
 chooser:onFileSelect(fa)
 check("tap toggles a book back off (no send on tap)",
-    fa.dim == nil and chooser.selected["/tmp/fakebook.epub"] == nil)
+    fa.dim == nil and chooser.picked["/tmp/fakebook.epub"] == nil)
 check("title count follows the selection",
     chooser.custom_title_bar and tostring(chooser.custom_title_bar.title):match("1 selected"),
     chooser.custom_title_bar and chooser.custom_title_bar.title)
@@ -526,7 +528,7 @@ inst.home = nil
 
 -- ✓ with nothing picked is a gentle hint, never a send
 UIManager._shown = {}
-chooser.selected = {}
+chooser.picked = {}
 chooser.custom_title_bar.right_icon_tap_callback()
 local hint0 = UIManager._shown[#UIManager._shown]
 check("✓ with no selection shows a hint",
@@ -813,6 +815,11 @@ check("no-reader batch reports failure", ok_none == false)
 check("home shows no-reader failure inline",
     home.send_state == "failed" and tostring(home.fail_reason):match("No CrossDrop reader reached"),
     home.send_state and home.fail_reason)
+check("no-reader message guides to the reader's hotspot network",
+    tostring(home.fail_reason):match("CrossDrop") and tostring(home.fail_reason):match("join the reader"),
+    home.fail_reason)
+check("no-reader message shows each probe's own error",
+    tostring(home.fail_reason):match("connection refused"), home.fail_reason)
 check("reach marks both connections down",
     inst._reach and inst._reach.wifi == "down" and inst._reach.hotspot == "down",
     inst._reach and (inst._reach.wifi or "?") .. "/" .. (inst._reach.hotspot or "?"))

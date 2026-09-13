@@ -253,9 +253,17 @@ end
 
 -- Probe every configured connection with GET /api/status; return the first
 -- that answers. Sends and "Check device" use this so either connection works.
+-- Every probe result is recorded in self._probe_errors (kind -> error text or
+-- nil when it answered) and logged — the no-reader message then shows WHY each
+-- connection failed (timeout, refused…), and a "freeze" during a check can be
+-- root-caused from crash.log afterwards.
 function CROSSDROP:probeReachable()
+    self._probe_errors = {}
     for _, target in ipairs(self:configuredTargets()) do
-        local ok, _ = self:probeTarget(target)
+        local ok, _, err = self:probeTarget(target)
+        self._probe_errors[target.kind] = ok and nil or tostring(err)
+        logger.info("crossdrop: probe ", target.kind, " ", target.ip,
+            ok and " -> ok" or (" -> failed: " .. tostring(err)))
         if ok then
             return target
         end
@@ -299,12 +307,26 @@ function CROSSDROP:currentBookPath()
     return doc.file
 end
 
--- The "Tried:" section for the no-connection error message.
+-- The whole "nothing answered" message: the Tried list (with each probe's own
+-- error) plus the two concrete fixes. The HotSpot line matters a lot: the
+-- reader's Create Hotspot screen bridges a guest network — this Kindle must
+-- JOIN that network (CrossPoint firmware names it "CrossDrop-…"), it cannot
+-- reach 192.168.4.1 while sitting on the home router.
+function CROSSDROP:noReaderText()
+    return _("No CrossDrop reader reached.\n\nTried:\n") .. self:connectionSummary() ..
+        _("\n\nThis device must be on the reader's network:\n\226\128\162  WiFi:  same router as the reader, correct IP.\n\226\128\162  HotSpot:  join the reader's \"CrossDrop\226\128\166\" Wi-Fi\n    network (its Create Hotspot screen shows the\n    name and the IP to enter here).\n\nOpen File Transfer\226\128\148Receive Books on the reader.")
+end
+
+-- The "Tried:" section for the no-connection error message. When a probe just
+-- ran, appends its per-connection result ("[timeout]", "[connection refused]")
+-- so the message says what actually happened instead of just listing addresses.
 function CROSSDROP:connectionSummary()
+    local errs = self._probe_errors or {}
     local lines = {}
     for _, t in ipairs(self:configuredTargets()) do
+        local result = errs[t.kind] and ("[" .. errs[t.kind] .. "]") or "no reply"
         lines[#lines + 1] = "  " .. connectionLabel(t.kind) .. "  " .. t.ip ..
-            "  →  " .. (t.folder or DEFAULT_FOLDER)
+            "  \226\134\146  " .. (t.folder or DEFAULT_FOLDER) .. "   " .. result
     end
     return table.concat(lines, "\n")
 end
@@ -364,8 +386,7 @@ function CROSSDROP:statusDialog()
     local target = self:probeReachable()
     if not target then
         UIManager:show(Notification:new{
-            text = _("Could not reach the CrossDrop reader.\n\nTried:\n") .. self:connectionSummary() ..
-                _("\n\nSame Wi-Fi? Correct IP? File Transfer open?"),
+            text = self:noReaderText(),
             timeout = 6,
         })
         return
@@ -543,8 +564,7 @@ function CROSSDROP:sendFile(book_path)
     UIManager:close(checking)
     if not target then
         UIManager:show(InfoMessage:new{
-            text = _("No CrossDrop reader reached.\n\nTried:\n") .. self:connectionSummary() ..
-                _("\n\nOpen File Transfer on the reader (Join Network for WiFi,\nor Create Hotspot), and keep this device on the same network."),
+            text = self:noReaderText(),
         })
         return
     end
@@ -667,7 +687,7 @@ function CROSSDROP:chooseAndSend()
     -- switchItemTable — so a count there would be lost; the title survives).
     local function refreshSelectionTitle()
         local n = 0
-        for _ in pairs(fc.selected or {}) do n = n + 1 end
+        for _ in pairs(fc.picked or {}) do n = n + 1 end
         custom_title_bar:setTitle((n > 0)
             and string.format(_("Send A Book  \226\128\164  %d selected"), n)
             or _("Send A Book"), true)
@@ -695,7 +715,7 @@ function CROSSDROP:chooseAndSend()
         right_icon_size_ratio = 1,
         right_icon_tap_callback = function()
             local paths = {}
-            for p in pairs(fc.selected or {}) do paths[#paths + 1] = p end
+            for p in pairs(fc.picked or {}) do paths[#paths + 1] = p end
             if #paths == 0 then
                 toastModule().show(_("Tap a book first \226\128\148 then \226\156\147 sends your selection."), 4)
                 return
@@ -714,7 +734,11 @@ function CROSSDROP:chooseAndSend()
             return DocumentRegistry:hasProvider(filename)
         end,
         modal = true,
-        selected = {}, -- path -> true, the multi-select picker set
+        -- NOTE: named `picked`, NOT `selected` — `selected` is FocusManager's
+        -- own cursor field. Passing it here made Menu:mergeTitleBarIntoLayout
+        -- do arithmetic on a nil `y` (FocusManager:_init copies the option's
+        -- x/y) and crashed KOReader the moment the browser opened.
+        picked = {}, -- path -> true, the multi-select picker set
         -- use our title bar (with the close + send icons) instead of Menu's default
         custom_title_bar = custom_title_bar,
     }
@@ -728,12 +752,12 @@ function CROSSDROP:chooseAndSend()
         local path = item and item.path
         if not path then return true end
         local base = path:match("([^/]+)$") or item.text or path
-        if fc.selected[path] then
-            fc.selected[path] = nil
+        if fc.picked[path] then
+            fc.picked[path] = nil
             item.dim = nil
             item.text = base
         else
-            fc.selected[path] = true
+            fc.picked[path] = true
             item.dim = true
             item.text = "\226\156\147  " .. base
         end

@@ -470,8 +470,7 @@ end
 
 function HomeDialog:onUnreachable()
     self.send_state = "failed"
-    self.fail_reason = _("No CrossDrop reader reached.\n\nTried:\n") .. self.plugin:connectionSummary() ..
-        _("\n\nOpen File Transfer on the reader (Join Network for WiFi,\nor Create Hotspot), and keep this device on the same network.")
+    self.fail_reason = self.plugin:noReaderText()
     self:init()
     UIManager:forceRePaint()
 end
