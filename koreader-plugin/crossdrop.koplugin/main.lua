@@ -623,6 +623,7 @@ function CROSSDROP:chooseAndSend()
     local DocumentRegistry = require("document/documentregistry")
     local FileChooser = require("ui/widget/filechooser")
     local TitleBar = require("ui/widget/titlebar")
+    local Button = require("ui/widget/button")
     local ConfirmBox = require("ui/widget/confirmbox")
     local start_path
     local ok_util, filemanagerutil = pcall(require, "apps/filemanager/filemanagerutil")
@@ -648,6 +649,10 @@ function CROSSDROP:chooseAndSend()
     local plugin = self
     local fc
     local custom_title_bar
+    -- NOTE: declared here, assigned after fc exists — refreshSelectionTitle
+    -- (defined below) closes over this upvalue; a later `local send_button`
+    -- would shadow it and the function would see a nil global instead.
+    local send_button
 
     -- Lifted from Storefront's confirm flows: a "Send N book(s)?" confirm
     -- dialog gives the explicit go-ahead the user asked for, then hands the
@@ -691,17 +696,35 @@ function CROSSDROP:chooseAndSend()
         custom_title_bar:setTitle((n > 0)
             and string.format(_("Send A Book  \226\128\164  %d selected"), n)
             or _("Send A Book"), true)
+        -- Only offer to send while there is something to send: keep the button
+        -- in the title-bar overlay while books are picked, drop it when none.
+        local inserted
+        for i, w in ipairs(custom_title_bar) do
+            if w == send_button then inserted = i break end
+        end
+        if n > 0 and not inserted then
+            table.insert(custom_title_bar, send_button)
+        elseif n == 0 and inserted then
+            table.remove(custom_title_bar, inserted)
+        end
+        if custom_title_bar.dimen then
+            local titlebar_dimen = custom_title_bar.dimen:copy()
+            local btn_size = send_button:getSize()
+            titlebar_dimen.h = math.max(titlebar_dimen.h, btn_size and btn_size.h or 0)
+            UIManager:setDirty(custom_title_bar.show_parent, "ui", titlebar_dimen)
+        end
     end
 
     -- The browser needs a visible way back to the CrossDrop menu (it is a
     -- modal over Home, and a bare FileChooser has no close button). Left icon
-    -- closes without sending; the right ✓ is the "Send selected" confirm
-    -- (following Storefront's IconButton allow_flash=false rule: any button
-    -- that closes its container must not flash after the callback runs, or
-    -- KOReader crashes on the destroyed widget).
+    -- closes without sending; once a book is picked, a real "Send to Xteink"
+    -- text button appears top-right (opposite the ✕) and is the send action
+    -- (following Storefront's allow_flash=false rule: any button that closes
+    -- its container must not flash after the callback runs, or KOReader
+    -- crashes on the destroyed widget).
     custom_title_bar = TitleBar:new{
         title = _("Send A Book"),
-        subtitle = _("Tap books to pick them \226\128\164  \226\156\147 sends"),
+        subtitle = _("Tap books to pick them \226\128\164  Send to Xteink sends"),
         fullscreen = "true",
         align = "center",
         button_padding = Device.screen:scaleBySize(5),
@@ -711,18 +734,6 @@ function CROSSDROP:chooseAndSend()
             UIManager:close(fc)
         end,
         left_icon_allow_flash = false,
-        right_icon = "check",
-        right_icon_size_ratio = 1,
-        right_icon_tap_callback = function()
-            local paths = {}
-            for p in pairs(fc.picked or {}) do paths[#paths + 1] = p end
-            if #paths == 0 then
-                toastModule().show(_("Tap a book first \226\128\148 then \226\156\147 sends your selection."), 4)
-                return
-            end
-            confirmAndSend(paths)
-        end,
-        right_icon_allow_flash = false,
         show_parent = nil, -- patched to fc right below
     }
 
@@ -743,6 +754,32 @@ function CROSSDROP:chooseAndSend()
         custom_title_bar = custom_title_bar,
     }
     custom_title_bar.show_parent = fc
+
+    -- The Send button: a real text button overlapped onto the title bar's
+    -- right edge, opposite the ✕. It only exists while ≥1 book is picked —
+    -- we add it to the title-bar OverlapGroup when a book is chosen and take
+    -- it out again when none are, so there is no affordance until there is
+    -- something to send (see refreshSelectionTitle below).
+    send_button = Button:new{
+        text = _("Send to Xteink"),
+        text_font_size = Device.screen:scaleBySize(16),
+        text_font_bold = true,
+        bordersize = Device.screen:scaleBySize(1),
+        margin = 0,
+        show_parent = fc,
+        allow_flash = false,
+        callback = function()
+            local paths = {}
+            for p in pairs(fc.picked or {}) do paths[#paths + 1] = p end
+            if #paths == 0 then
+                toastModule().show(_("Tap a book first \226\128\148 then Send to Xteink sends your selection."), 4)
+                return
+            end
+            confirmAndSend(paths)
+        end,
+    }
+    send_button.overlap_align = "right"
+    custom_title_bar.send_button = send_button
 
     -- Tap = toggle in the picker. Dimmed rows + a ✓ prefix mark the selection;
     -- folders keep navigating normally (Menu routes those to changeToPath).
