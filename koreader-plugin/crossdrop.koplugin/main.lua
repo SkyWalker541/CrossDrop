@@ -51,13 +51,19 @@ local DEFAULT_FOLDER = "/CrossDropped Files"
 local toast_mod = require("crossdrop_toast")
 local progress_mod = require("crossdrop_progress")
 local home_mod = require("crossdrop_home")
+local picker_mod = require("crossdrop_picker")
 local function toastModule() return toast_mod end
 local function progressModule() return progress_mod end
 local function homeModule() return home_mod end
+local function pickerModule() return picker_mod end
 
 local CROSSDROP = WidgetContainer:extend{
     name = "crossdrop",
     is_doc_only = false,
+    -- Shown on the dashboard's Connections tab so the running build is
+    -- always identifiable on the device (KOReader loads plugins once at
+    -- startup — a replaced plugin file does nothing until restart).
+    VERSION = "1.3.15",
 }
 
 local socket, http
@@ -595,198 +601,18 @@ function CROSSDROP:sendCurrentBook()
     self:sendFile(book_path)
 end
 
--- "Send A Book": open the FileManager file browser (a modal FileChooser — the
--- same list widget FileManager hosts, shown full-screen so it paints ABOVE
--- the Home dialog) in PICK mode: tapping a book toggles it in the selection
--- (dimmed row). THE SEND ACTION IS THE FIRST ROW of the listing — "Send to
--- Xteink" — always visible, updated with the running count, exactly like the
--- synthetic "⬆ ../" row FileChooser itself injects (same genItemTable
--- pattern). Menu's OWN title bar (✕ top-right, centered title) is used as-is
--- — the user sees and uses it already; a custom_title_bar was never picked up
--- by this build's BookList/Menu chain, which is why no ✓ icon ever rendered.
+-- "Send A Book": open the CrossDrop book picker (crossdrop_picker.lua) —
+-- a browser built on the SAME widget architecture as the dashboard (rows of
+-- Buttons on the full-screen white card, the dashboard's TitleBar with its
+-- ✕). That widget set is the only one proven to render and take taps on
+-- this device; every FileChooser/Menu-based picker before 1.3.15 rendered
+-- blank controls (custom_title_bar ignored, icon slots invisible, synthetic
+-- rows lost). The picker scans folders itself (lfs), keeps its own picked
+-- set, and its first row is the always-visible "Send to Xteink" action.
 function CROSSDROP:chooseAndSend()
-    local DocumentRegistry = require("document/documentregistry")
-    local FileChooser = require("ui/widget/filechooser")
-    local ConfirmBox = require("ui/widget/confirmbox")
-    local start_path
-    local ok_util, filemanagerutil = pcall(require, "apps/filemanager/filemanagerutil")
-    if ok_util and filemanagerutil and filemanagerutil.getHomeFolder then
-        start_path = filemanagerutil.getHomeFolder()
-    end
-
-    -- FileChooser is the file browser's list widget; FileManager is the app
-    -- that usually hosts it. Standalone, the only `ui` bits BookList/FileChooser
-    -- poke at are folder shortcuts, book metadata (for metadata sorting) and a
-    -- PathChanged event — a minimal shim avoids crashing when the reader has no
-    -- FileManager instance to borrow from.
-    local ui_shim = {
-        folder_shortcuts = {
-            getShortcutFullName = function() return nil end,
-            hasFolderShortcut = function() return false end,
-        },
-        bookinfo = { getDocProps = function() return {} end },
-        selected_files = {},
-        handleEvent = function() return false end,
-    }
-
-    local plugin = self
-    local fc
-    -- The sentinel path of the synthetic send row (never a real file: paths
-    -- contain "/" and cannot look like this).
-    local SEND_ROW_PATH = "__crossdrop_send__"
-
-    -- Lifted from Storefront's confirm flows: a "Send N book(s)?" confirm
-    -- dialog gives the explicit go-ahead the user asked for, then hands the
-    -- batch to the open dashboard (self.home) which repaints in place. The
-    -- OK button carries the requested "Send to Xteink" label — ConfirmBox
-    -- buttons are core widgets, proven on this build (Storefront uses the
-    -- same ok_text mechanism).
-    local function confirmAndSend(paths)
-        table.sort(paths)
-        local names = {}
-        for i = 1, math.min(3, #paths) do
-            names[#names + 1] = "  " .. (paths[i]:match("([^/]+)$") or paths[i])
-        end
-        if #paths > 3 then
-            names[#names + 1] = string.format("  \226\128\166  %d more", #paths - 3)
-        end
-        local confirm
-        confirm = ConfirmBox:new{
-            text = string.format(_("Send %d book(s) to the reader?"), #paths)
-                .. "\n" .. table.concat(names, "\n"),
-            ok_text = _("Send to Xteink"),
-            ok_callback = function()
-                UIManager:close(confirm)
-                UIManager:close(fc, "ui")
-                local paths_now = {}
-                for _, p in ipairs(paths) do paths_now[#paths_now + 1] = p end
-                UIManager:nextTick(function()
-                    plugin:sendBooks(paths_now, plugin.home)
-                end)
-            end,
-            cancel_callback = function()
-                UIManager:close(confirm)
-            end,
-        }
-        UIManager:show(confirm)
-    end
-
-    local function pickedCount()
-        local n = 0
-        for _ in pairs(fc.picked or {}) do n = n + 1 end
-        return n
-    end
-
-    -- The send row always names the action; once books are picked it carries
-    -- the count too, so it doubles as the selection readout.
-    local function sendRowText()
-        local n = pickedCount()
-        if n > 0 then
-            return string.format(_("Send to Xteink  \226\128\162  %d book(s) selected"), n)
-        end
-        return _("Send to Xteink  \226\128\162  pick books below")
-    end
-
-    -- Keep the running selection visible in Menu's own title (the count is
-    -- also in the send row; Menu replaces the subtitle with the folder path
-    -- on navigation — switchItemTable — but the title survives).
-    local function refreshSelectionTitle()
-        local n = pickedCount()
-        if fc.title_bar and fc.title_bar.setTitle then
-            fc.title_bar:setTitle((n > 0)
-                and string.format(_("Send A Book  \226\128\164  %d selected"), n)
-                or _("Send A Book"), true)
-        end
-        if fc._send_item then
-            fc._send_item.text = sendRowText()
-        end
-    end
-
-    fc = FileChooser:new{
-        ui = ui_shim,
-        path = start_path,
-        title = _("Send A Book"),
-        file_filter = function(filename)
-            return DocumentRegistry:hasProvider(filename)
-        end,
-        modal = true,
-        -- NOTE: named `picked`, NOT `selected` — `selected` is FocusManager's
-        -- own cursor field. Passing it here made Menu:mergeTitleBarIntoLayout
-        -- do arithmetic on a nil `y` (FocusManager:_init copies the option's
-        -- x/y) and crashed KOReader the moment the browser opened.
-        picked = {}, -- path -> true, the multi-select picker set
-        -- Menu's built-in title bar ✕ (top-right) closes the picker; make
-        -- sure exiting always lands back on the CrossDrop dashboard.
-        close_callback = function()
-            if plugin.home then
-                UIManager:setDirty(plugin.home, "ui")
-                UIManager:forceRePaint()
-            else
-                plugin:openHome()
-            end
-        end,
-    }
-
-    -- Inject the "Send to Xteink" row at the top of every listing, the same
-    -- in-core pattern FileChooser's genItemTable itself uses for the "⬆ ../"
-    -- row: it is re-inserted on every folder change (genItemTableFromPath
-    -- runs per navigation), so it is ALWAYS the first row, everywhere.
-    local orig_genItemTable = fc.genItemTable
-    function fc:genItemTable(dirs, files, path)
-        local t = orig_genItemTable
-            and orig_genItemTable(self, dirs, files, path)
-            or {}
-        self._send_item = {
-            text = sendRowText(),
-            path = SEND_ROW_PATH,
-            is_file = true, -- Menu:onMenuSelect routes is_file taps to onFileSelect
-            bold = true,
-        }
-        table.insert(t, 1, self._send_item)
-        return t
-    end
-
-    -- Tap = toggle in the picker. Dimmed rows mark the selection; folders keep
-    -- navigating normally (Menu routes those to changeToPath). The synthetic
-    -- send row starts the transfer (or the hint when nothing is picked).
-    -- Must be defined HERE, after fc exists: Lua evaluates `function fc:m()`
-    -- at definition time (nil fc would raise "attempt to index local 'fc'").
-    function fc:onFileSelect(item)
-        local path = item and item.path
-        if path == SEND_ROW_PATH then
-            local paths = {}
-            for p in pairs(fc.picked or {}) do paths[#paths + 1] = p end
-            if #paths == 0 then
-                toastModule().show(_("Tap books below to pick them \226\128\148 then this row sends them."), 4)
-                return true
-            end
-            confirmAndSend(paths)
-            return true
-        end
-        if not path then return true end
-        local base = path:match("([^/]+)$") or item.text or path
-        if fc.picked[path] then
-            fc.picked[path] = nil
-            item.dim = nil
-            item.text = base
-        else
-            fc.picked[path] = true
-            item.dim = true
-            item.text = "\226\156\147  " .. base
-        end
-        fc:updateItems(1, true)
-        refreshSelectionTitle()
-        return true
-    end
-
-    -- FileChooser:init ran inside FileChooser:new, before the overrides
-    -- above existed, so the initial listing has no send row yet: rebuild it.
-    if fc.refreshPath then
-        fc:refreshPath()
-    end
-
-    UIManager:show(fc)
-    refreshSelectionTitle()
+    local picker = pickerModule():new{ plugin = self }
+    UIManager:show(picker)
+    UIManager:forceRePaint()
 end
 
 -- Open the full-screen CrossDrop dashboard. Shown with a "ui" refresh (the

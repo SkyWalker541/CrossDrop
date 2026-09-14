@@ -358,7 +358,8 @@ function HomeDialog:renderConnections()
     }))
 
     table.insert(vg,TextBoxWidget:new{
-        text = _("Books land in the CrossDropped Files folder on the reader's card.\nSend A Book picks any ebook \226\128\148 no need to open it first."),
+        text = _("Books land in the CrossDropped Files folder on the reader's card.\nSend A Book picks any ebook \226\128\148 no need to open it first.")
+            .. "\nCrossDrop " .. tostring((self.plugin and self.plugin.VERSION) or ""),
         face = Font:getFace("smallinfofont"),
         width = self.row_w,
     })

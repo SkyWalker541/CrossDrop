@@ -247,6 +247,33 @@ local FontStub = {
     getSize = function() return 20 end,
 }
 
+-- A tiny deterministic in-memory filesystem for the picker's folder scan
+-- (the real libkoreader-lfs stub is a bare widget stub; the picker needs
+-- dir/attributes to list books, and the tests must not depend on the
+-- machine's actual /tmp).
+local FAKE_FS = {
+    ["/tmp"] = { "fakebook.epub", "fakebook2.epub", "somedir" },
+    ["/tmp/somedir"] = { "nested.epub" },
+}
+local function fake_attributes(path, what)
+    if FAKE_FS[path] then
+        local t = { mode = "directory" }
+        if what then return t[what] end
+        return t
+    end
+    local parent, name = path:match("^(.*)/([^/]+)$")
+    if parent and FAKE_FS[parent] then
+        for _, e in ipairs(FAKE_FS[parent]) do
+            if e == name then
+                local t = { mode = "file", size = 256000 }
+                if what then return t[what] end
+                return t
+            end
+        end
+    end
+    return nil
+end
+
 local stubs = {
     ["logger"] = { warn = function() end, info = function() end },
     ["gettext"] = function(s) return s end,
@@ -363,11 +390,12 @@ stubs["socketutil"] = {
 }
 stubs["json"] = json_mod
 
--- lfs stub: size via io
+-- lfs stub: real file sizes via io + the deterministic FAKE_FS directory
+-- listing (the picker's folder scan must not depend on the machine's /tmp)
 stubs["libs/libkoreader-lfs"] = {
     attributes = function(path, what)
         local f = io.open(path, "rb")
-        if not f then return nil end
+        if not f then return fake_attributes(path, what) end
         if what == "size" then
             local cur = f:seek("set", 0)
             local sz = f:seek("end")
@@ -375,8 +403,19 @@ stubs["libs/libkoreader-lfs"] = {
             return sz
         end
         f:close()
-        return nil
+        return fake_attributes(path, what)
     end,
+    dir = function(path)
+        local entries = FAKE_FS[path]
+        if not entries then return nil, path .. ": no such directory" end
+        local i = 0
+        local function iter()
+            i = i + 1
+            return entries[i]
+        end
+        return iter, path
+    end,
+    currentdir = function() return "/tmp" end,
 }
 
 -- documentregistry: any filename the test picks is a supported book
@@ -466,57 +505,50 @@ inst:sendCurrentBook()
 local last_notif = UIManager._shown[#UIManager._shown]
 check("send success shows Book sent", last_notif and type(last_notif.text) == "string" and last_notif.text:match("Book sent"), last_notif and last_notif.text)
 
--- 5b. "Send A Book" picker opens a MODAL file browser above the full-screen
--- Home (non-modal would stack below it, exactly like the old IP dialog bug),
--- in multi-select mode: tapping toggles books (dim + ✓). THE SEND ACTION IS
--- THE FIRST ROW of the listing — "Send to Xteink", always visible, re-inserted
--- on every folder navigation (the same genItemTable pattern as FileChooser's
--- own "⬆ ../" row) — tap with 0 picked for a hint, with books picked for the
--- confirm dialog whose OK button is the labeled "Send to Xteink" button.
--- Menu's OWN title bar (✕ top-right) is used; exiting always lands back on
--- the CrossDrop dashboard.
+-- 5b. "Send A Book" opens the CROSSDROP PICKER (crossdrop_picker.lua) — the
+-- dashboard-architecture browser (the only widget set proven on this device):
+-- its own picked set (toggle), a folder scan (listFolder), and the
+-- always-visible "Send to Xteink" action row (sendRowText → confirmAndSend).
+-- Exiting always lands back on the CrossDrop dashboard.
 
 UIManager._shown = {}
 inst:chooseAndSend()
-local chooser = UIManager._shown[#UIManager._shown]
-check("chooseAndSend opens the file browser", type(chooser) == "table")
-check("chooser is modal (paints above Home)", chooser ~= nil and chooser.modal == true, chooser and chooser.modal)
-check("chooser filters supported book files", chooser and chooser.file_filter and chooser.file_filter("MyBook.epub") == true)
-check("chooser ui has folder_shortcuts (browser needs it)",
-    chooser and chooser.ui and chooser.ui.folder_shortcuts and type(chooser.ui.folder_shortcuts.getShortcutFullName) == "function")
-check("chooser starts with an empty picker set",
-    chooser and type(chooser.picked) == "table" and next(chooser.picked) == nil)
-check("chooser picked does NOT collide with FocusManager's selected field",
-    chooser and chooser.selected == nil, chooser and chooser.selected)
-local listing = chooser:genItemTable({}, {}, "/Books")
-check("send row is the first row of the listing",
-    listing and listing[1] and listing[1].path == "__crossdrop_send__",
-    listing and listing[1] and listing[1].text)
-check("send row is tappable (is_file → Menu routes it to onFileSelect)",
-    listing and listing[1] and listing[1].is_file == true,
-    listing and listing[1])
+local picker = UIManager._shown[#UIManager._shown]
+check("chooseAndSend opens the picker", type(picker) == "table")
+check("picker is modal (paints above Home)", picker ~= nil and picker.modal == true, picker and picker.modal)
+check("picker starts with an empty picked set",
+    picker and type(picker.picked) == "table" and next(picker.picked) == nil)
+check("picker uses a picked set (never FocusManager's selected)",
+    picker and picker.selected == nil, picker and picker.selected)
 check("send row names the action from the start",
-    listing and listing[1] and tostring(listing[1].text):match("Send to Xteink"),
-    listing and listing[1] and listing[1].text)
-local fa = { path = "/tmp/fakebook.epub" }
-local fb = { path = "/tmp/fakebook2.epub" }
-chooser:onFileSelect(fa)
-check("tap picks a book (dim + ✓)", fa.dim == true and tostring(fa.text):match("\226\156\147"), fa.text)
+    picker and tostring(picker:sendRowText()):match("Send to Xteink"),
+    picker and picker:sendRowText())
+picker:toggle("/tmp/fakebook.epub")
+check("toggle picks a book", picker.picked["/tmp/fakebook.epub"] == true, picker.picked["/tmp/fakebook.epub"])
 check("send row carries the count once books are picked",
-    chooser._send_item and tostring(chooser._send_item.text):match("1 book"),
-    chooser._send_item and chooser._send_item.text)
-chooser:onFileSelect(fb)
-chooser:onFileSelect(fa)
-check("tap toggles a book back off (no send on tap)",
-    fa.dim == nil and chooser.picked["/tmp/fakebook.epub"] == nil)
+    tostring(picker:sendRowText()):match("1 book"), picker:sendRowText())
+picker:toggle("/tmp/fakebook2.epub")
+picker:toggle("/tmp/fakebook.epub")
+check("toggle unpicks a book (no send on tap)",
+    picker.picked["/tmp/fakebook.epub"] == nil, picker.picked["/tmp/fakebook.epub"])
 check("send row count follows the selection",
-    chooser._send_item and tostring(chooser._send_item.text):match("1 book"),
-    chooser._send_item and chooser._send_item.text)
-chooser:onFileSelect(fa) -- re-pick fa → both books picked (fa + fb)
+    tostring(picker:sendRowText()):match("1 book"), picker:sendRowText())
+picker:toggle("/tmp/fakebook.epub") -- both books picked again
+-- the folder scan lists the harness's deterministic FAKE_FS (dirs + books)
+local pdirs, pfiles = picker:listFolder("/tmp")
+local pdirs, pfiles = picker:listFolder("/tmp")
+local found_fake, found_fake2 = false, false
+for _, f in ipairs(pfiles) do
+    if f.name == "fakebook.epub" then found_fake = true end
+    if f.name == "fakebook2.epub" then found_fake2 = true end
+end
+check("picker scans folders for books (registry/fallback filter)",
+    found_fake and found_fake2, tostring(found_fake) .. "/" .. tostring(found_fake2))
 
--- the send row confirm: closes the picker and runs the whole batch IN
--- the dashboard (a fake Home sink records the flow; the real Home is
--- exercised in section 14).
+-- the send action: confirm dialog whose OK button is the labeled
+-- "Send to Xteink" button, then the whole batch runs IN the dashboard
+-- (a fake Home sink records the flow; the real Home is exercised in
+-- section 14).
 local fake_home
 fake_home = {
     calls = {},
@@ -532,9 +564,9 @@ fake_home = {
 }
 inst.home = fake_home
 UIManager._shown = {}
-chooser:onFileSelect(chooser._send_item)
+picker:confirmAndSend()
 local cdlg = UIManager._shown[#UIManager._shown]
-check("send row opens a confirm dialog with a Send to Xteink button",
+check("send action opens a confirm dialog with a Send to Xteink button",
     cdlg and cdlg.ok_text == "Send to Xteink" and tostring(cdlg.text):match("Send 2 book"),
     cdlg and ((cdlg.ok_text or "") .. " / " .. tostring(cdlg.text or "")))
 UIManager._shown = {}
@@ -556,19 +588,19 @@ inst.home = nil
 
 -- Send with nothing picked is a gentle hint, never a send
 UIManager._shown = {}
-chooser.picked = {}
-chooser:onFileSelect(chooser._send_item)
+picker.picked = {}
+picker:confirmAndSend()
 local hint0 = UIManager._shown[#UIManager._shown]
-check("send row with no selection shows a hint",
+check("send action with no selection shows a hint",
     hint0 and type(hint0.text) == "string" and hint0.text:match("Tap books"), hint0 and hint0.text)
 
--- exiting the picker (Menu's built-in ✕ → close_callback) ALWAYS lands back
+-- exiting the picker (its TitleBar ✕, the dashboard's own) ALWAYS lands back
 -- on the CrossDrop dashboard: if Home is still open it is repainted; if it
 -- was closed meanwhile, it is reopened
 UIManager._shown = {}
 inst.home = nil
-chooser.close_callback()
-check("✕ exits back to the CrossDrop dashboard (reopens Home if needed)",
+picker:close()
+check("picker exit lands back on the CrossDrop dashboard (reopens Home if needed)",
     inst.home ~= nil, inst.home)
 inst.home = nil -- restore the pre-section state for the checks below
 
@@ -741,22 +773,20 @@ check("IP save repaints the open dashboard", home.frame ~= nil and home[1] ~= ni
 check("IP save clears remembered reach (stale probe)",
     next(inst._reach or {}) == nil, inst._reach and next(inst._reach))
 
--- 12c. the file browser has a visible way back: Menu's own title-bar ✕ (the
--- close the user already sees and uses) routes through the chooser's
--- close_callback and always lands on the CrossDrop dashboard.
+-- 12c. the picker has a visible way back: the dashboard's own TitleBar ✕
+-- pattern (close_callback → PickerDialog:close) — closing the picker always
+-- lands on the CrossDrop dashboard.
 UIManager._shown = {}
 inst:chooseAndSend()
-chooser = UIManager._shown[#UIManager._shown]
-check("browser wires Menu's built-in ✕ via close_callback",
-    chooser and type(chooser.close_callback) == "function",
-    chooser and chooser.close_callback)
+local picker2 = UIManager._shown[#UIManager._shown]
 local closed = false
 local save_close = UIManager.close
-UIManager.close = function(_, w) if w == chooser then closed = true end end
-chooser.close_callback()
+UIManager.close = function(_, w) if w == picker2 then closed = true end end
+inst.home = nil
+picker2:close()
 UIManager.close = save_close
-check("browser close_callback exits to the dashboard (Home reopened)",
-    closed or inst.home ~= nil, closed and "closed" or inst.home)
+check("picker close exits to the dashboard (Home reopened)",
+    closed and inst.home ~= nil, tostring(closed) .. " / " .. tostring(inst.home ~= nil))
 
 -- 13. THE FREEZE FIX: "Check device" / probes used raw socket.http, which
 -- forces its OWN 60s connect timeout regardless of any custom create() — an
@@ -795,6 +825,8 @@ check("sibling modules eager-cached at load (progress)",
     type(package.loaded["crossdrop_progress"]) == "table")
 check("sibling modules eager-cached at load (home)",
     type(package.loaded["crossdrop_home"]) == "table")
+check("sibling modules eager-cached at load (picker)",
+    type(package.loaded["crossdrop_picker"]) == "table")
 local saved_path = package.path
 package.path = string.gsub(package.path, PLUGIN_ROOT:gsub("%.", "%%.") .. "crossdrop%.koplugin/?.lua;", "")
 check("plugin folder off package.path (PluginLoader restore simulated)",
