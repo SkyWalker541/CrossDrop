@@ -527,6 +527,8 @@ inst:chooseAndSend()
 local picker = UIManager._shown[#UIManager._shown]
 check("chooseAndSend opens the picker", type(picker) == "table")
 check("picker is modal (paints above Home)", picker ~= nil and picker.modal == true, picker and picker.modal)
+check("picker covers the full screen (storefront browser flag)",
+    picker ~= nil and picker.covers_fullscreen == true, picker and picker.covers_fullscreen)
 check("picker starts with an empty picked set",
     picker and type(picker.picked) == "table" and next(picker.picked) == nil)
 check("picker uses a picked set (never FocusManager's selected)",

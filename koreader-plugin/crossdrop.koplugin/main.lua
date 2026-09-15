@@ -63,7 +63,7 @@ local CROSSDROP = WidgetContainer:extend{
     -- Shown on the dashboard's Connections tab so the running build is
     -- always identifiable on the device (KOReader loads plugins once at
     -- startup — a replaced plugin file does nothing until restart).
-    VERSION = "1.3.16",
+    VERSION = "1.3.17",
 }
 
 local socket, http
@@ -611,8 +611,21 @@ end
 -- set, and its first row is the always-visible "Send to Xteink" action.
 function CROSSDROP:chooseAndSend()
     local picker = pickerModule():new{ plugin = self }
-    UIManager:show(picker)
+    -- "ui" refresh type, exactly like openHome(): guarantees the picker is
+    -- enqueued for painting (a bare show() leaves the refresh to chance when
+    -- a full-screen modal is already up — which read as "opened behind").
+    UIManager:show(picker, "ui")
     UIManager:forceRePaint()
+    -- Diagnostics: if the picker ever misbehaves on the device again,
+    -- crash.log says what was on screen (books found, modal flag, and the
+    -- picker's position in the UIManager window stack).
+    local stack = UIManager._window_stack or {}
+    local pos, total = 0, #stack
+    for i, w in ipairs(stack) do
+        if w and w.widget == picker then pos = i end
+    end
+    logger.info("crossdrop: picker shown (books=", picker.books and #picker.books or 0,
+        " modal=", tostring(picker.modal), " stackpos=", pos, "/", total, ")")
 end
 
 -- Open the full-screen CrossDrop dashboard. Shown with a "ui" refresh (the

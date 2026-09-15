@@ -1,5 +1,5 @@
 return {
     fullname = "CrossDrop",
     description = "Send books to your CrossDrop reader over your local network.",
-    version = "1.3.16",
+    version = "1.3.17",
 }

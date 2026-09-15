@@ -42,6 +42,7 @@ local VerticalGroup = require("ui/widget/verticalgroup")
 local VerticalSpan = require("ui/widget/verticalspan")
 
 local _ = require("gettext")
+local logger = require("logger")
 
 local lfs_ok, lfs = pcall(require, "libs/libkoreader-lfs")
 
@@ -72,6 +73,11 @@ local EXCLUDED_DIRS = {
 local PickerDialog = InputContainer:extend{
     modal = true,
     dismissable = false,
+    -- covers_fullscreen is the storefront browser's flag: it tells
+    -- UIManager the dialog is a dominant full-screen layer, so repaints
+    -- start here and everything below (the dashboard) is not painted over
+    -- it. Without it, the picker can appear to open BEHIND the dashboard.
+    covers_fullscreen = true,
     plugin = nil,
     books = nil,      -- the scan result, cached for the dialog's lifetime
     picked = nil,     -- full path -> true (survives paging)
@@ -337,8 +343,12 @@ function PickerDialog:init()
         UIManager:forceRePaint()
         self.books = self:scanAllBooks()
         UIManager:close(scanning)
+        logger.info("crossdrop: device scan found ", #self.books, " book(s)")
     end
     self.picked = self.picked or {}
+    -- Belt-and-suspenders: instance-level modal (never rely on class
+    -- inheritance for the field UIManager's stacking depends on).
+    self.modal = true
 
     -- The dashboard's exact TitleBar config — the ✕ top-right the user
     -- already sees and uses on the dashboard, on this very device.
