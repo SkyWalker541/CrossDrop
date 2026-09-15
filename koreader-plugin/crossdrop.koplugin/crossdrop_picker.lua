@@ -585,6 +585,15 @@ function PickerDialog:confirmAndSend()
             for _, p in ipairs(paths) do paths_now[#paths_now + 1] = p end
             UIManager:nextTick(function()
                 plugin:sendBooks(paths_now, plugin.home)
+                -- e-ink: the batch ran blocking on the UI thread; whatever state
+                -- the dashboard ends in (done/failed) must be truly ON the screen.
+                -- sendBooks' own full refreshes cover this, but belt-and-braces:
+                -- dirty Home for one flashing FULL refresh after the batch.
+                local home = plugin and plugin.home
+                if home and home.frame then
+                    UIManager:setDirty(home, "full")
+                    UIManager:forceRePaint()
+                end
             end)
         end,
         cancel_callback = function()

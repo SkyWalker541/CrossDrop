@@ -13,6 +13,14 @@
 -- dialog and Storefront use). The dashboard never closes during a transfer,
 -- and "Send more books…"/"Try again" keep going from the same window.
 --
+-- E-INK REPAINT RULE (the issue that hid the whole flow on the device):
+-- when one of these callbacks flips the send STATE (connecting / sending a
+-- file / done / failed) it does a flashing FULL refresh — bare forceRePaint()
+-- partials over a whole-screen white card were being swallowed by the panel,
+-- so the transfer ran to completion with the screen still showing the old
+-- tab. Progress-while-streaming (onProgress) stays a partial repaint so it
+-- never flashes every chunk; only the per-file/state boundaries flash.
+--
 -- Uses only the plugin API exported from main.lua:
 --   configuredTargets() -> {kind, ip, port, folder}[]  (WiFi only)
 --   resolveTarget()     -> the WiFi target
@@ -43,6 +51,7 @@ local VerticalGroup = require("ui/widget/verticalgroup")
 local VerticalSpan = require("ui/widget/verticalspan")
 
 local _ = require("gettext")
+local logger = require("logger")
 
 -- ────────────────────── small presentation helpers ──────────────────────
 
@@ -424,9 +433,10 @@ end
 -- ─────────────── in-dashboard send: the progress sink ─────────────────────
 -- plugin:sendBooks(paths, self) drives these callbacks synchronously while the
 -- connection probes and the chunked PUT run on the UI thread. Each one rebuilds
--- the Send tab in place and force-paints, so the whole flow is visible inside
--- CrossDrop — the dashboard never closes, and afterwards Send More / Try Again
--- keep controlling the same window.
+-- the Send tab in place, so the whole flow is visible inside CrossDrop — the
+-- dashboard never closes, and afterwards Send More / Try Again keep
+-- controlling the same window. State changes paint via repaintNow (a flashing
+-- full refresh) so the panel really shows them; see the header comment.
 
 function HomeDialog:beginSendBatch(paths)
     self.send_state = "connecting"
@@ -439,10 +449,18 @@ function HomeDialog:beginSendBatch(paths)
     self.plugin:sendBooks(self.send_paths, self)
 end
 
+-- Rebuild this dashboard's frame and repaint it with a flushing FULL refresh
+-- (forceRePaint alone enqueues only a partial over the white card, which an
+-- e-ink panel can fail to show when the whole screen is repainting).
+function HomeDialog:repaintNow()
+    self:init()
+    UIManager:setDirty(self, "full")
+    UIManager:forceRePaint()
+end
+
 function HomeDialog:onConnecting()
     self.send_state = "connecting"
-    self:init()
-    UIManager:forceRePaint()
+    self:repaintNow()
 end
 
 function HomeDialog:onConnected(target)
@@ -452,8 +470,7 @@ end
 function HomeDialog:onUnreachable()
     self.send_state = "failed"
     self.fail_reason = self.plugin:noReaderText()
-    self:init()
-    UIManager:forceRePaint()
+    self:repaintNow()
 end
 
 function HomeDialog:onBeginFile(path, target, idx, total)
@@ -464,8 +481,12 @@ function HomeDialog:onBeginFile(path, target, idx, total)
     self.send_index = idx
     self.send_total = total
     self.send_widgets = nil
-    self:init()
-    UIManager:forceRePaint()
+    self:repaintNow()
+    local top = UIManager._window_stack
+        and UIManager._window_stack[#UIManager._window_stack]
+        and UIManager._window_stack[#UIManager._window_stack].widget
+    logger.info("crossdrop: home shows Sending ", idx, "/", total, " ",
+        self.send_filename, " (dashboard on top: ", tostring(top == self) or "?", ")")
 end
 
 function HomeDialog:onProgress(path, pct, sent, total, elapsed)
@@ -507,8 +528,12 @@ function HomeDialog:onDone(all_ok)
     if not all_ok and not self.fail_reason then
         self.fail_reason = _("The transfer did not complete.")
     end
-    self:init()
-    UIManager:forceRePaint()
+    self:repaintNow()
+    local top = UIManager._window_stack
+        and UIManager._window_stack[#UIManager._window_stack]
+        and UIManager._window_stack[#UIManager._window_stack].widget
+    logger.info("crossdrop: home shows ", self.send_state,
+        " (dashboard on top: ", tostring(top == self) or "?", ")")
 end
 
 function HomeDialog:sendMore()

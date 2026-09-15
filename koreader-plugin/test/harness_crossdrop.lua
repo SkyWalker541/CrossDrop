@@ -332,9 +332,10 @@ UIManager = {
     -- device, and the harness must not provide one either, or Home's tab
     -- switch and check() would be tested against an API that doesn't exist).
     _shown = {},
+    last_dirty = nil,
     show = function(_, w) table.insert(UIManager._shown, w) end,
     close = function() end,
-    setDirty = function() end,
+    setDirty = function(_, _, mode) UIManager.last_dirty = mode end,
     forceRePaint = function() end,
     nextTick = function(_, f) return f() end,
     scheduleIn = function() return { cancel = function() end } end,
@@ -1044,6 +1045,8 @@ FAKE.fail, FAKE.fail_put = false, false
 local ok_batch = inst:sendBooks({ "/tmp/fakebook.epub", "/tmp/fakebook2.epub" }, home)
 check("in-dashboard batch sends every book", ok_batch == true)
 check("home ends in the done state", home.send_state == "done", home.send_state)
+check("state change repaints with a flushing FULL refresh (e-ink)",
+    UIManager.last_dirty == "full", tostring(UIManager.last_dirty))
 check("home stays open the whole time", inst.home == home)
 check("home rendered the sent-books list", #home.send_file_list == 2, #home.send_file_list)
 check("reach dot recorded the connection", inst._reach and inst._reach.wifi == "ok", inst._reach and inst._reach.wifi)
@@ -1060,6 +1063,8 @@ inst:openHome()
 home = UIManager._shown[#UIManager._shown]
 local ok_bad = inst:sendBooks({ "/tmp/fakebook.epub" }, home)
 check("put-drop batch reports failure", ok_bad == false)
+check("failure repaints full too (e-ink)",
+    UIManager.last_dirty == "full", tostring(UIManager.last_dirty))
 check("home ends in the failed state", home.send_state == "failed", home.send_state)
 check("failed state carries the reason",
     home.fail_reason ~= nil and tostring(home.fail_reason) ~= "", tostring(home.fail_reason))
