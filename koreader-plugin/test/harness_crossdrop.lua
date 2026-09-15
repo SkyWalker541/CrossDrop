@@ -1141,6 +1141,8 @@ home:backToIdle() -- force send_state == "idle"
 local idle_joined = table.concat(flatten_texts(home:buildTabContent("send", home.row_w)), "\n")
 check("pick button reads Click Here To Select Book(s)",
     idle_joined:find("Click Here To Select Book(s)", 1, true) ~= nil, idle_joined)
+check("Send tab header above the picker reads Send one or more books",
+    idle_joined:find("Send one or more books", 1, true) ~= nil, idle_joined)
 check("Send tab no longer repeats the destination (it is on Connections)",
     not idle_joined:match("Destination") and not idle_joined:find("Check device", 1, true),
     idle_joined)
@@ -1155,6 +1157,12 @@ local h_frame = home.frame
 check("dashboard title bar carries no subtitle (just CrossDrop)",
     h_frame and h_frame[1] and h_frame[1][1] and h_frame[1][1].subtitle == nil,
     tostring(h_frame and h_frame[1] and h_frame[1][1] and h_frame[1][1].subtitle))
+local conn_joined = table.concat(flatten_texts(home:buildTabContent("connections", home.row_w)), "\n")
+check("connections tab shows the Xteink setup instructions",
+    conn_joined:find("Join WiFi Network", 1, true) ~= nil
+        and conn_joined:find("same Wi-Fi", 1, true) ~= nil
+        and conn_joined:find("Reachable", 1, true) ~= nil,
+    conn_joined)
 
 -- 15. IP PERSISTENCE: the WiFi IP lives in KOReader's global settings; in
 -- this plugin it is only ever written by the Set WiFi IP dialog.

@@ -344,9 +344,20 @@ function HomeDialog:renderConnections()
         callback = function() self.plugin:editIp("wifi", function() self:refresh() end) end,
     }))
 
-    table.insert(vg,TextBoxWidget:new{
-        text = _("Books land in the CrossDropped Files folder on the reader's card.\nSend A Book picks any ebook \226\128\148 no need to open it first.")
-            .. "\nCrossDrop " .. tostring((self.plugin and self.plugin.VERSION) or ""),
+    -- Setup guide for a first-time reader (the space the WiFi rows need
+    -- between the controls and the text). Steps mirror the buttons directly
+    -- above, so a new user reads exactly where each action happens.
+    local sc = function(v) return Device.screen:scaleBySize(v) end
+    table.insert(vg, VerticalSpan:new{ width = sc(12) })
+    table.insert(vg, TextBoxWidget:new{
+        text = _("To receive books, set up your Xteink device like this:\n")
+            .. _("1. Put the Xteink and this Kindle on the same Wi-Fi network.\n")
+            .. _("2. With CrossPoint running on the Xteink, open File Transfer and tap \"Join WiFi Network\".\n")
+            .. _("3. On that screen, the device's IP address is below the QR code.\n")
+            .. _("4. Tap \"Set WiFi IP\" to enter that address.\n")
+            .. _("5. Then tap the connection row above to check \226\128\148 it should read \"Reachable\" when connected.\n")
+            .. _("6. Send from the Send A Book tab: pick books from the list, or send the currently open book. Books land in the CrossDropped Files folder on the reader.")
+            .. "\n\nCrossDrop " .. tostring((self.plugin and self.plugin.VERSION) or ""),
         face = Font:getFace("smallinfofont"),
         width = self.row_w,
     })
@@ -363,7 +374,7 @@ function HomeDialog:renderSendIdle()
     local reach = self.plugin._reach or {}
     local book = self.plugin:currentBookPath()
 
-    table.insert(vg,self:header(_("Send a book")))
+    table.insert(vg,self:header(_("Send one or more books")))
     table.insert(vg,self:row(_("Click Here To Select Book(s)"), {
         callback = function() self.plugin:chooseAndSend() end,
     }))
