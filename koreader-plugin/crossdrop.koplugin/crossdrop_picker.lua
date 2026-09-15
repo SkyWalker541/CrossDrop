@@ -236,11 +236,23 @@ end
 
 -- Whatever a parser scraped out of a file gets normalized here; returns nil
 -- when there is nothing usable (so callers fall through to the next tier).
+-- Real-world metadadata quirks handled on-device: raw underscores from
+-- calibre-style titles ("Braiding_Sweetgrass_…") become spaces, and words
+-- repeated by the series packaging ("…Carl - 01 Anthology Anthology") are
+-- collapsed to one.
 function PickerDialog:sanitizeTitle(t)
     if not t or t == "" then return nil end
     t = tostring(t)
     t = t:gsub("%c", "")
+    t = t:gsub("_", " ")
     t = t:gsub("%s+", " ")
+    local words = {}
+    for w in t:gmatch("%S+") do
+        if words[#words] ~= w then
+            words[#words + 1] = w
+        end
+    end
+    t = table.concat(words, " ")
     t = t:gsub("^%s+", "")
     t = t:gsub("%s+$", "")
     if #t > 200 then t = t:sub(1, 200) end

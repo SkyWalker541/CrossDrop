@@ -7,8 +7,10 @@ cd "$ROOT"
 rm -rf releases
 mkdir -p releases
 
-( cd crosspoint-plugin && zip -r -q "$ROOT/releases/CrossDrop-SD-Plugin.zip" crossdrop )
-( cd koreader-plugin && zip -r -q "$ROOT/releases/CrossDrop-Plugin.zip" crossdrop.koplugin )
+# -x drops macOS AppleDouble silently-added files along with the README; only
+# the six plugin source files belong in the installable zip.
+( cd crosspoint-plugin && zip -r -q "$ROOT/releases/CrossDrop-SD-Plugin.zip" crossdrop -x "._*" -x "*.DS_Store" -x "*README*" )
+( cd koreader-plugin && zip -r -q "$ROOT/releases/CrossDrop-Plugin.zip" crossdrop.koplugin -x "._*" -x "*.DS_Store" -x "*README*" )
 
 echo "Built:"
 ls -1 releases/

@@ -597,6 +597,13 @@ check("sanitizeTitle strips controls", picker:sanitizeTitle("Real\0Title\n") == 
     tostring(picker:sanitizeTitle("Real\0Title\n")))
 check("sanitizeTitle empties to nil", picker:sanitizeTitle("   ") == nil)
 check("sanitizeTitle caps runaway lengths", #(picker:sanitizeTitle(string.rep("a", 500)) or "") <= 200)
+check("sanitizeTitle converts underscores to spaces (calibre titles)",
+    picker:sanitizeTitle("Braiding_Sweetgrass_Ind_Wisdom,_Scientific") == "Braiding Sweetgrass Ind Wisdom, Scientific",
+    tostring(picker:sanitizeTitle("Braiding_Sweetgrass_Ind_Wisdom,_Scientific")))
+check("sanitizeTitle collapses repeated words (series packaging)",
+    picker:sanitizeTitle("Dungeon Crawler Carl - 01 Anthology Anthology")
+        == "Dungeon Crawler Carl - 01 Anthology",
+    tostring(picker:sanitizeTitle("Dungeon Crawler Carl - 01 Anthology Anthology")))
 
 -- mobiTitle: a hand-built record 0 (PalmDB header + BOOKMOBI + full name at
 -- offset 120) — the 0x54/0x58 offsets are relative to RECORD 0, not the file.
@@ -1103,6 +1110,42 @@ home.send_state = "failed"
 home.fail_reason = "boom"
 home:init()
 check("failed state renders", home.frame ~= nil and home.frame:getSize().w <= SCREEN_W)
+
+-- 14b. APP CLEANUP: the Send tab is minimal — one pick button, "Currently
+-- open" only when a book is actually open, no Destination/Check-device section
+-- (the Connections tab owns the destination), and the title bar carries just
+-- the app title (no "folder → WiFi" subtitle).
+local function flatten_texts(w, out)
+    out = out or {}
+    if type(w) == "table" then
+        if type(w.text) == "string" then out[#out + 1] = w.text end
+        for i = 1, #w do
+            if type(w[i]) == "table" then flatten_texts(w[i], out) end
+        end
+    end
+    return out
+end
+UIManager._shown = {}
+inst:openHome()
+home = UIManager._shown[#UIManager._shown]
+home:backToIdle() -- force send_state == "idle"
+local idle_joined = table.concat(flatten_texts(home:buildTabContent("send", home.row_w)), "\n")
+check("pick button reads Click Here Select Book To Send",
+    idle_joined:find("Click Here Select Book To Send", 1, true) ~= nil, idle_joined)
+check("Send tab no longer repeats the destination (it is on Connections)",
+    not idle_joined:match("Destination") and not idle_joined:find("Check device", 1, true),
+    idle_joined)
+check("Currently open shown when a book is open",
+    idle_joined:find("Currently open", 1, true) ~= nil, idle_joined)
+inst.ui.document = nil
+local no_book_joined = table.concat(flatten_texts(home:buildTabContent("send", home.row_w)), "\n")
+check("Currently open hidden when no book is open",
+    not no_book_joined:find("Currently open", 1, true), no_book_joined)
+inst.ui.document = { file = "/tmp/fakebook.epub" }
+local h_frame = home.frame
+check("dashboard title bar carries no subtitle (just CrossDrop)",
+    h_frame and h_frame[1] and h_frame[1][1] and h_frame[1][1].subtitle == nil,
+    tostring(h_frame and h_frame[1] and h_frame[1][1] and h_frame[1][1].subtitle))
 
 -- 15. IP PERSISTENCE: the WiFi IP lives in KOReader's global settings; in
 -- this plugin it is only ever written by the Set WiFi IP dialog.

@@ -80,14 +80,6 @@ local function status_word(reach)
     return _("Not checked")
 end
 
-local function reach_summary(reach)
-    local parts = {}
-    if reach.wifi == "ok" then parts[#parts + 1] = _("WiFi \226\151\128") end
-    if reach.wifi == "down" then parts[#parts + 1] = _("WiFi \226\151\138") end
-    if #parts == 0 then return nil end
-    return table.concat(parts, "  " .. string.char(0xB7) .. "  ")
-end
-
 -- ─────────────────────────────── the widget ──────────────────────────────
 
 local HomeDialog = InputContainer:extend{
@@ -123,24 +115,9 @@ function HomeDialog:init()
     local inner_w = sw - pad * 2
     self.row_w = inner_w
 
-    local reach = self.plugin._reach or {}
-    local target = self.plugin:resolveTarget()
-    local folder = (target and target.folder) or "/CrossDropped Files"
-    local summary = reach_summary(reach)
-    local subtitle
-    if reach.wifi == "down" then
-        subtitle = _("No reader reached \226\128\148 is File Transfer open?")
-    elseif summary then
-        subtitle = folder .. "  \226\134\146  " .. summary
-    else
-        subtitle = _("Destination \226\134\146 ") .. folder ..
-            _("\nTap a connection to check it")
-    end
-
     local title_bar = TitleBar:new{
         width = inner_w,
         title = _("CrossDrop"),
-        subtitle = subtitle,
         fullscreen = false,
         with_bottom_line = true,
         close_callback = function()
@@ -378,50 +355,34 @@ end
 
 -- ─────────────────────────── Send tab ───────────────────────────────────
 
--- Idle: the pick-anything entry points, exactly as before. All sends now run
--- inside this dashboard (beginSendBatch → plugin:sendBooks with this Home as
--- the repaint sink), so the CrossDrop UI never closes while transferring.
+-- Idle: pick books, or send the one that is open (and only shown when it is).
+-- The destination lives on the Connections tab: nothing here repeats it.
 function HomeDialog:renderSendIdle()
     local vg = VerticalGroup:new{ align = "left" }
     local reach = self.plugin._reach or {}
     local book = self.plugin:currentBookPath()
 
     table.insert(vg,self:header(_("Send a book")))
-    table.insert(vg,self:row(_("Send A Book\226\128\166"), {
+    table.insert(vg,self:row(_("Click Here Select Book To Send"), {
         callback = function() self.plugin:chooseAndSend() end,
     }))
 
-    table.insert(vg,self:header(_("Currently open")))
+    -- "Currently open" only appears when there IS an open book (no empty
+    -- placeholder header when nothing is open).
     if book and book ~= "" then
         local name = book:match("([^/]+)$") or book
         local size = file_size(book)
+        table.insert(vg,self:header(_("Currently open")))
         table.insert(vg,self:row(
             string.format("\226\151\128  %s\n%s  \226\128\164  tap to send", name,
                 (size > 0 and string.format(_("%.1f MB"), size / 1048576) or "ebook")), {
             callback = function() self:beginSendBatch({ book }) end,
         }))
-    else
-        table.insert(vg,TextBoxWidget:new{
-            text = _("No book open just now \226\128\148 Send A Book picks any ebook."),
-            face = Font:getFace("smallinfofont"),
-            width = self.row_w,
-        })
     end
-
-    table.insert(vg,self:header(_("Destination")))
-    local target = self.plugin:resolveTarget() or { ip = "?", port = 80, folder = "/CrossDropped Files", kind = "wifi" }
-    local which = _("via WiFi")
-    table.insert(vg,self:row(
-        string.format("%s  \226\134\146  %s\n%s  \226\128\164  tap to check the reader", ip_str(target), folder_str(target), which), {
-        callback = function() self.plugin:statusDialog() end,
-    }))
-    table.insert(vg,self:row(_("Check device\226\128\166"), {
-        callback = function() self.plugin:statusDialog() end,
-    }))
 
     if reach.wifi ~= "ok" then
         table.insert(vg,TextBoxWidget:new{
-            text = _("Send uses the WiFi connection.\nNo connection checked yet or none reachable."),
+            text = _("Send uses the WiFi connection \226\128\148 set or check it on the Connections tab."),
             face = Font:getFace("smallinfofont"),
             width = self.row_w,
         })
