@@ -12,14 +12,15 @@
 -- alphabetical "every book on this device" list — pick any of them without
 -- navigating folders.
 --
--- Screen layout (one cohesive style: every row the same font, hairline
--- separators between rows, every interactive thing a proper button):
+-- Screen layout (one cohesive style: every row the same font, every button a
+-- framed box, hairline separators between rows, every interactive thing a
+-- proper button):
 --
 --   TitleBar: "Send A Book" + "N books — tap to pick; the top row sends"
 --   [Send to Xteink — send N book(s) now]  (dark button: THE action)
 --   ─────────────
 --   [Search books…]                       (opens a keyword-search popup)
---   Search: "treis" — 4 of 120 books      (only while a filter is active)
+--   Search "treis" — 4 results            (only while a filter is active)
 --   [Clear search]                        (only while a filter is active)
 --   ─────────────
 --   [book row]  ───────────── [book row] ───────────── …
@@ -637,14 +638,19 @@ end
 -- Menu-style Button row (the dashboard's row widget): one consistent font
 -- everywhere (smallinfofont 22, the same as the dashboard's rows). Built
 -- manually rather than via menu_style so bold and colors stay controllable
--- (menu_style clobbers them).
+-- (menu_style clobbers them). avoid_text_truncation is OFF on purpose: with
+-- it on, Button shrinks the font (down to a 2-line TextBoxWidget) for any
+-- title too wide for the row, so long and short titles rendered at visibly
+-- different sizes. Off, every row keeps font 22 and a too-long title is
+-- truncated instead. Every row is a framed box (a real border).
 function PickerDialog:row(text, opts)
     opts = opts or {}
     return Button:new{
         text = text,
         width = self.row_w,
         align = "left",
-        bordersize = 0,
+        bordersize = Size.border.button,
+        avoid_text_truncation = false,
         padding_h = Size.padding.large,
         text_font_face = "smallinfofont",
         text_font_size = 22,
@@ -708,8 +714,10 @@ function PickerDialog:buildContent()
     }))
     if self.query then
         table.insert(vg, self:separator())
-        table.insert(vg, self:caption(string.format(_("Search: \226\128\156%s\226\128\157 \226\128\148 %d of %d"),
-            self.query, #books, #self.books)))
+        local results = #books
+        local label = (results == 1) and _("result") or _("results")
+        table.insert(vg, self:caption(string.format(_("Search \226\128\156%s\226\128\157 \226\128\148 %d %s"),
+            self.query, results, label)))
         table.insert(vg, self:row(_("Clear search"), {
             callback = function() self:clearSearch() end,
         }))

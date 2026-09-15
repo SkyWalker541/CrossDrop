@@ -299,7 +299,7 @@ local stubs = {
         radius = { window = scal(7) },
         padding = { default = scal(5), large = scal(10) },
         span = { horizontal_default = scal(10) },
-        border = { window = scal(1.5) },
+        border = { window = scal(1.5), button = scal(1.5) },
         line = { thin = scal(1), thick = scal(2) },
     },
     ["ui/widget/container/widgetcontainer"] = class:extend{},
@@ -702,6 +702,45 @@ picker:clearSearch()
 check("clear search restores the full list",
     picker.query == nil and #picker:visibleBooks() == 5,
     tostring(picker.query) .. "/" .. tostring(#picker:visibleBooks()))
+
+-- 1.3.18 follow-up: uniform font + a framed box on EVERY row (Button no
+-- longer shrinks long titles into a smaller font), and the active-filter
+-- caption spelled as "Search \"X\" — N results".
+local function find_row_buttons(content)
+    local rows, caption = {}, nil
+    for i = 1, #content do
+        local c = content[i]
+        if type(c) == "table" then
+            if c.text_font_size ~= nil then rows[#rows + 1] = c end
+            if type(c.text) == "string" and c.text:find("Search", 1, true) then caption = c.text end
+        end
+    end
+    return rows, caption
+end
+picker.query = "book"
+local content = picker:buildContent()
+local row_btns, search_caption = find_row_buttons(content)
+local uniform, framed = #row_btns > 0, (#row_btns > 0)
+for _, btn in ipairs(row_btns) do
+    if btn.text_font_size ~= 22 then uniform = false end
+    if not (btn.bordersize and btn.bordersize > 0) then framed = false end
+end
+check("every row uses one font size (22)", uniform,
+    row_btns[1] and tostring(row_btns[1].text_font_size))
+check("rows never shrink long titles (avoid_text_truncation off)",
+    row_btns[1] and row_btns[1].avoid_text_truncation == false,
+    row_btns[1] and tostring(row_btns[1].avoid_text_truncation))
+check("every row is a framed box (visible border)", framed,
+    row_btns[1] and tostring(row_btns[1].bordersize))
+check("search caption reads Search \"X\" — N results",
+    search_caption ~= nil and search_caption:find("Search", 1, true) ~= nil
+        and search_caption:find("results", 1, true) ~= nil, tostring(search_caption))
+picker.query = "bold"
+local _, cap_one = find_row_buttons(picker:buildContent())
+check("search caption singularises one result",
+    cap_one ~= nil and cap_one:find("1 result", 1, true) ~= nil
+        and cap_one:find("results", 1, true) == nil, tostring(cap_one))
+picker.query = nil
 
 -- the send action: confirm dialog whose OK button is the labeled
 -- "Send to Xteink" button, then the whole batch runs IN the dashboard
