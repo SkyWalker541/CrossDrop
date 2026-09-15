@@ -310,19 +310,20 @@ function HomeDialog:check(kind)
             .. tostring(err or "network error")
         UIManager:show(Notification:new{ text = text, timeout = 5 })
     end
-    UIManager:setDirty(self, "full")
+    UIManager:setDirty(self, "partial")
     self:init()
 end
 
 -- Repaint the dashboard in place after a setting change (an IP edit happens
 -- under a modal InputDialog, so the re-init must wait until that dialog is off
 -- the stack). This is what makes a saved IP show up on the Connections tab
--- without reopening the dashboard.
+-- without reopening the dashboard. A partial update (no flash): the IP row
+-- changed in place under a closed modal.
 function HomeDialog:refresh()
     UIManager:nextTick(function()
         self.plugin._reach = {}
         self:init()
-        UIManager:setDirty(self, "full")
+        UIManager:setDirty(self, "partial")
     end)
 end
 
@@ -363,7 +364,7 @@ function HomeDialog:renderSendIdle()
     local book = self.plugin:currentBookPath()
 
     table.insert(vg,self:header(_("Send a book")))
-    table.insert(vg,self:row(_("Click Here Select Book To Send"), {
+    table.insert(vg,self:row(_("Click Here To Select Book(s)"), {
         callback = function() self.plugin:chooseAndSend() end,
     }))
 

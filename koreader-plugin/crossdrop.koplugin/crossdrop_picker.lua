@@ -462,7 +462,7 @@ function PickerDialog:upgradeVisibleTitles()
             if picker.title_cache_dirty then picker:saveTitleCache() end
             if not picker._closed then
                 picker:init()
-                UIManager:setDirty(picker, "full")
+                UIManager:setDirty(picker, "partial")
             end
         end
     end
@@ -523,7 +523,7 @@ function PickerDialog:showSearchDialog()
                         picker.page = 1
                         UIManager:close(search_dialog)
                         picker:init()
-                        UIManager:setDirty(picker, "full")
+                        UIManager:setDirty(picker, "partial")
                     end,
                 },
             },
@@ -544,7 +544,7 @@ function PickerDialog:clearSearch()
     self.query = nil
     self.page = 1
     self:init()
-    UIManager:setDirty(self, "full")
+    UIManager:setDirty(self, "partial")
 end
 
 -- The action row text: the send button the user asked for, always visible,
@@ -617,9 +617,9 @@ end
 
 -- ────────────────────── interactions ─────────────────────────────
 
--- Toggle one book in the picked set and repaint in place (the dashboard's
--- showTab recipe: re-init the same widget, then a "full" refresh). The scan
--- is cached on self, so this never rescans.
+-- Toggle one book in the picked set and repaint in place. A flashless PARTIAL
+-- update: the tap only changes a tick on the row (the scanning cache on self
+-- means this never rescans), so a full-screen e-ink wipe is pure strobing.
 function PickerDialog:toggle(path)
     self.picked = self.picked or {}
     if self.picked[path] then
@@ -628,13 +628,13 @@ function PickerDialog:toggle(path)
         self.picked[path] = true
     end
     self:init()
-    UIManager:setDirty(self, "full")
+    UIManager:setDirty(self, "partial")
 end
 
 function PickerDialog:gotoPage(n)
     self.page = math.max(1, n)
     self:init()
-    UIManager:setDirty(self, "full")
+    UIManager:setDirty(self, "partial")
 end
 
 -- Exiting (the TitleBar ✕, the one the user already uses on the dashboard)

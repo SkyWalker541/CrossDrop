@@ -549,6 +549,8 @@ check("toggle unpicks a book (no send on tap)",
 check("send row count follows the selection",
     tostring(picker:sendRowText()):match("1 book"), picker:sendRowText())
 picker:toggle("/tmp/fakebook.epub") -- both books picked again
+check("toggles repaint flashless (partial, no full-screen wipe)",
+    UIManager.last_dirty == "partial", tostring(UIManager.last_dirty))
 -- the device scan (bookshelf-style walk) finds every book — including
 -- nested and other source folders — and skips app/system/sidecar junk
 local books = picker:scanAllBooks("/mnt/us")
@@ -704,12 +706,19 @@ for _, row in ipairs(sd2.buttons or {}) do
 end
 check("search Save applies a trimmed, lowercased filter",
     picker.query == "book", tostring(picker.query))
+check("search applies and clears repaint flashless (partial)",
+    UIManager.last_dirty == "partial", tostring(UIManager.last_dirty))
 check("search narrows the visible books", #picker:visibleBooks() == 2,
     tostring(#picker:visibleBooks()))
 picker:clearSearch()
 check("clear search restores the full list",
     picker.query == nil and #picker:visibleBooks() == 5,
     tostring(picker.query) .. "/" .. tostring(#picker:visibleBooks()))
+check("clear search repaints flashless too",
+    UIManager.last_dirty == "partial", tostring(UIManager.last_dirty))
+picker:gotoPage(2)
+check("page turns repaint flashless (partial)",
+    UIManager.last_dirty == "partial", tostring(UIManager.last_dirty))
 
 -- 1.3.18 follow-up: uniform font + a framed box on EVERY row (Button no
 -- longer shrinks long titles into a smaller font), and the active-filter
@@ -1130,8 +1139,8 @@ inst:openHome()
 home = UIManager._shown[#UIManager._shown]
 home:backToIdle() -- force send_state == "idle"
 local idle_joined = table.concat(flatten_texts(home:buildTabContent("send", home.row_w)), "\n")
-check("pick button reads Click Here Select Book To Send",
-    idle_joined:find("Click Here Select Book To Send", 1, true) ~= nil, idle_joined)
+check("pick button reads Click Here To Select Book(s)",
+    idle_joined:find("Click Here To Select Book(s)", 1, true) ~= nil, idle_joined)
 check("Send tab no longer repeats the destination (it is on Connections)",
     not idle_joined:match("Destination") and not idle_joined:find("Check device", 1, true),
     idle_joined)
