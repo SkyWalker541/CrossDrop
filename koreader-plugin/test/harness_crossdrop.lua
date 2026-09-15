@@ -300,6 +300,7 @@ local stubs = {
         padding = { default = scal(5), large = scal(10) },
         span = { horizontal_default = scal(10) },
         border = { window = scal(1.5) },
+        line = { thin = scal(1), thick = scal(2) },
     },
     ["ui/widget/container/widgetcontainer"] = class:extend{},
     ["ui/widget/container/inputcontainer"] = class:extend{},
@@ -564,6 +565,143 @@ check("scan skips app/system/hidden/sidecar dirs and AppleDouble files",
     names["junk.epub"] and "koreader walked" or "ok")
 check("picker scanned at open (books cached on the dialog)",
     picker.books ~= nil and #picker.books == 5, picker.books and #picker.books)
+
+-- 5d. 1.3.18 real titles + search: rows show title-like names, not raw
+-- filenames, and a case-insensitive keyword search filters the pageable list.
+
+-- System text files join FAKE_FS: the scan must still NOT pick them up
+FAKE_FS["/mnt/us"] = { "Books", "Boldonic Books", "documents", "koreader", "system", "screenshots", ".hidden", "sneaky.azw3", "notes.txt" }
+FAKE_FS["/mnt/us/Books"] = { "fakebook.epub", "sub", "fakebook.sdr", "._fakebook.epub", "readme.md" }
+local rescan = picker:scanAllBooks("/mnt/us")
+local pk_names = {}
+for _, b in ipairs(rescan) do pk_names[b.name] = true end
+check("scan still finds 5 books with .txt/.md present", #rescan == 5, #rescan)
+check("scan excludes notes.txt and readme.md",
+    not pk_names["notes.txt"] and not pk_names["readme.md"],
+    pk_names["notes.txt"] and "notes.txt listed" or "ok")
+
+-- cleanTitle: the side-loader junk on this very device
+check("cleanTitle turns underscores into spaces",
+    picker:cleanTitle("The_Primal_Hunter_Book_1.azw3") == "The Primal Hunter Book 1",
+    picker:cleanTitle("The_Primal_Hunter_Book_1.azw3"))
+check("cleanTitle drops Anna's Archive junk",
+    not tostring(picker:cleanTitle("Less- a novel -- Andrew Sean Greer -- isbn13 9780316316125 -- d00e197c6b7871a431a4ea9d207a77df -- Anna's Archive_optimized.epub")):match("anna"),
+    picker:cleanTitle("Less- a novel -- Andrew Sean Greer -- isbn13 9780316316125 -- d00e197c6b7871a431a4ea9d207a77df -- Anna's Archive_optimized.epub"))
+check("cleanTitle keeps interior hyphens", picker:cleanTitle("sci-fi.novel.epub") == "sci-fi novel", picker:cleanTitle("sci-fi.novel.epub"))
+check("cleanTitle has a stem fallback", picker:cleanTitle("___-._---.pdf") ~= "",
+    tostring(picker:cleanTitle("___-._---.pdf")))
+
+-- sanitizeTitle: NULs/controls out, whitespace collapsed, empties become nil
+check("sanitizeTitle strips controls", picker:sanitizeTitle("Real\0Title\n") == "RealTitle",
+    tostring(picker:sanitizeTitle("Real\0Title\n")))
+check("sanitizeTitle empties to nil", picker:sanitizeTitle("   ") == nil)
+check("sanitizeTitle caps runaway lengths", #(picker:sanitizeTitle(string.rep("a", 500)) or "") <= 200)
+
+-- mobiTitle: a hand-built record 0 (PalmDB header + BOOKMOBI + full name at
+-- offset 120) — the 0x54/0x58 offsets are relative to RECORD 0, not the file.
+local function be32enc(v)
+    return string.char(math.floor(v / 16777216) % 256,
+        math.floor(v / 65536) % 256, math.floor(v / 256) % 256, v % 256)
+end
+local mobi_blob =
+    string.rep(" ", 32)            -- PalmDB 32-byte name field
+    .. string.rep("\0", 44)        -- …to byte 76
+    .. "\0\1"                      -- record count = 1
+    .. be32enc(82)                 -- record 0 data offset
+    .. "BOOKMOBI"                  -- record 0: MOBI header identifier
+    .. string.rep("\0", 8)
+    .. string.rep("\0", 84 - 16)   -- to 0x54 (full name offset, rec0-relative)
+    .. be32enc(120)
+    .. be32enc(11)                 -- full name length at 0x58
+    .. string.rep("\0", 120 - 92)
+    .. "My Test Mob"               -- the full name at record-0 offset 120
+local mobi_path = "/tmp/crossdrop_test.mobi"
+local mfh = assert(io.open(mobi_path, "wb")); mfh:write(mobi_blob); mfh:close()
+check("mobiTitle parses the record-0 full name",
+    picker:mobiTitle(mobi_path) == "My Test Mob", tostring(picker:mobiTitle(mobi_path)))
+
+-- fb2Title: plain-XML <book-title>, entities decoded
+local fb2_path = "/tmp/crossdrop_test.fb2"
+local ffh = assert(io.open(fb2_path, "wb"))
+ffh:write('<?xml version="1.0"?><FictionBook><description><title-info><book-title>My Test &amp; Fancy Book</book-title></title-info></description></FictionBook>')
+ffh:close()
+check("fb2Title parses book-title", picker:fb2Title(fb2_path) == "My Test & Fancy Book",
+    tostring(picker:fb2Title(fb2_path)))
+
+-- the durable titles_cache.lua format round-trips
+picker.title_cache_file = "/tmp/crossdrop_titles_cache.lua"
+picker._cache_loaded = false
+picker.title_cache = {}
+local cfh = assert(io.open("/tmp/crossdrop_titles_cache.lua", "w"))
+cfh:write('return {\n  ["/tmp/aa.epub"] = "Real Title",\n  ["/tmp/bb.mobi"] = "A \\"tricky\\" title",\n}\n')
+cfh:close()
+picker:loadTitleCache()
+check("title cache loads persisted titles", picker.title_cache["/tmp/aa.epub"] == "Real Title",
+    tostring(picker.title_cache["/tmp/aa.epub"]))
+check("title cache survives %q quoting", picker.title_cache["/tmp/bb.mobi"] == 'A "tricky" title',
+    tostring(picker.title_cache["/tmp/bb.mobi"]))
+picker.title_cache["/tmp/cc.epub"] = "Newly Discovered"
+picker.title_cache_dirty = true
+picker:saveTitleCache()
+picker.title_cache = {}
+picker:loadTitleCache()
+check("title cache round-trips through disk",
+    picker.title_cache["/tmp/cc.epub"] == "Newly Discovered" and picker.title_cache["/tmp/aa.epub"] == "Real Title")
+
+-- a persisted real title is used by the SCAN for that path (tier 2 beats
+-- the cleaned fallback) without waiting for the lazy Document upgrade
+picker.title_cache["/mnt/us/Books/fakebook.epub"] = "The Real Fake Book"
+local scanned_titles = picker:scanAllBooks("/mnt/us")
+local real_title
+for _, b in ipairs(scanned_titles) do
+    if b.path == "/mnt/us/Books/fakebook.epub" then real_title = b.title end
+end
+check("scan uses a persisted real title at once", real_title == "The Real Fake Book",
+    tostring(real_title))
+
+-- search: case-insensitive substring over the DISPLAYED title and the raw name
+picker.query = "fake"
+check("search matches the displayed title (fake)", #picker:visibleBooks() == 2,
+    tostring(#picker:visibleBooks()))
+picker.query = "BOLD"
+check("search ignores capitalisation (BOLD)", #picker:visibleBooks() == 1,
+    tostring(#picker:visibleBooks()))
+picker.query = "book"
+check("search is a plain substring, no pattern magic (book)", #picker:visibleBooks() == 2,
+    tostring(#picker:visibleBooks()))
+picker.query = "azw"
+check("search also matches the raw filename (azw)", #picker:visibleBooks() == 2,
+    tostring(#picker:visibleBooks()))
+picker.query = "zzzz"
+check("unmatched search yields nothing (no crash)", #picker:visibleBooks() == 0,
+    tostring(#picker:visibleBooks()))
+picker.query = nil
+check("clearing the query shows the full list", #picker:visibleBooks() == 5,
+    tostring(#picker:visibleBooks()))
+
+-- The Search popup is a modal InputDialog; Save applies a trimmed,
+-- lowercased filter and cancels leave the list alone.
+UIManager._shown = {}
+picker.query = nil
+picker:showSearchDialog()
+local sd2 = UIManager._shown[#UIManager._shown]
+check("search button opens a popup", type(sd2) == "table" and type(sd2.buttons) == "table")
+check("search popup is modal (stacks above the picker)", sd2 ~= nil and sd2.modal == true,
+    sd2 and sd2.modal)
+sd2.getInputText = function() return "  booK  " end
+for _, row in ipairs(sd2.buttons or {}) do
+    for _, btn in ipairs(row) do
+        if btn.text == "Search" then btn.callback() end
+    end
+end
+check("search Save applies a trimmed, lowercased filter",
+    picker.query == "book", tostring(picker.query))
+check("search narrows the visible books", #picker:visibleBooks() == 2,
+    tostring(#picker:visibleBooks()))
+picker:clearSearch()
+check("clear search restores the full list",
+    picker.query == nil and #picker:visibleBooks() == 5,
+    tostring(picker.query) .. "/" .. tostring(#picker:visibleBooks()))
 
 -- the send action: confirm dialog whose OK button is the labeled
 -- "Send to Xteink" button, then the whole batch runs IN the dashboard

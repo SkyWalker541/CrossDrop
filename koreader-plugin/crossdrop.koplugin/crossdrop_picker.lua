@@ -12,11 +12,20 @@
 -- alphabetical "every book on this device" list — pick any of them without
 -- navigating folders.
 --
--- Every page shows, top to bottom:
---   [Send to Xteink — send N book(s) now]   the action row, always row #1
---   [N books found]                        a small header line
---   [book rows of this page]
---   [Previous page][Next page]
+-- Screen layout (one cohesive style: every row the same font, hairline
+-- separators between rows, every interactive thing a proper button):
+--
+--   TitleBar: "Send A Book" + "N books — tap to pick; the top row sends"
+--   [Send to Xteink — send N book(s) now]  (dark button: THE action)
+--   ─────────────
+--   [Search books…]                       (opens a keyword-search popup)
+--   Search: "treis" — 4 of 120 books      (only while a filter is active)
+--   [Clear search]                        (only while a filter is active)
+--   ─────────────
+--   [book row]  ───────────── [book row] ───────────── …
+--   ─────────────
+--   Page X of Y                       (caption, not a control)
+--   [Previous page] [Next page]        (only the ones that apply)
 --
 -- Picked books get a light-gray row background plus a "picked" hint line
 -- (no reliance on icon glyphs, which never rendered here). The picked set
@@ -24,6 +33,20 @@
 -- confirm dialog whose OK button is the labeled "Send to Xteink" button;
 -- the transfer then runs inside the open dashboard
 -- (plugin:sendBooks with plugin.home as the repaint sink).
+--
+-- Rows show REAL book titles, not the (often horrendous) filenames that
+-- side-loaders produce. Titles are resolved cheapest-first:
+--   1. KOReader's own metadata cache (coverbrowser's BookInfoManager,
+--      bookinfo_cache.sqlite3) — one indexed sqlite query, covers every book
+--      KOReader has ever browsed/extracted, EPUB titles included.
+--   2. our durable on-disk titles_cache.lua, filled by (4) in past sessions;
+--   3. cheap raw reads at scan time: the MOBI/AZW/AZW3/PRC "full name" record
+--      (record 0 of the PalmDB) and the FB2 <book-title> element;
+--   4. lazy per-page upgrade via DocumentRegistry for EPUBs that failed 1-3
+--      (one Document open per frame, so the UI keeps breathing);
+--   5. a cleaned-up filename (underscores/hyphens to spaces, side-loader junk
+--      tokens like "Anna's Archive" / isbn13 / 32-hex thumbprints dropped).
+-- The search below matches the DISPLAYED title as well as the raw filename.
 
 local Blitbuffer = require("ffi/blitbuffer")
 local Button = require("ui/widget/button")
@@ -33,6 +56,7 @@ local Font = require("ui/font")
 local FrameContainer = require("ui/widget/container/framecontainer")
 local Geom = require("ui/geometry")
 local InputContainer = require("ui/widget/container/inputcontainer")
+local LineWidget = require("ui/widget/linewidget")
 local Notification = require("ui/widget/notification")
 local Size = require("ui/size")
 local TextBoxWidget = require("ui/widget/textboxwidget")
@@ -46,14 +70,27 @@ local logger = require("logger")
 
 local lfs_ok, lfs = pcall(require, "libs/libkoreader-lfs")
 
--- Book extensions (bookshelf.koplugin's SUPPORTED_EXT pattern: ebooks,
--- documents, comics — but not images/archives, which the native listers
--- would happily hand us).
+-- Where this module lives on disk: used for the durable title cache next to
+-- the plugin. Derived from the source path (works on device and in tests);
+-- KOReader's loader also stamps .path on the plugin module, but never on our
+-- instances, so we prefer the file's own location.
+local PLUGIN_DIR
+do
+    local info = debug and debug.getinfo and debug.getinfo(1, "S")
+    local src = info and info.source
+    if src and src:sub(1, 1) == "@" then
+        PLUGIN_DIR = src:sub(2):match("^(.*)/[^/]+$")
+    end
+end
+
+-- Book extensions (bookshelf.koplugin's SUPPORTED_EXT pattern, minus the
+-- plain-text/markup forms: on a real device .txt/.md are almost always
+-- system files — logs, notes, readmes — not books).
 local SUPPORTED_EXT = {
     epub = true, epub3 = true, fb2 = true, fb3 = true, mobi = true,
     azw = true, azw3 = true, prc = true, pdb = true,
     pdf = true, djvu = true, djv = true, doc = true, docx = true,
-    rtf = true, odt = true, txt = true, md = true,
+    rtf = true, odt = true,
     cbz = true, cbr = true, cbt = true,
 }
 
@@ -79,12 +116,23 @@ local PickerDialog = InputContainer:extend{
     -- it. Without it, the picker can appear to open BEHIND the dashboard.
     covers_fullscreen = true,
     plugin = nil,
-    books = nil,      -- the scan result, cached for the dialog's lifetime
-    picked = nil,     -- full path -> true (survives paging)
+    books = nil,       -- the scan result, cached for the dialog's lifetime
+    query = nil,       -- active search filter (lowercased), nil = no filter
+    picked = nil,      -- full path -> true (survives paging)
+    title_cache = {},  -- path -> real title, from past lazy upgrades
+    title_failed = {}, -- path -> true: never retried this session
+    title_cache_file = nil,
+    title_cache_dirty = nil,
     page = 1,
-    rows_per_page = 12,
-    scan_root = nil,  -- override for tests
+    rows_per_page = 10,
+    scan_root = nil,   -- override for tests
 }
+
+-- Extension groups: names a book by raw reads (cheap), and EPUBs that need
+-- the Document provider for a real title (done lazily, page by page).
+local MOBI_EXTS = { mobi = true, azw = true, azw3 = true, prc = true }
+local FB2_EXTS = { fb2 = true, fb3 = true }
+local EPUB_EXTS = { epub = true, epub3 = true }
 
 -- ─────────────────── pure, testable logic ──────────────────────
 
@@ -105,8 +153,12 @@ end
 
 -- One recursive walk over the scan root (bookshelf.koplugin's walkBooks
 -- pattern): skip dot entries, EXCLUDED_DIRS and .sdr sidecar dirs; collect
--- every file with a book extension. Returns a flat, name-sorted list of
--- {name, path, size}. Unreadable or missing roots simply yield an empty list.
+-- every file with a book extension. Returns a flat, title-sorted list of
+-- {name, path, ext, title, size}. Unreadable or missing roots simply yield
+-- an empty list. Each entry gets its best-known title via :titleFor (see
+-- the header comment for the resolution ladder; `real` is set when the
+-- title came from metadata, and cleared for EPUBs still awaiting the lazy
+-- Document upgrade).
 function PickerDialog:scanAllBooks(root)
     root = root or self.scan_root or PickerDialog.scanRoot()
     local out = {}
@@ -130,8 +182,11 @@ function PickerDialog:scanAllBooks(root)
                         end
                     elseif attr.mode == "file" then
                         local ext = entry:match("%.([^.]+)$")
-                        if ext and SUPPORTED_EXT[ext:lower()] then
-                            out[#out + 1] = { name = entry, path = fp, size = attr.size or 0 }
+                        ext = ext and ext:lower() or nil
+                        if ext and SUPPORTED_EXT[ext] then
+                            local b = { name = entry, path = fp, ext = ext, size = attr.size or 0 }
+                            self:titleFor(b)
+                            out[#out + 1] = b
                         end
                     end
                 end
@@ -139,14 +194,344 @@ function PickerDialog:scanAllBooks(root)
         end
     end
     walk(root, 0)
-    table.sort(out, function(a, b) return a.name:lower() < b.name:lower() end)
+    table.sort(out, function(a, b)
+        local ta, tb = a.title or a.name, b.title or b.name
+        return ta:lower() < tb:lower()
+    end)
     return out
+end
+
+-- ─────────────────── real titles, cheapest-first ─────────────────────
+
+-- Fallback: a filename made readable. Conservative — it only strips what
+-- side-loaders stamp on: separators, underscores, and the junk tokens
+-- retailers add (archive names, isbn13, 32-hex thumbprints). Interior
+-- punctuation ("sci-fi", digits) is kept. If nothing survives, the raw
+-- filename (minus extension) wins.
+function PickerDialog:cleanTitle(name)
+    local t = name:match("^(.*)%.[^.]+$") or name
+    t = t:gsub("_", " ")
+    t = t:gsub("%s+", " ")
+    -- Anna's Archive (straight or curly apostrophe) + tails
+    local APOSTROPHES = "'" .. string.char(226, 128, 152, 226, 128, 153)
+    t = t:gsub("Anna[" .. APOSTROPHES .. "]s Archive", " ")
+    t = t:gsub("%s+[Oo]ptimized%s*", " ")
+    t = t:gsub("[Ii][Ss][Bb][Nn]13[%s%-]*%d%d%d%d%d%d%d%d%d?%d?%d?%s*", " ")
+    t = t:gsub(
+        "%s+[%x][%x][%x][%x][%x][%x][%x][%x][%x][%x][%x][%x][%x][%x][%x][%x]"
+        .. "[%x][%x][%x][%x][%x][%x][%x][%x][%x][%x][%x][%x][%x][%x][%x][%x]%s*",
+        " ")
+    t = t:gsub("%s%-+%s*", " ")
+    -- left-over double-extension dots ("sci-fi.novel.epub" -> "sci-fi novel")
+    t = t:gsub("[%.]+", " ")
+    t = t:gsub("%s+", " ")
+    t = t:gsub("^%s+", "")
+    t = t:gsub("%s+$", "")
+    if t == "" then
+        return name:match("^(.*)%.[^.]+$") or name
+    end
+    return t
+end
+
+-- Whatever a parser scraped out of a file gets normalized here; returns nil
+-- when there is nothing usable (so callers fall through to the next tier).
+function PickerDialog:sanitizeTitle(t)
+    if not t or t == "" then return nil end
+    t = tostring(t)
+    t = t:gsub("%c", "")
+    t = t:gsub("%s+", " ")
+    t = t:gsub("^%s+", "")
+    t = t:gsub("%s+$", "")
+    if #t > 200 then t = t:sub(1, 200) end
+    if t == "" then return nil end
+    return t
+end
+
+-- First raw bytes of a file: used by the cheap binary/XML parsers below,
+-- and only there (this is a couple of small reads per mobi/fb2 — nothing
+-- like opening a book).
+function PickerDialog:readFirstBytes(path, n)
+    local f = io.open(path, "rb")
+    if not f then return nil end
+    local ok, data = pcall(f.read, f, n)
+    f:close()
+    if ok and data then return data end
+    return nil
+end
+
+local function be32(s, i) -- uint32, big-endian, at 1-based byte index i
+    return s:byte(i) * 16777216
+        + s:byte(i + 1) * 65536
+        + s:byte(i + 2) * 256
+        + s:byte(i + 3)
+end
+
+-- Palm Database identifiers that carry the MOBI header in record 0.
+local MOBI_MAGICS = { BOOKMOBI = true, ["TEXtREAd"] = true, ["TEXtOReB"] = true, ["TEXtRTF"] = true }
+
+-- The MOBI/PalmDoc "full name": record 0 of the PalmDB holds the MOBI header
+-- whose 0x54/0x58 fields are the offset/length (relative to record 0, NOT
+-- the file) of the clean book title. The MobileRead-verified layout:
+--   76(2) record count, 78(4) record 0 data offset,
+--   84(4) full name offset, 88(4) full name length.
+function PickerDialog:mobiTitle(path)
+    local data = self:readFirstBytes(path, 8192)
+    if not data or #data < 96 then return nil end
+    local rec0 = be32(data, 79)
+    if not rec0 or rec0 < 24 or rec0 + 120 > #data then return nil end
+    if not MOBI_MAGICS[data:sub(rec0 + 1, rec0 + 8)] then return nil end
+    local fn_off = be32(data, rec0 + 85)
+    local fn_len = be32(data, rec0 + 89)
+    if fn_len == 0 or fn_len > 2048 then return nil end
+    if rec0 + fn_off + fn_len > #data + 1 then return nil end
+    return self:sanitizeTitle(data:sub(rec0 + fn_off + 1, rec0 + fn_off + fn_len))
+end
+
+-- FB2/FB3 are plain XML (at least as a single .fb2/.fb3 file): the title is
+-- the <book-title> element. Namespace/entities handled loosely.
+function PickerDialog:fb2Title(path)
+    local data = self:readFirstBytes(path, 65536)
+    if not data then return nil end
+    local t = data:match("<book%-title[^>]*>(.-)</book%-title>")
+    if not t then return nil end
+    t = t:gsub("<[^>]+>", " ")
+    t = t:gsub("&amp;", "&"):gsub("&lt;", "<"):gsub("&gt;", ">")
+        :gsub("&quot;", '"'):gsub("&apos;", "'"):gsub("&#39;", "'")
+    return self:sanitizeTitle(t)
+end
+
+-- Tier 1: KOReader's own metadata cache. coverbrowser's BookInfoManager
+-- maintains bookinfo_cache.sqlite3 (real titles for every book KOReader has
+-- browsed/extracted — EPUB titles included). One indexed prepared query,
+-- same order of cost as the scan's lfs.attributes calls. Guarded: on a
+-- device without coverbrowser, or in the test harness, this is a no-op.
+function PickerDialog:koreaderMetaTitle(path)
+    if PickerDialog.bim == nil then
+        local ok, bim = pcall(require, "plugins/coverbrowser.koplugin/bookinfomanager")
+        PickerDialog.bim = ok and bim or false
+        if PickerDialog.bim and PickerDialog.bim.init then
+            pcall(PickerDialog.bim.init, PickerDialog.bim)
+        end
+    end
+    local bim = PickerDialog.bim
+    if not bim or not bim.getDocProps then return nil end
+    local ok, props = pcall(bim.getDocProps, bim, path)
+    if ok and props and props.title and props.title ~= "" then
+        return self:sanitizeTitle(props.title)
+    end
+    return nil
+end
+
+-- Resolve the best-known title for one scan entry, cheapest tier first
+-- (see the header comment). `b.real` is true when the title came from real
+-- metadata; EPUBs that found nothing keep a cleaned fallback with real=nil,
+-- so the lazy per-page Document upgrade (upgradeVisibleTitles) gets a turn.
+function PickerDialog:titleFor(b)
+    local ext = b.ext
+    local title, real
+    if not ext then
+        -- no extension: filename is all we have
+    elseif MOBI_EXTS[ext] then
+        title, real = self:mobiTitle(b.path), true
+    elseif FB2_EXTS[ext] then
+        title, real = self:fb2Title(b.path), true
+    elseif EPUB_EXTS[ext] then
+        -- bind first since it is free and instant
+        title = self.title_cache[b.path] or self:koreaderMetaTitle(b.path)
+        real = title and true or nil
+    end
+    if title then
+        b.title = title
+        b.real = real and true or nil
+    else
+        b.title = self:cleanTitle(b.name)
+        b.real = nil
+    end
+end
+
+-- Durable cache (tier 2): titles discovered by the lazy upgrade are kept in
+-- a Lua file next to the plugin, so the next session starts a page already
+-- holding real titles. Plain <path>=<title> lines, %q-quoted and read back
+-- with load(); a sub-par read just yields an empty cache.
+function PickerDialog:loadTitleCache()
+    if not self.title_cache_file then return end
+    local f = io.open(self.title_cache_file, "r")
+    if not f then return end
+    local src = f:read("*a")
+    f:close()
+    local chunk = src and load(src, "crossdrop_titles_cache")
+    if chunk then
+        local ok, t = pcall(chunk)
+        if ok and type(t) == "table" then
+            self.title_cache = t
+        end
+    end
+end
+
+function PickerDialog:saveTitleCache()
+    if not self.title_cache_file or not self.title_cache_dirty then return end
+    local f = io.open(self.title_cache_file, "w")
+    if not f then return end
+    local lines = {}
+    for p, t in pairs(self.title_cache) do
+        lines[#lines + 1] = string.format("  [%q] = %q,\n", p, t)
+    end
+    f:write("-- CrossDrop real-title cache, written as titles are discovered.\nreturn {\n")
+    f:write(table.concat(lines))
+    f:write("}\n")
+    f:close()
+    self.title_cache_dirty = nil
+end
+
+-- Tier 4, the lazy upgrade: the EPUBs on the CURRENT page that still have
+-- only a cleaned-filename title get a real title from the Document provider.
+-- One Document open per frame (UIManager:nextTick) so the UI never stalls,
+-- and every finished title is cached on disk for next session. Failures are
+-- black-listed for this session. DocumentRegistry does not exist in the
+-- harness, so it is a no-op there.
+function PickerDialog:upgradeVisibleTitles()
+    if self._upgrading or not self.books then return end
+    local books = self:visibleBooks()
+    local lo = (self.page - 1) * self.rows_per_page + 1
+    local hi = math.min(#books, self.page * self.rows_per_page)
+    local todo = {}
+    for i = lo, hi do
+        local b = books[i]
+        if b and not b.real and EPUB_EXTS[b.ext] and not self.title_failed[b.path] then
+            local known = self.title_cache[b.path] or self:koreaderMetaTitle(b.path)
+            if known then
+                b.title, b.real = known, true
+            else
+                todo[#todo + 1] = b
+            end
+        end
+    end
+    if #todo == 0 then return end
+    local ok_reg, DocumentRegistry = pcall(require, "document/documentregistry")
+    if not (ok_reg and DocumentRegistry and DocumentRegistry.openDocument) then return end
+    self._upgrading = true
+    local picker = self
+    local i = 1
+    local step
+    step = function()
+        if picker._closed then
+            picker._upgrading = nil
+            return
+        end
+        local b = todo[i]
+        if b then
+            local ok, title = pcall(function()
+                local doc = DocumentRegistry:openDocument(b.path)
+                local props = doc and doc.getProps and doc:getProps()
+                if doc and doc.close then pcall(doc.close, doc) end
+                if DocumentRegistry.closeDocument then
+                    pcall(DocumentRegistry.closeDocument, DocumentRegistry, b.path)
+                end
+                return props and props.title
+            end)
+            if ok and title then
+                title = picker:sanitizeTitle(title)
+            end
+            if title then
+                b.title = title
+                b.real = true
+                picker.title_cache[b.path] = title
+                picker.title_cache_dirty = true
+            else
+                picker.title_failed[b.path] = true
+            end
+        end
+        i = i + 1
+        if i <= #todo then
+            UIManager:nextTick(step)
+        else
+            picker._upgrading = nil
+            if picker.title_cache_dirty then picker:saveTitleCache() end
+            if not picker._closed then
+                picker:init()
+                UIManager:setDirty(picker, "full")
+            end
+        end
+    end
+    UIManager:nextTick(step)
 end
 
 function PickerDialog:pickedCount()
     local n = 0
     for _ in pairs(self.picked or {}) do n = n + 1 end
     return n
+end
+
+-- The pageable list is the scan filtered by the active search: an
+-- always-case-insensitive substring match on the DISPLAYED title AND the raw
+-- filename (plain find, no pattern magic, so "(" or "." in a query can't
+-- blow up). The picked set is untouched by filtering — a picked book stays
+-- picked when you search.
+function PickerDialog:visibleBooks()
+    local books = self.books or {}
+    local q = self.query
+    if not q or q == "" then
+        return books
+    end
+    q = q:lower() -- defensive: callers store it lowercased, this keeps it safe
+    local out = {}
+    for _, b in ipairs(books) do
+        if b.title and b.title:lower():find(q, 1, true)
+            or (b.name and b.name:lower():find(q, 1, true)) then
+            out[#out + 1] = b
+        end
+    end
+    return out
+end
+
+-- The Search button: a modal keyword popup (the same InputDialog recipe the
+-- dashboard's editIp uses — modal=true is REQUIRED so it stacks above this
+-- full-screen picker). Saves the (trimmed, lowercased) query or clears it.
+function PickerDialog:showSearchDialog()
+    local InputDialog = require("ui/widget/inputdialog")
+    local picker = self
+    local search_dialog
+    search_dialog = InputDialog:new{
+        title = _("Search books"),
+        input = self.query or "",
+        input_hint = _("Keyword \226\128\148 matches any part of a title or file name"),
+        type = "text",
+        modal = true,
+        buttons = {
+            {
+                {
+                    text = _("Search"),
+                    is_enter_default = true,
+                    callback = function()
+                        local text = search_dialog:getInputText() or ""
+                        local q = text:match("^%s*(.-)%s*$") or ""
+                        q = q:lower()
+                        picker.query = (q == "") and nil or q
+                        picker.page = 1
+                        UIManager:close(search_dialog)
+                        picker:init()
+                        UIManager:setDirty(picker, "full")
+                    end,
+                },
+            },
+            {
+                {
+                    text = _("Cancel"),
+                    callback = function()
+                        UIManager:close(search_dialog)
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(search_dialog)
+end
+
+function PickerDialog:clearSearch()
+    self.query = nil
+    self.page = 1
+    self:init()
+    UIManager:setDirty(self, "full")
 end
 
 -- The action row text: the send button the user asked for, always visible,
@@ -174,9 +559,13 @@ function PickerDialog:confirmAndSend()
         return
     end
     table.sort(paths)
+    local titles = {}
+    for _, b in ipairs(self.books or {}) do
+        titles[b.path] = b.title or b.name
+    end
     local names = {}
     for i = 1, math.min(3, #paths) do
-        names[#names + 1] = "  " .. (paths[i]:match("([^/]+)$") or paths[i])
+        names[#names + 1] = "  " .. (titles[paths[i]] or (paths[i]:match("([^/]+)$") or paths[i]))
     end
     if #paths > 3 then
         names[#names + 1] = string.format("  \226\128\166  %d more", #paths - 3)
@@ -230,6 +619,7 @@ end
 -- always lands back on the CrossDrop dashboard: if Home is still open it is
 -- repainted; if it was closed meanwhile, it is reopened.
 function PickerDialog:close()
+    self._closed = true
     UIManager:close(self, "ui")
     local plugin = self.plugin
     if plugin then
@@ -244,10 +634,10 @@ end
 
 -- ────────────────────── rendering ─────────────────────────────
 
--- Menu-style Button row (the dashboard's row widget), with optional
--- background/bold overrides for the action row and picked rows. Built
--- manually rather than via menu_style so text_font_bold stays controllable
--- (menu_style clobbers it).
+-- Menu-style Button row (the dashboard's row widget): one consistent font
+-- everywhere (smallinfofont 22, the same as the dashboard's rows). Built
+-- manually rather than via menu_style so bold and colors stay controllable
+-- (menu_style clobbers them).
 function PickerDialog:row(text, opts)
     opts = opts or {}
     return Button:new{
@@ -260,22 +650,47 @@ function PickerDialog:row(text, opts)
         text_font_size = 22,
         text_font_bold = opts.bold == true,
         background = opts.background,
+        text_font_color = opts.text_color,
         callback = opts.callback,
+    }
+end
+
+-- The hairline between rows: a thin gray line with a little air around it,
+-- so the list reads as discrete rows instead of one dense block.
+function PickerDialog:separator()
+    local sc = function(v) return Device.screen:scaleBySize(v) end
+    return VerticalGroup:new{
+        VerticalSpan:new{ width = sc(2) },
+        LineWidget:new{
+            dimen = Geom:new{ w = self.row_w, h = Size.line.thick },
+            background = Blitbuffer.COLOR_LIGHT_GRAY,
+        },
+        VerticalSpan:new{ width = sc(2) },
+    }
+end
+
+-- A small caption (plain text, same face as the rows — not a button).
+function PickerDialog:caption(text)
+    return TextBoxWidget:new{
+        text = text,
+        face = Font:getFace("smallinfofont"),
+        width = self.row_w,
     }
 end
 
 function PickerDialog:buildContent()
     local vg = VerticalGroup:new{ align = "left" }
-    local books = self.books or {}
+    local books = self:visibleBooks()
+    local sc = function(v) return Device.screen:scaleBySize(v) end
 
-    -- THE send button: always the first row of every page.
+    -- THE send button: always the first row of every page, dark and bold so
+    -- it reads as THE primary control (storefront's ok-button styling).
     table.insert(vg, self:row(self:sendRowText(), {
         bold = true,
-        background = Blitbuffer.COLOR_WHITE,
+        background = Blitbuffer.COLOR_DARK_GRAY,
+        text_color = Blitbuffer.COLOR_WHITE,
         callback = function() self:confirmAndSend() end,
     }))
-
-    table.insert(vg, self:row(string.format(_("%d book(s) found on this device"), #books), {}))
 
     local rpp = self.rows_per_page
     local max_page = math.max(1, math.ceil(#books / rpp))
@@ -283,38 +698,65 @@ function PickerDialog:buildContent()
     local lo = (self.page - 1) * rpp + 1
     local hi = math.min(#books, self.page * rpp)
 
+    table.insert(vg, self:separator())
+
+    -- Search: the button is always there; the active filter is spelled out in
+    -- a caption ("the field that shows the current search filter") with a
+    -- Clear button right under it.
+    table.insert(vg, self:row(_("Search books\226\128\166"), {
+        callback = function() self:showSearchDialog() end,
+    }))
+    if self.query then
+        table.insert(vg, self:separator())
+        table.insert(vg, self:caption(string.format(_("Search: \226\128\156%s\226\128\157 \226\128\148 %d of %d"),
+            self.query, #books, #self.books)))
+        table.insert(vg, self:row(_("Clear search"), {
+            callback = function() self:clearSearch() end,
+        }))
+    end
+    table.insert(vg, self:separator())
+
     if #books == 0 then
-        table.insert(vg, TextBoxWidget:new{
-            text = _("No books found on this device."),
-            face = Font:getFace("smallinfofont"),
-            width = self.row_w,
-        })
+        if self.query then
+            table.insert(vg, self:caption(_("No books match this search.")))
+        else
+            table.insert(vg, self:caption(_("No books found on this device.")))
+        end
     end
 
     for i = lo, hi do
         local e = books[i]
         local picked = self.picked[e.path] == true
         local size_str = string.format("%.1f MB", (e.size or 0) / 1048576)
-        local text = (picked and "\226\156\147 " or "") .. e.name .. "\n" ..
+        local text = e.title .. "\n" ..
             size_str .. (picked and _("  \226\128\148 picked, tap to un-pick")
                 or _("  \226\128\148 tap to pick"))
         table.insert(vg, self:row(text, {
             background = picked and Blitbuffer.COLOR_LIGHT_GRAY or nil,
             callback = function() self:toggle(e.path) end,
         }))
+        if i < hi then
+            table.insert(vg, self:separator())
+        end
     end
 
-    if self.page > 1 then
-        table.insert(vg, self:row(string.format(_("Previous page (page %d of %d)"),
-            self.page - 1, max_page), {
-            callback = function() self:gotoPage(self.page - 1) end,
-        }))
-    end
-    if hi < #books then
-        table.insert(vg, self:row(string.format(_("Next page (page %d of %d)"),
-            self.page + 1, max_page), {
-            callback = function() self:gotoPage(self.page + 1) end,
-        }))
+    -- Paging: a plain caption for the page number (never a control), then
+    -- the actual Previous/Next buttons — only the ones that apply.
+    if #books > 0 then
+        table.insert(vg, self:separator())
+        table.insert(vg, self:caption(string.format(_("Page %d of %d"),
+            self.page, max_page)))
+        table.insert(vg, VerticalSpan:new{ width = sc(2) })
+        if self.page > 1 then
+            table.insert(vg, self:row(_("Previous page"), {
+                callback = function() self:gotoPage(self.page - 1) end,
+            }))
+        end
+        if hi < #books then
+            table.insert(vg, self:row(_("Next page"), {
+                callback = function() self:gotoPage(self.page + 1) end,
+            }))
+        end
     end
 
     return vg
@@ -329,6 +771,21 @@ function PickerDialog:init()
     local pad = Size.padding.default
     local inner_w = sw - pad * 2
     self.row_w = inner_w
+
+    self._closed = false
+    -- The durable real-title cache lives next to the plugin (derived from
+    -- this file's own path); in tests the file simply doesn't exist yet, and
+    -- reads/writes are gated by the lazy-upgrade flow that cannot run there.
+    if not self.title_cache_file then
+        local dir = (self.plugin and self.plugin.path) or PLUGIN_DIR
+        if dir then
+            self.title_cache_file = dir .. "/titles_cache.lua"
+        end
+    end
+    if self.title_cache_file and not self._cache_loaded then
+        self:loadTitleCache()
+        self._cache_loaded = true
+    end
 
     -- Scan ONCE per dialog lifetime (the walk is a real directory read on
     -- slow device storage): paint a notice first so it never reads as a
@@ -346,16 +803,26 @@ function PickerDialog:init()
         logger.info("crossdrop: device scan found ", #self.books, " book(s)")
     end
     self.picked = self.picked or {}
+
+    -- After the first paint, give the current page's titles one lazy shot at
+    -- becoming real (Document opens, one per frame). No-ops until the frame
+    -- ticks, and no-ops altogether when there is nothing left to upgrade.
+    UIManager:nextTick(function()
+        if not self._closed then self:upgradeVisibleTitles() end
+    end)
+
     -- Belt-and-suspenders: instance-level modal (never rely on class
     -- inheritance for the field UIManager's stacking depends on).
     self.modal = true
 
     -- The dashboard's exact TitleBar config — the ✕ top-right the user
-    -- already sees and uses on the dashboard, on this very device.
+    -- already sees and uses on the dashboard, on this very device. The
+    -- subtitle carries the book count (static for the dialog's lifetime).
     local title_bar = TitleBar:new{
         width = inner_w,
         title = _("Send A Book"),
-        subtitle = _("Tap books to pick them \226\128\148 the top row sends"),
+        subtitle = string.format(_("%d book(s) on this device \226\128\148 tap to pick; the top row sends"),
+            #self.books),
         fullscreen = false,
         with_bottom_line = true,
         close_callback = function()
