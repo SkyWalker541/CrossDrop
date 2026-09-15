@@ -67,12 +67,20 @@ Hard-won device lessons (KPW5SE, KOReader 2026.07.2):
   BookList/Menu chain — the user only ever saw Menu's BUILT-IN title bar
   (centered title, ✕ top-right, subtitle = folder path), and no ✓ icon ever
   appeared. Don't pass `custom_title_bar` to FileChooser; use Menu's own bar.
-- **The user-visible send action is a synthetic top row** injected by
-  overriding `fc:genItemTable` (the same in-core pattern as FileChooser's own
-  "⬆ ../" row: `{text=…, path=SENTINEL, is_file=true}` → Menu routes its tap
-  to `onFileSelect`). Rows are the only picker element proven to render and
-  tap on this device. Call `fc:refreshPath()` once after the override so the
-  initial listing includes it (FileChooser:init already ran during :new).
+- **The user-visible send action is the first row** of the picker's own
+  dashboard-style list. The picker (crossdrop_picker.lua) does NOT use the
+  built-in file browser at all: it scans the device for book files
+  (bookshelf.koplugin's walk pattern — recursive lfs.dir, dot-entry skip,
+  .sdr skip, EXCLUDED_DIRS, SUPPORTED_EXT filter), caches the result per
+  open, and renders rows on the dashboard's widget set. Rows are the only
+  picker element proven to render and tap on this device.
+- **Research-backed patterns** (storefront catalog + installed plugins):
+  localsend.koplugin (311★) picks files with core `PathChooser`
+  (FileChooser subclass, Menu's own bar, `close_callback` on its ✕) —
+  the built-in list itself does render/tap fine on this device; only
+  custom chrome (custom_title_bar, icon slots) ever failed.
+  bookshelf.koplugin (854★) scans libraries with a plain recursive
+  lfs walk. When in doubt, check how those two do it.
 - **File rows dim but lose hand-edited `text`** across navigations
   (`getListItem` regenerates `item.text` from the filename per folder
   change) — `item.dim` survives a rebuild, the ✓ prefix does not. Treat dim

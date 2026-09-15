@@ -216,6 +216,7 @@ local DeviceStub = {
     input = DevInputStub,
     hasKeys = function() return false end,
     isTouchDevice = function() return true end,
+    isKindle = function() return true end, -- scan root = /mnt/us (FAKE_FS)
 }
 
 local function widget_stub(name, extra)
@@ -247,13 +248,23 @@ local FontStub = {
     getSize = function() return 20 end,
 }
 
--- A tiny deterministic in-memory filesystem for the picker's folder scan
+-- A tiny deterministic in-memory filesystem for the picker's device scan
 -- (the real libkoreader-lfs stub is a bare widget stub; the picker needs
--- dir/attributes to list books, and the tests must not depend on the
--- machine's actual /tmp).
+-- dir/attributes to walk for books, and the tests must not depend on the
+-- machine's actual disk). Mirrors the user's Kindle layout, including dirs
+-- the scan MUST skip (koreader, system, screenshots, .hidden, .sdr,
+-- AppleDouble "._" companions).
 local FAKE_FS = {
-    ["/tmp"] = { "fakebook.epub", "fakebook2.epub", "somedir" },
-    ["/tmp/somedir"] = { "nested.epub" },
+    ["/mnt/us"] = { "Books", "Boldonic Books", "documents", "koreader", "system", "screenshots", ".hidden", "sneaky.azw3" },
+    ["/mnt/us/Books"] = { "fakebook.epub", "sub", "fakebook.sdr", "._fakebook.epub" },
+    ["/mnt/us/Books/sub"] = { "nested.epub" },
+    ["/mnt/us/Books/fakebook.sdr"] = { "meta.epub" },
+    ["/mnt/us/Boldonic Books"] = { "bold.epub" },
+    ["/mnt/us/documents"] = { "fakebook2.azw" },
+    ["/mnt/us/koreader"] = { "junk.epub" },
+    ["/mnt/us/system"] = { "junk2.pdf" },
+    ["/mnt/us/screenshots"] = { "screen.png" },
+    ["/mnt/us/.hidden"] = { "hidden.epub" },
 }
 local function fake_attributes(path, what)
     if FAKE_FS[path] then
@@ -391,7 +402,7 @@ stubs["socketutil"] = {
 stubs["json"] = json_mod
 
 -- lfs stub: real file sizes via io + the deterministic FAKE_FS directory
--- listing (the picker's folder scan must not depend on the machine's /tmp)
+-- walking (the picker's device scan must not depend on the machine's disk)
 stubs["libs/libkoreader-lfs"] = {
     attributes = function(path, what)
         local f = io.open(path, "rb")
@@ -505,11 +516,11 @@ inst:sendCurrentBook()
 local last_notif = UIManager._shown[#UIManager._shown]
 check("send success shows Book sent", last_notif and type(last_notif.text) == "string" and last_notif.text:match("Book sent"), last_notif and last_notif.text)
 
--- 5b. "Send A Book" opens the CROSSDROP PICKER (crossdrop_picker.lua) — the
--- dashboard-architecture browser (the only widget set proven on this device):
--- its own picked set (toggle), a folder scan (listFolder), and the
--- always-visible "Send to Xteink" action row (sendRowText → confirmAndSend).
--- Exiting always lands back on the CrossDrop dashboard.
+-- 5b. "Send A Book" opens the CROSSDROP PICKER (crossdrop_picker.lua) — a
+-- device-wide book scan (the bookshelf.koplugin walk pattern) rendered on
+-- the dashboard's proven widgets: its own picked set (toggle), the
+-- always-visible "Send to Xteink" action row (sendRowText → confirmAndSend),
+-- paging, and exit that always lands back on the CrossDrop dashboard.
 
 UIManager._shown = {}
 inst:chooseAndSend()
@@ -534,16 +545,23 @@ check("toggle unpicks a book (no send on tap)",
 check("send row count follows the selection",
     tostring(picker:sendRowText()):match("1 book"), picker:sendRowText())
 picker:toggle("/tmp/fakebook.epub") -- both books picked again
--- the folder scan lists the harness's deterministic FAKE_FS (dirs + books)
-local pdirs, pfiles = picker:listFolder("/tmp")
-local pdirs, pfiles = picker:listFolder("/tmp")
-local found_fake, found_fake2 = false, false
-for _, f in ipairs(pfiles) do
-    if f.name == "fakebook.epub" then found_fake = true end
-    if f.name == "fakebook2.epub" then found_fake2 = true end
-end
-check("picker scans folders for books (registry/fallback filter)",
-    found_fake and found_fake2, tostring(found_fake) .. "/" .. tostring(found_fake2))
+-- the device scan (bookshelf-style walk) finds every book — including
+-- nested and other source folders — and skips app/system/sidecar junk
+local books = picker:scanAllBooks("/mnt/us")
+local names = {}
+for _, b in ipairs(books) do names[b.name] = true end
+local all_names = {}
+for n in pairs(names) do all_names[#all_names + 1] = n end
+check("device scan finds the books (all folders, nested)",
+    names["fakebook.epub"] and names["nested.epub"] and names["fakebook2.azw"]
+        and names["bold.epub"] and names["sneaky.azw3"],
+    table.concat(all_names, ", "))
+check("scan skips app/system/hidden/sidecar dirs and AppleDouble files",
+    not names["junk.epub"] and not names["junk2.pdf"] and not names["meta.epub"]
+        and not names["hidden.epub"] and not names["._fakebook.epub"] and not names["screen.png"],
+    names["junk.epub"] and "koreader walked" or "ok")
+check("picker scanned at open (books cached on the dialog)",
+    picker.books ~= nil and #picker.books == 5, picker.books and #picker.books)
 
 -- the send action: confirm dialog whose OK button is the labeled
 -- "Send to Xteink" button, then the whole batch runs IN the dashboard

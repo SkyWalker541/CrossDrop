@@ -63,7 +63,7 @@ local CROSSDROP = WidgetContainer:extend{
     -- Shown on the dashboard's Connections tab so the running build is
     -- always identifiable on the device (KOReader loads plugins once at
     -- startup — a replaced plugin file does nothing until restart).
-    VERSION = "1.3.15",
+    VERSION = "1.3.16",
 }
 
 local socket, http
@@ -602,12 +602,12 @@ function CROSSDROP:sendCurrentBook()
 end
 
 -- "Send A Book": open the CrossDrop book picker (crossdrop_picker.lua) —
--- a browser built on the SAME widget architecture as the dashboard (rows of
--- Buttons on the full-screen white card, the dashboard's TitleBar with its
--- ✕). That widget set is the only one proven to render and take taps on
--- this device; every FileChooser/Menu-based picker before 1.3.15 rendered
--- blank controls (custom_title_bar ignored, icon slots invisible, synthetic
--- rows lost). The picker scans folders itself (lfs), keeps its own picked
+-- a device-wide book scan (the bookshelf.koplugin walk pattern) rendered on
+-- the dashboard's proven widgets (rows of Buttons on the full-screen card,
+-- the dashboard's TitleBar with its ✕). The built-in file browser is not
+-- involved at all: no FileChooser, no Menu, no custom title bars — every
+-- attempt to ride those (1.3.9–1.3.14) rendered blank controls on this
+-- device. The picker scans once per open (cached), keeps its own picked
 -- set, and its first row is the always-visible "Send to Xteink" action.
 function CROSSDROP:chooseAndSend()
     local picker = pickerModule():new{ plugin = self }
