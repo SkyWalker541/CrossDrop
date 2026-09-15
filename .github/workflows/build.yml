@@ -12,12 +12,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Validate JSON
-        run: |
-          python3 -m json.tool hosted/crossdrop/guide-1.json
-          python3 -m json.tool crosspoint-plugin/crossdrop/device.json
-          python3 -m json.tool crosspoint-plugin/crossdrop/manifest.json
-
       - name: Lua syntax check + harness
         run: |
           sudo apt-get update && sudo apt-get install -y luajit
@@ -26,7 +20,7 @@ jobs:
           done
           luajit koreader-plugin/test/harness_crossdrop.lua
 
-      - name: Build release zips
+      - name: Build release zip
         run: ./scripts/build-zips.sh
 
       - uses: actions/upload-artifact@v4

@@ -38,21 +38,12 @@ typing needed.
 
 ## Requirements
 
-- **Reader:** a **CrossPoint *beta* build with SD plugin support** (the "SD
-  Plugins Beta" track, e.g. the Xteink X3/X4 beta builds). CrossPoint's
-  stable builds don't include the plugin platform. The plugin talks to the
-  reader's standard web server on port 80, so all that's needed on the reader
-  is **File Transfer** — open **File Transfer → Join Network**: the reader
-  joins your Wi-Fi, shows its IP, and is ready to receive (or create its own
-  hotspot and join that from the sender).
+- **Reader:** any CrossPoint build with **File Transfer** (WebDAV on port 80).
+  From the reader, open **File Transfer → Join Network**: the reader joins your
+  Wi-Fi, shows its IP, and is ready to receive (or create its own hotspot and
+  join that from the sender).
 - **KOReader:** any recent build (the plugin uses LuaSocket, which KOReader
   bundles).
-- **Optional companion:** the **CrossDrop CrossPoint plugin** (folder
-  `crossdrop/` on the reader's SD card under `/plugins/`) adds a
-  **Settings → System → Plugins → CrossDrop** screen rendered natively on the
-  e-ink display. It does **not** handle transfers — it's the step-by-step
-  setup guide that tells you how to install this KOReader plugin and pair the
-  two sides. Sending works without it on any File Transfer build.
 
 ## Install
 
@@ -82,8 +73,9 @@ cp -r crossdrop.koplugin /path/to/koreader/plugins/
 - The reader's web server listens on port **80**. Its IP + status are available
   at `GET /api/status`.
 - Destination folder: `CrossDropped Files` at the card root, ensured with
-  WebDAV `MKCOL /CrossDropped%20Files` (405 = already exists). CrossPoint's
-  own firmware may also auto-create it on PUT.
+  WebDAV `MKCOL /CrossDropped%20Files` (201 = created, 405 = already exists).
+  Verified against live firmware (X3, v1.6.0): MKCOL on a fresh path → 201,
+  PUT into it → 201.
 - Transfer: `PUT http://<ip>:<port>/CrossDropped%20Files/<url-encoded-filename>`
   with the raw file bytes in the body and a `Content-Length` header. Success
   is any 2xx. (Alternatively `POST /upload?path=<folder>` with multipart form
