@@ -32,12 +32,14 @@
 
 local Blitbuffer = require("ffi/blitbuffer")
 local Button = require("ui/widget/button")
+local CenterContainer = require("ui/widget/container/centercontainer")
 local Device = require("device")
 local Font = require("ui/font")
 local FrameContainer = require("ui/widget/container/framecontainer")
 local Geom = require("ui/geometry")
 local HorizontalGroup = require("ui/widget/horizontalgroup")
 local HorizontalSpan = require("ui/widget/horizontalspan")
+local ImageWidget = require("ui/widget/imagewidget")
 local InputContainer = require("ui/widget/container/inputcontainer")
 local LineWidget = require("ui/widget/linewidget")
 local Notification = require("ui/widget/notification")
@@ -52,6 +54,17 @@ local VerticalSpan = require("ui/widget/verticalspan")
 
 local _ = require("gettext")
 local logger = require("logger")
+
+-- This file's own plugin directory (icon.png lives beside it). The on-device
+-- PluginLoader sets plugin.path on the module; this mirrors how the picker
+-- finds titles_cache.lua so the logo also resolves when running without it.
+local LUA_PLUGIN_DIR
+do
+    local src = debug.getinfo(1, "S").source
+    if src and src:sub(1, 1) == "@" then
+        LUA_PLUGIN_DIR = src:sub(2):match("^(.*)/[^/]+$")
+    end
+end
 
 -- ────────────────────── small presentation helpers ──────────────────────
 
@@ -145,6 +158,8 @@ function HomeDialog:init()
             align = "left",
             title_bar,
             VerticalSpan:new{ width = sc(8) },
+            self:buildLogo(inner_w, sc),
+            VerticalSpan:new{ width = sc(8) },
             self:buildTabBar(inner_w),
             VerticalSpan:new{ width = sc(6) },
             content,
@@ -162,6 +177,32 @@ end
 function HomeDialog:onBack()
     UIManager:close(self)
     return true
+end
+
+-- The plugin logo (icon.png beside this file) renders as a small centered
+-- header under the title bar whenever the file exists. No image on disk, no
+-- logo and no dead gap — a stripped install just gets the normal spacing.
+-- ImageWidget + CenterContainer are the same blitting path Storefront uses
+-- for cover art, so this is proven to paint on the e-ink panel.
+function HomeDialog:buildLogo(inner_w, sc)
+    local dir = (self.plugin and self.plugin.path) or LUA_PLUGIN_DIR
+    local ok, lfs = pcall(require, "libs/libkoreader-lfs")
+    local icon = dir and (dir .. "/icon.png") or nil
+    if not icon or not ok or not lfs or not lfs.attributes
+            or lfs.attributes(icon, "mode") ~= "file" then
+        self.logo_shown = false
+        return VerticalSpan:new{ width = sc(6) }
+    end
+    self.logo_shown = true
+    local size = sc(56)
+    return CenterContainer:new{
+        dimen = Geom:new{ w = inner_w, h = size },
+        ImageWidget:new{
+            file = icon,
+            width = size,
+            height = size,
+        },
+    }
 end
 
 function HomeDialog:onCloseWidget()

@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="logo.png" width="160" alt="CrossDrop" />
+</p>
+
 # CrossDrop
 
 Send books from **KOReader** to your **Xteink (CrossPoint)** e-ink reader over

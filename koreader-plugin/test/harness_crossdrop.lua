@@ -415,6 +415,10 @@ stubs["libs/libkoreader-lfs"] = {
             f:close()
             return sz
         end
+        if what == "mode" then
+            f:close()
+            return "file"
+        end
         f:close()
         return fake_attributes(path, what)
     end,
@@ -1157,6 +1161,16 @@ local h_frame = home.frame
 check("dashboard title bar carries no subtitle (just CrossDrop)",
     h_frame and h_frame[1] and h_frame[1][1] and h_frame[1][1].subtitle == nil,
     tostring(h_frame and h_frame[1] and h_frame[1][1] and h_frame[1][1].subtitle))
+check("dashboard header renders the plugin logo (icon.png beside the plugin)",
+    home.logo_shown == true, tostring(home.logo_shown))
+local saved_path = inst.path
+inst.path = "/tmp/no-such-plugin-dir"
+UIManager._shown = {}
+inst:openHome()
+home = UIManager._shown[#UIManager._shown]
+check("header collapses to a spacer when the logo file is missing",
+    home.logo_shown == false, tostring(home.logo_shown))
+inst.path = saved_path
 local conn_joined = table.concat(flatten_texts(home:buildTabContent("connections", home.row_w)), "\n")
 check("connections tab shows the Xteink setup instructions",
     conn_joined:find("Join WiFi Network", 1, true) ~= nil
