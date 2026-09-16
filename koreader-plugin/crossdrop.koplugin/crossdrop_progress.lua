@@ -1,18 +1,16 @@
--- Live transfer progress dialog. The PUT runs synchronously; while the chunks
--- stream, on_progress mutates this dialog in place and forces an e-ink repaint
--- (the same technique the Storefront plugin uses for its download steps), so
--- the reader screen shows real, updating percentage/bytes/rate/ETA.
+-- Waiting dialog while a book streams. NO progress bar: socket.http drains the
+-- whole file into the TCP buffers in milliseconds on this build, so any bar
+-- just sat at 0% then jumped straight to done. Shows the book, the destination
+-- and a plain "… please wait" line; update() is inert (progress never paints).
 
+local _ = require("gettext")
 local Blitbuffer = require("ffi/blitbuffer")
 local CenterContainer = require("ui/widget/container/centercontainer")
 local Device = require("device")
 local Font = require("ui/font")
 local FrameContainer = require("ui/widget/container/framecontainer")
-local Geom = require("ui/geometry")
 local InputContainer = require("ui/widget/container/inputcontainer")
-local LineWidget = require("ui/widget/linewidget")
 local MovableContainer = require("ui/widget/container/movablecontainer")
-local OverlapGroup = require("ui/widget/overlapgroup")
 local Size = require("ui/size")
 local TextBoxWidget = require("ui/widget/textboxwidget")
 local TextWidget = require("ui/widget/textwidget")
@@ -20,7 +18,7 @@ local UIManager = require("ui/uimanager")
 local VerticalGroup = require("ui/widget/verticalgroup")
 local VerticalSpan = require("ui/widget/verticalspan")
 
-local ProgressDialog = InputContainer:extend{
+local WaitingDialog = InputContainer:extend{
     modal = true,
     dismissable = false,
     alignment = "center",
@@ -28,7 +26,7 @@ local ProgressDialog = InputContainer:extend{
     target = nil,
 }
 
-function ProgressDialog:init()
+function WaitingDialog:init()
     local sc = function(v) return Device.screen:scaleBySize(v) end
     local sw = Device.screen:getWidth()
     local content_w = math.min(sw - sc(70), sc(480))
@@ -53,78 +51,27 @@ function ProgressDialog:init()
         max_width = inner_w,
     }
 
-    local bar_w = inner_w
-    local bar_h = sc(16)
-    local border_w = Size.border.window or 1
-    self.bar_w = bar_w
-
-    -- NOTE: the old bar used CHILDLESS FrameContainers here. FrameContainer:getSize
-    -- does `self[1]:getSize()` with no nil guard, and OverlapGroup:init calls getSize()
-    -- on every child at build time — so the progress dialog crashed the instant a
-    -- transfer started. LineWidget has no children: its size is its dimen and its
-    -- paintTo is a plain bb:paintRect, so it cannot crash. The track keeps a border,
-    -- so it stays a FrameContainer but with a LineWidget child that guarantees getSize.
-    self.bar_fill = LineWidget:new{
-        dimen = Geom:new{ w = 0, h = bar_h },
-        background = Blitbuffer.COLOR_BLACK,
-    }
-    local bar_track = FrameContainer:new{
-        dimen = Geom:new{ w = bar_w, h = bar_h },
-        bordersize = border_w,
-        color = Blitbuffer.COLOR_DARK_GRAY,
-        background = Blitbuffer.COLOR_LIGHT_GRAY,
-        padding = 0,
-        LineWidget:new{
-            dimen = Geom:new{ w = bar_w - border_w * 2, h = bar_h - border_w * 2 },
-            background = Blitbuffer.COLOR_LIGHT_GRAY,
-        },
-    }
-    -- Track FIRST, fill LAST: OverlapGroup paints its children in order, so later
-    -- children sit on top. The old order painted the track OVER the fill — even
-    -- without the crash the progress bar would never have shown any fill.
-    local bar = OverlapGroup:new{
-        dimen = Geom:new{ w = bar_w, h = bar_h },
-        bar_track,
-        self.bar_fill,
-    }
-
-    self.pct_text = TextWidget:new{
-        text = "0%",
-        face = Font:getFace("cfont", 20),
-        bold = true,
-    }
-    self.meta_text = TextWidget:new{
-        text = "",
-        face = Font:getFace("smallinfofont"),
-        max_width = inner_w,
-    }
-
-    local header_row = VerticalGroup:new{
-        align = "left",
-        TextWidget:new{
-            text = "Sending to CrossDrop",
-            face = Font:getFace("smallinfofontbold"),
-            bold = true,
-        },
-        VerticalSpan:new{ width = sc(6) },
-        book_line,
-        VerticalSpan:new{ width = sc(2) },
-        target_line,
-    }
-
     local frame = FrameContainer:new{
         background = Blitbuffer.COLOR_WHITE,
         radius = Size.radius.window,
         padding = Size.padding.default,
         VerticalGroup:new{
             align = "left",
-            header_row,
-            VerticalSpan:new{ width = sc(14) },
-            bar,
-            VerticalSpan:new{ width = sc(8) },
-            self.pct_text,
+            TextWidget:new{
+                text = _("Sending to CrossDrop"),
+                face = Font:getFace("smallinfofontbold"),
+                bold = true,
+            },
+            VerticalSpan:new{ width = sc(6) },
+            book_line,
             VerticalSpan:new{ width = sc(2) },
-            self.meta_text,
+            target_line,
+            VerticalSpan:new{ width = sc(14) },
+            TextBoxWidget:new{
+                text = _("… please wait\n\nThe reader is writing to its card."),
+                face = Font:getFace("smallinfofont"),
+                width = inner_w,
+            },
         },
     }
 
@@ -142,46 +89,20 @@ function ProgressDialog:init()
     end
 end
 
--- sent/total in bytes; elapsed in seconds (may be 0). Called per streamed chunk.
-function ProgressDialog:update(pct, sent, total, elapsed)
-    pct = math.max(0, math.min(100, math.floor(pct + 0.5)))
-    self.pct_text:setText(string.format("%d%%", pct))
-    self.bar_fill.dimen.w = math.max(1, math.floor(self.bar_w * pct / 100))
-
-    local meta = {}
-    if total and total > 0 then
-        meta[#meta + 1] = string.format("%.1f / %.1f MB", sent / 1048576, total / 1048576)
-    else
-        meta[#meta + 1] = string.format("%.1f MB", sent / 1048576)
-    end
-    if elapsed and elapsed > 0 then
-        local rate = sent / elapsed
-        meta[#meta + 1] = string.format("%.2f MB/s", rate / 1048576)
-        if total and total > 0 and pct > 0 then
-            local remaining = total - sent
-            local eta = remaining / math.max(rate, 1)
-            meta[#meta + 1] = string.format("ETA %d:%02d", math.floor(eta / 60), math.floor(eta % 60))
-        end
-    end
-    self.meta_text:setText(table.concat(meta, "  ·  "))
-
-    if UIManager.forceRePaint then
-        UIManager:forceRePaint()
-    else
-        UIManager:setDirty(self, function()
-            return "ui", self.movable and self.movable.dimen or nil
-        end)
-    end
+-- Inert: the transfer is unpaced and finishes too fast for e-ink to show
+-- anything, so there is nothing to repaint mid-flight.
+function WaitingDialog:update(pct, sent, total, elapsed)
+    return true
 end
 
-function ProgressDialog:onBack()
+function WaitingDialog:onBack()
     return true
 end
 
 local CrossdropProgress = {}
 
 function CrossdropProgress.new(book, target)
-    local dlg = ProgressDialog:new{ book = book, target = target }
+    local dlg = WaitingDialog:new{ book = book, target = target }
     UIManager:show(dlg)
     return dlg
 end

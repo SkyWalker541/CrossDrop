@@ -20,11 +20,16 @@ plugin. It is not a firmware fork and builds no reader image.
   `crossdrop_*` siblings) must not `require` KOReader widgets at module load;
   widgets load via the `getWidgets()`/sibling-module pattern already in
   `main.lua`. The harness guards this.
-- **Fixed destination:** the koplugin has NO folder picker. Every book goes to
-  `/CrossDropped Files` on the reader (`DEFAULT_FOLDER` in `main.lua`).
-  Auto-create the folder on the reader via MKCOL before each PUT
-  (`ensureFolder`). Verified against live firmware (X3, v1.6.0): MKCOL on a
-  fresh path → 201, PUT into it → 201, DELETE file then folder → 204/204.
+- **Destination folder:** the Send A Book tab lists the reader's folders
+  (`GET /api/files`, raw-socket fetch) or takes a typed name; nothing chosen ==
+  `CrossDropped Files` (`DEFAULT_FOLDER` in `main.lua`). The chosen folder is
+  MKCOL-created on the reader before each PUT (`ensureFolder`). Verified
+  against live firmware (X3, v1.6.0): MKCOL on a fresh path → 201, PUT into
+  it → 201, DELETE file then folder → 204/204.
+  The reader streams `/api/files` with `Transfer-Encoding: chunked` in tiny
+  chunks, and this build's `socket.http` truncates multi-line bodies to their
+  first line — `listFolders` uses a raw-socket GET (`rawBody`) that splits
+  headers, dechunks, and decodes the body within a socketutil time budget.
 
 ## Non-negotiables
 

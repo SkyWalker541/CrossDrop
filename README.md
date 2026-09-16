@@ -11,9 +11,14 @@ Wi-Fi — no cable, no cloud.
 
 - A full-screen CrossDrop dashboard (**Connections** / **Send A Book**) inside
   KOReader's Tools menu.
-- Send any ebook, or the book you're currently reading.
-- Books land in the reader's `CrossDropped Files` folder, created automatically
-  on the first send (WebDAV MKCOL).
+- **Send A Book** scans your device for books: search and multi-pick from the
+  list, or send the book you're currently reading.
+- Books land in a **destination folder** on the reader — pick one from the
+  reader's folders or type a name. Nothing chosen = the **CrossDropped Files**
+  default, created automatically on the first send (WebDAV MKCOL).
+- A "… please wait" screen while a book streams, and a toast when it lands.
+  There's deliberately no progress bar: the transfer drains faster than
+  e-ink can repaint.
 
 ## Setup
 
@@ -22,8 +27,11 @@ Wi-Fi — no cable, no cloud.
 2. On your device, copy `crossdrop.koplugin/` into KOReader's `plugins/`
    folder and restart KOReader.
 3. Open **Tools → CrossDrop → Connections → Set WiFi IP…** and enter the
-   reader's IP.
-4. Use the **Send A Book** tab to send.
+   reader's IP. Tap the **WiFi** row to check it reads **Reachable**.
+4. Use the **Send A Book** tab to pick books and choose a destination folder.
+
+Wi-Fi is the only connection mode. The reader's "Create Hotspot" mode was
+dropped — it never worked reliably.
 
 ## Build & test
 

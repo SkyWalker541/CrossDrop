@@ -346,10 +346,27 @@ stubs["ui/uimanager"] = UIManager
 -- ── fake device ───────────────────────────────────────────────────────────
 
 local FAKE = {
-    fail = false,           -- simulate "connection refused" on everything
+    fail = false,
     fail_put = false,       -- network is up, but the PUT transfer drops (string error)
+    chunked = false,        -- /api/files replies with raw chunked-transfer framing
+    garbage = false,        -- /api/files replies with a non-JSON body
     mkcol_count = 0,
 }
+
+-- Real wire capture from the Xteink reader (nc at 192.168.7.45:80): it streams
+-- the /api/files listing with Transfer-Encoding: chunked in many tiny writes.
+-- The device's socket.http hands this framing to JSON.decode verbatim, which is
+-- why the folder list once refused to parse. Regression fixture for dechunk().
+local RAW_CHUNKED_FILES = "1\r\n[\r\n"
+    .. "3b\r\n{\"name\":\"Books\",\"size\":0,\"isDirectory\":true,\"isEpub\":false}\r\n"
+    .. "1\r\n,\r\n"
+    .. "4a\r\n{\"name\":\"crash_report.txt\",\"size\":4268,\"isDirectory\":false,\"isEpub\":false}\r\n"
+    .. "1\r\n,\r\n"
+    .. "3b\r\n{\"name\":\"sleep\",\"size\":0,\"isDirectory\":true,\"isEpub\":false}\r\n"
+    .. "1\r\n,\r\n"
+    .. "48\r\n{\"name\":\"CrossDropped Files\",\"size\":0,\"isDirectory\":true,\"isEpub\":false}\r\n"
+    .. "1\r\n]\r\n"
+    .. "0\r\n\r\n"
 
 local function fake_request(args)
     if FAKE.fail then
@@ -365,7 +382,16 @@ local function fake_request(args)
         return '{"version":"1.6.0rc","ip":"192.168.1.50","mode":"STA","rssi":-45,"freeHeap":123456,"uptime":3600,"device":"X4"}', 200
     end
     if method == "GET" and url:match("/api/files") then
-        return '[{"name":"Books","size":0,"isDirectory":true,"isEpub":false},{"name":"MyBook.epub","size":123,"isDirectory":false,"isEpub":true}]', 200
+        if FAKE.garbage then
+            return "this is not json at all", 200
+        end
+        if FAKE.chunked then
+            return RAW_CHUNKED_FILES, 200
+        end
+        return '[{"name":"Books","size":0,"isDirectory":true,"isEpub":false},'
+            .. '{"name":"MyBook.epub","size":123,"isDirectory":false,"isEpub":true},'
+            .. '{"name":"sleep","size":0,"isDirectory":true,"isEpub":false},'
+            .. '{"name":"CrossDropped Files","size":0,"isDirectory":true,"isEpub":false}]', 200
     end
     if method == "MKCOL" then
         FAKE.mkcol_count = FAKE.mkcol_count + 1
@@ -381,10 +407,41 @@ local function fake_request(args)
     return "not found", 404
 end
 
+-- Raw-socket transport for the folder listing: the device's socket.http only
+-- returns the FIRST LINE of a multi-line body, so listFolders reads a plain
+-- tcp socket. The fake hands back TCP_RESP verbatim (full HTTP response), or a
+-- connect failure under FAKE.fail — exactly what a real device would send.
+local CLEAN_FILES_JSON = '[{"name":"Books","size":0,"isDirectory":true,"isEpub":false},'
+    .. '{"name":"MyBook.epub","size":123,"isDirectory":false,"isEpub":true},'
+    .. '{"name":"sleep","size":0,"isDirectory":true,"isEpub":false},'
+    .. '{"name":"CrossDropped Files","size":0,"isDirectory":true,"isEpub":false}]'
+local TCP_RESP = "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n" .. CLEAN_FILES_JSON
+local function raw_ok(payload)
+    TCP_RESP = "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n" .. payload
+end
+-- Monotonic fake clock for putFile pacing (socket.gettime/socket.sleep). The
+-- harness advances it so the live-progress pacing is exercised deterministically.
+local fake_clock = 0.0
+local sleep_calls = 0
 stubs["socket"] = {
     tcp = function()
-        local s = { settimeout = function() end }
-        return s
+        return {
+            settimeout = function() end,
+            connect = function() if FAKE.fail then return nil, "connection refused" end return 1 end,
+            send = function() return 1 end,
+            receive = function()
+                local r = TCP_RESP
+                if r == nil then return nil end
+                TCP_RESP = nil
+                return r
+            end,
+            close = function() end,
+        }
+    end,
+    gettime = function() return fake_clock end,
+    sleep = function(t)
+        fake_clock = fake_clock + t
+        sleep_calls = sleep_calls + 1
     end,
 }
 stubs["socket.http"] = { request = function(args) return fake_request(args) end }
@@ -727,6 +784,10 @@ check("page turns repaint flashless (partial)",
 -- 1.3.18 follow-up: uniform font + a framed box on EVERY row (Button no
 -- longer shrinks long titles into a smaller font), and the active-filter
 -- caption spelled as "Search \"X\" — N results".
+-- 1.3.31 change: BOOK rows are borderless (bare text with hairline rules
+-- between them — the picker is a list, not a stack of boxes); only the
+-- action rows (Send, Search, pages) keep their bordered-box look. Font
+-- stays locked at 22 via avoid_text_truncation=false.
 local function find_row_buttons(content)
     local rows, caption = {}, nil
     for i = 1, #content do
@@ -738,21 +799,43 @@ local function find_row_buttons(content)
     end
     return rows, caption
 end
+local function find_widgets(w, pred, out)
+    out = out or {}
+    if type(w) == "table" then
+        if pred(w) then out[#out + 1] = w end
+        for i = 1, #w do
+            if type(w[i]) == "table" then find_widgets(w[i], pred, out) end
+        end
+    end
+    return out
+end
 picker.query = "book"
 local content = picker:buildContent()
 local row_btns, search_caption = find_row_buttons(content)
-local uniform, framed = #row_btns > 0, (#row_btns > 0)
+local uniform, action_framed, book_borderless = #row_btns > 0, false, false
+local book_rows = 0
 for _, btn in ipairs(row_btns) do
     if btn.text_font_size ~= 22 then uniform = false end
-    if not (btn.bordersize and btn.bordersize > 0) then framed = false end
+    if btn.bordersize == 0 then book_rows = book_rows + 1 end
 end
+for _, btn in ipairs(row_btns) do
+    if btn.bordersize and btn.bordersize > 0 then action_framed = true end
+end
+book_borderless = book_rows >= 1
 check("every row uses one font size (22)", uniform,
     row_btns[1] and tostring(row_btns[1].text_font_size))
 check("rows never shrink long titles (avoid_text_truncation off)",
     row_btns[1] and row_btns[1].avoid_text_truncation == false,
     row_btns[1] and tostring(row_btns[1].avoid_text_truncation))
-check("every row is a framed box (visible border)", framed,
-    row_btns[1] and tostring(row_btns[1].bordersize))
+check("book rows are borderless (no box around each book)", book_borderless,
+    tostring(book_rows) .. " borderless book rows")
+check("action rows keep their framed boxes (Send, Search, pages)",
+    action_framed, tostring(row_btns[1] and row_btns[1].bordersize))
+local hairline = find_widgets(content, function(w)
+    return w.dimen ~= nil and w.dimen.h == require("ui/size").line.thick
+end)
+check("thin rule separates rows (hairline separators present)",
+    #hairline >= #row_btns, #hairline .. " hairlines / " .. #row_btns .. " rows")
 check("search caption reads Search \"X\" — N results",
     search_caption ~= nil and search_caption:find("Search", 1, true) ~= nil
         and search_caption:find("results", 1, true) ~= nil, tostring(search_caption))
@@ -868,10 +951,31 @@ local ipw = UIManager._shown[#UIManager._shown]
 check("editIp(wifi) opens dialog", type(ipw) == "table")
 check("editIp(wifi) dialog is modal (paints above Home)", ipw ~= nil and ipw.modal == true, ipw and ipw.modal)
 
--- 8b. send books always land in CrossDropped Files: folder setting cannot override
-G_reader_settings:saveSetting("crossdrop_folder", "/Books")
-local forced = inst:configuredTargets()
-check("folder setting ignored (always CrossDropped Files)", forced[1].folder == "/CrossDropped Files", forced[1].folder)
+-- 8b. destination folder is user-facing since 1.3.25: crossdrop_folder is
+-- honored; nothing chosen == the CrossDropped Files default.
+G_reader_settings:saveSetting("crossdrop_folder", nil)
+check("destination defaults to CrossDropped Files",
+    inst:configuredTargets()[1].folder == "/CrossDropped Files",
+    inst:configuredTargets()[1].folder)
+inst:setFolder("My Books")
+check("setFolder persists a new name",
+    inst:configuredTargets()[1].folder == "/My Books",
+    inst:configuredTargets()[1].folder)
+check("setFolder stored under crossdrop_folder",
+    G_reader_settings:readSetting("crossdrop_folder") == "/My Books",
+    G_reader_settings:readSetting("crossdrop_folder"))
+inst:setFolder("  Plaid Books  ")
+check("setFolder trims whitespace",
+    inst:configuredTargets()[1].folder == "/Plaid Books",
+    inst:configuredTargets()[1].folder)
+inst:setFolder("")
+check("setFolder empty clears back to the default",
+    inst:configuredTargets()[1].folder == "/CrossDropped Files",
+    inst:configuredTargets()[1].folder)
+inst:setFolder("CrossDropped Files")
+check("setFolder('CrossDropped Files') restores the default",
+    inst:configuredTargets()[1].folder == "/CrossDropped Files",
+    inst:configuredTargets()[1].folder)
 
 -- 9. menu registration: CrossDrop opens the dashboard directly (no submenu)
 local menu_items = {}
@@ -926,6 +1030,32 @@ for _, tab in ipairs({ "connections", "send" }) do
     end
 end
 
+-- 11c. Send-tab breathing room (1.3.31): content is pushed DOWN off the tab
+-- bar by a sc(20) spacer, and the Send / "Currently open" / Destination
+-- folder sections of the idle view are separated by sc(18) spacers instead
+-- of being cramped together.
+UIManager._shown = {}
+inst:openHome()
+local h = UIManager._shown[#UIManager._shown]
+if h then
+    if h.tab ~= "send" then h.tab = "send"; h:init() end
+    local frame_vg = h.frame and h.frame[1]
+    local below_tab = frame_vg and frame_vg[6] and frame_vg[6].width
+    check("content sits below the tab bar (sc(20) spacer)",
+        below_tab == scal(20), tostring(below_tab))
+    local idle_vg = h:buildTabContent("send", h.row_w or 560)
+    local biggest_span = 0
+    for i = 1, #idle_vg do
+        local c = idle_vg[i]
+        if type(c) == "table" and (c.__name == "VerticalSpan" or type(c.width) == "number")
+                and type(c.width) == "number" then
+            if c.width > biggest_span then biggest_span = c.width end
+        end
+    end
+    check("idle send sections separated by a sc(18) spacer",
+        biggest_span >= scal(18), "largest span " .. tostring(biggest_span))
+end
+
 -- 11b. Home check() probes and remembers reachability (state survives swap)
 inst:openHome()
 home = UIManager._shown[#UIManager._shown]
@@ -950,25 +1080,31 @@ if home then
     check("tab switch re-inits the widget", home.frame ~= nil and home[1] ~= nil)
 end
 
--- 12. THE SEND CRASH: the progress dialog used childless FrameContainers for
--- its bar fill/track. OverlapGroup:init calls getSize() on every child at
--- build time and FrameContainer:getSize does self[1]:getSize() — childless
--- frames crashed the moment a transfer started. The bar is now LineWidgets.
+-- 12. THE SEND DIALOG: a plain "… please wait" view (NO progress bar — on this
+-- build socket.http drains the file to the TCP buffers in milliseconds, so the
+-- bar sat at 0% then jumped to done). It must build without crashing and its
+-- update() must be inert.
+local function flatten_texts(w, out)
+    out = out or {}
+    if type(w) == "table" then
+        if type(w.text) == "string" then out[#out + 1] = w.text end
+        for i = 1, #w do
+            if type(w[i]) == "table" then flatten_texts(w[i], out) end
+        end
+    end
+    return out
+end
 local ProgressMod = require("crossdrop_progress")
 local dlg = ProgressMod.new("mybook.epub", { ip = "192.168.1.50", port = 80, folder = "/CrossDropped Files" })
-check("progress dialog builds (no childless-frame crash)", type(dlg) == "table", dlg)
+check("waiting dialog builds (no crash)", type(dlg) == "table", dlg)
 if dlg then
-    check("progress bar fill is sized (LineWidget, no crash on getSize)",
-        dlg.bar_fill and dlg.bar_fill.dimen and dlg.bar_fill.dimen.w == 0)
-    local bar = dlg[1] and dlg[1][1] and dlg[1][1][1] and dlg[1][1][1][1] and dlg[1][1][1][1][3]
-    check("progress bar paints track then fill (fill on top)",
-        bar and bar[1] and bar[1].__name and bar[1].__name:match("framecontainer") and bar[2] == dlg.bar_fill,
-        tostring(bar and bar[1] and bar[1].__name))
-    dlg:update(50, 65536, 131072, 1.0)
-    check("progress update grows the fill", dlg.bar_fill.dimen.w > 0 and dlg.bar_fill.dimen.w <= dlg.bar_w,
-        dlg.bar_fill.dimen.w)
-    check("progress update repaints in place", dlg.pct_text and dlg.pct_text.text == "50%",
-        dlg.pct_text and dlg.pct_text.text)
+    local dlg_txt = table.concat(flatten_texts(dlg), "\n")
+    check("waiting dialog says please wait and carries no bar",
+        dlg_txt:find("please wait", 1, true) ~= nil
+            and dlg.bar_fill == nil and dlg.pct_text == nil and dlg.bar_w == nil,
+        dlg_txt)
+    pcall(dlg.update, dlg, 100, 131072, 131072, 1.0)
+    check("waiting dialog update is inert", dlg.bar_fill == nil and dlg.pct_text == nil)
 end
 
 -- 12b. Saving an IP must repaint the OPEN dashboard (the reported staleness
@@ -1018,6 +1154,11 @@ su_calls = {}
 inst:putFile({ ip = "192.168.1.50", port = 80, folder = "/CrossDropped Files" }, "/tmp/fakebook.epub", function() end)
 check("sends use Storefront file-size timeouts (15s block)",
     su_calls[1] and su_calls[1][1] == 15, su_calls[1] and su_calls[1][1])
+su_calls = {}
+raw_ok(CLEAN_FILES_JSON)
+inst:listFolders({ ip = "192.168.1.50", port = 80, folder = "/CrossDropped Files" })
+check("folder listing uses a 10s budget (still no 60s freeze)",
+    su_calls[1] and su_calls[1][1] == 10, su_calls[1] and su_calls[1][1])
 check("every request restores the global timeout",
     su_resets >= 2, su_resets)
 
@@ -1056,7 +1197,7 @@ check("openHome resolves siblings after restore (no module-not-found crash)",
 package.path = saved_path
 
 -- 14. THE IN-DASHBOARD TRANSFER: sendBooks sinks into the OPEN Home dialog,
--- which repaints its OWN Send tab in place (connecting → live bar → done) —
+-- which repaints its OWN Send tab in place (connecting → waiting → done) —
 -- nothing closes between picking, connecting, transferring, and sending more.
 UIManager._shown = {}
 inst:openHome()
@@ -1066,6 +1207,25 @@ local ok_batch = inst:sendBooks({ "/tmp/fakebook.epub", "/tmp/fakebook2.epub" },
 check("in-dashboard batch sends every book", ok_batch == true)
 check("home ends in the done state", home.send_state == "done", home.send_state)
 check("state change repaints with a flushing FULL refresh (e-ink)",
+    UIManager.last_dirty == "full", tostring(UIManager.last_dirty))
+-- 1.3.32: fewer flashes. "Connecting…" and MID-batch file starts repaint with
+-- a flash-free partial (the next full transition always catches up), so only
+-- the first file start and the final done/failed boundary flash.
+UIManager.last_dirty = nil
+home:onConnecting()
+check("connecting hint repaints without a flash (partial)",
+    UIManager.last_dirty == "partial", tostring(UIManager.last_dirty))
+UIManager.last_dirty = nil
+home.onBeginFile(home, "/tmp/fakebook.epub", { ip = "192.168.1.50", port = 80 }, 2, 3)
+check("mid-batch file start repaints without a flash (partial)",
+    UIManager.last_dirty == "partial", tostring(UIManager.last_dirty))
+UIManager.last_dirty = nil
+home.onBeginFile(home, "/tmp/fakebook.epub", { ip = "192.168.1.50", port = 80 }, 1, 3)
+check("first file start keeps a flushing full refresh",
+    UIManager.last_dirty == "full", tostring(UIManager.last_dirty))
+UIManager.last_dirty = nil
+home:onDone(true)
+check("done still flashes full (e-ink)",
     UIManager.last_dirty == "full", tostring(UIManager.last_dirty))
 check("home stays open the whole time", inst.home == home)
 check("home rendered the sent-books list", #home.send_file_list == 2, #home.send_file_list)
@@ -1112,6 +1272,17 @@ check("reach marks the connection down",
 FAKE.fail = false
 
 -- renderers for every send state build without crashing and stay in-screen
+home.send_state = "sending"
+home.send_index, home.send_total = 1, 1
+home.send_filename = "A.epub"
+home.send_target = { ip = "192.168.1.50", port = 80, folder = "/CrossDropped Files" }
+home:init()
+check("sending state renders (no crash)", home.frame ~= nil and home.frame:getSize().w <= SCREEN_W)
+local sending_txt = table.concat(flatten_texts(home:buildTabContent("send", home.row_w)), "\n")
+check("sending view says please wait and has no bar",
+    sending_txt:find("please wait", 1, true) ~= nil
+        and not sending_txt:find("0%", 1, true),
+    sending_txt)
 home.send_state = "connecting"
 home:init()
 check("connecting state renders", home.frame ~= nil and home.frame:getSize().w <= SCREEN_W)
@@ -1125,19 +1296,9 @@ home:init()
 check("failed state renders", home.frame ~= nil and home.frame:getSize().w <= SCREEN_W)
 
 -- 14b. APP CLEANUP: the Send tab is minimal — one pick button, "Currently
--- open" only when a book is actually open, no Destination/Check-device section
--- (the Connections tab owns the destination), and the title bar carries just
--- the app title (no "folder → WiFi" subtitle).
-local function flatten_texts(w, out)
-    out = out or {}
-    if type(w) == "table" then
-        if type(w.text) == "string" then out[#out + 1] = w.text end
-        for i = 1, #w do
-            if type(w[i]) == "table" then flatten_texts(w[i], out) end
-        end
-    end
-    return out
-end
+-- open" only when a book is actually open, a Destination folder row (the
+-- reader-folder chooser), and the title bar carries just the app title (no
+-- "folder → WiFi" subtitle).
 UIManager._shown = {}
 inst:openHome()
 home = UIManager._shown[#UIManager._shown]
@@ -1147,9 +1308,14 @@ check("pick button reads Click Here To Select Book(s)",
     idle_joined:find("Click Here To Select Book(s)", 1, true) ~= nil, idle_joined)
 check("Send tab header above the picker reads Send one or more books",
     idle_joined:find("Send one or more books", 1, true) ~= nil, idle_joined)
-check("Send tab no longer repeats the destination (it is on Connections)",
-    not idle_joined:match("Destination") and not idle_joined:find("Check device", 1, true),
+check("Send tab shows the destination folder row (default CrossDropped Files)",
+    idle_joined:find("Destination folder", 1, true) ~= nil
+        and idle_joined:find("CrossDropped Files", 1, true) ~= nil,
     idle_joined)
+check("Send tab carries no Check device section",
+    not idle_joined:find("Check device", 1, true), idle_joined)
+check("Send tab carries no WiFi hint text",
+    not idle_joined:find("Send uses the WiFi", 1, true), idle_joined)
 check("Currently open shown when a book is open",
     idle_joined:find("Currently open", 1, true) ~= nil, idle_joined)
 inst.ui.document = nil
@@ -1178,6 +1344,99 @@ check("connections tab shows the Xteink setup instructions",
         and conn_joined:find("Reachable", 1, true) ~= nil,
     conn_joined)
 
+-- 14c. FOLDER LISTING: GET /api/files → top-level folders only, sorted; raw
+-- chunked framing is dechunked; a dead reader, a garbage body or an empty IP
+-- fails cleanly instead of raising.
+G_reader_settings:saveSetting("crossdrop_wifi_ip", "10.1.2.3")
+raw_ok(CLEAN_FILES_JSON)
+local lf_ok, lf = inst:listFolders(inst:resolveTarget())
+local lf_set = {}
+for _, n in ipairs(lf or {}) do lf_set[n] = true end
+check("listFolders returns only directories (sorted)",
+    lf_ok and lf[1] == "Books" and lf[2] == "CrossDropped Files" and lf[3] == "sleep" and #lf == 3,
+    lf_ok and table.concat(lf, ","))
+check("listFolders skips file entries",
+    lf_ok and lf_set["MyBook.epub"] == nil, "file entry leaked")
+raw_ok(RAW_CHUNKED_FILES)
+local lfc_ok, lfc = inst:listFolders(inst:resolveTarget())
+local lfc_set = {}
+for _, n in ipairs(lfc or {}) do lfc_set[n] = true end
+check("listFolders decodes a chunked transfer-encoding body",
+    lfc_ok and #lfc == 3 and lfc_set["Books"]
+        and lfc_set["sleep"] and lfc_set["CrossDropped Files"],
+    lfc_ok and table.concat(lfc, ","))
+raw_ok("this is not json at all")
+local lfg_ok, lfg_err = inst:listFolders(inst:resolveTarget())
+check("listFolders fails cleanly on a non-JSON body",
+    lfg_ok == nil and tostring(lfg_err) ~= "", tostring(lfg_err))
+FAKE.fail = true
+raw_ok(CLEAN_FILES_JSON)
+local lf2_ok, lf2_err = inst:listFolders(inst:resolveTarget())
+check("listFolders fails cleanly when the reader is down",
+    lf2_ok == nil and tostring(lf2_err) ~= "", tostring(lf2_err))
+FAKE.fail = false
+G_reader_settings:saveSetting("crossdrop_wifi_ip", nil)
+local lf3_ok, lf3_err = inst:listFolders(inst:resolveTarget())
+check("listFolders guards the empty IP",
+    lf3_ok == nil and tostring(lf3_err):find("WiFi IP not set", 1, true) ~= nil, tostring(lf3_err))
+G_reader_settings:saveSetting("crossdrop_wifi_ip", "10.1.2.3")
+
+-- 14d. DESTINATION DIALOG: reached from the Send tab, lists the reader's
+-- folders, and a pick persists. A failed listing still leaves the typed-name
+-- and default choices usable; an unset IP just shows the hint.
+inst:setFolder("CrossDropped Files")
+raw_ok(CLEAN_FILES_JSON)
+UIManager._shown = {}
+inst:openHome()
+home = UIManager._shown[#UIManager._shown]
+home:chooseDestination()
+local dlg = UIManager._shown[#UIManager._shown]
+check("chooseDestination opens the folder dialog",
+    dlg ~= nil and type(dlg) == "table", dlg and tostring(dlg.__name))
+check("folder dialog lists the reader folders",
+    dlg and dlg.folders and dlg.folders[1] == "Books"
+        and dlg.folders[2] == "CrossDropped Files" and dlg.folders[3] == "sleep",
+    dlg and dlg.folders and table.concat(dlg.folders, ","))
+check("folder dialog renders a full-screen card",
+    dlg and dlg.frame ~= nil and dlg.frame:getSize().w <= SCREEN_W,
+    dlg and dlg.frame and dlg.frame:getSize().w)
+dlg:pick("Books")
+check("picking a folder saves it",
+    inst:configuredTargets()[1].folder == "/Books",
+    inst:configuredTargets()[1].folder)
+check("picking a folder refreshes the dashboard in place",
+    UIManager.last_dirty == "partial", tostring(UIManager.last_dirty))
+FAKE.fail = true
+inst:setFolder("CrossDropped Files")
+UIManager._shown = {}
+inst:openHome()
+home = UIManager._shown[#UIManager._shown]
+home:chooseDestination()
+dlg = UIManager._shown[#UIManager._shown]
+check("failed listing shows the error but keeps the dialog usable",
+    dlg ~= nil and dlg.folders == nil and tostring(dlg.list_err) ~= "",
+    dlg and tostring(dlg.list_err))
+local dlg_flat = table.concat(flatten_texts(dlg.frame), "\n")
+check("failed listing offers a retry in the dialog",
+    dlg_flat:find("Retry listing", 1, true) ~= nil, dlg_flat)
+dlg:pick("New Novels")
+check("typed destination saves even when the reader is down",
+    inst:configuredTargets()[1].folder == "/New Novels",
+    inst:configuredTargets()[1].folder)
+FAKE.fail = false
+inst:setFolder("CrossDropped Files")
+G_reader_settings:saveSetting("crossdrop_wifi_ip", nil)
+UIManager._shown = {}
+inst:openHome()
+home = UIManager._shown[#UIManager._shown]
+home:chooseDestination()
+local dlg_msg = UIManager._shown[#UIManager._shown]
+check("unset IP shows the Set WiFi IP hint instead of the dialog",
+    dlg_msg ~= nil and type(dlg_msg.text) == "string"
+        and dlg_msg.text:find("WiFi IP", 1, true) ~= nil,
+    dlg_msg and dlg_msg.text)
+G_reader_settings:saveSetting("crossdrop_wifi_ip", "10.1.2.3")
+
 -- 15. IP PERSISTENCE: the WiFi IP lives in KOReader's global settings; in
 -- this plugin it is only ever written by the Set WiFi IP dialog.
 -- A "restart" (fresh instance) must read it back exactly.
@@ -1192,6 +1451,11 @@ check("wifi IP change survives a restart",
     inst_r2:configuredTargets()[1].ip == "192.168.5.1", inst_r2:configuredTargets()[1].ip)
 check("port survives a restart",
     inst_r2:configuredTargets()[1].port == 80, inst_r2:configuredTargets()[1].port)
+G_reader_settings:saveSetting("crossdrop_folder", "/My Books")
+check("folder survives a restart",
+    inst_r2:configuredTargets()[1].folder == "/My Books",
+    inst_r2:configuredTargets()[1].folder)
+G_reader_settings:saveSetting("crossdrop_folder", nil)
 G_reader_settings:saveSetting("crossdrop_wifi_ip", nil)
 local inst_r3 = CROSSDROP:new{ ui = ui_r }
 check("empty wifi stays unset (wifi-only, no fallback)",

@@ -15,11 +15,18 @@
 --
 -- E-INK REPAINT RULE (the issue that hid the whole flow on the device):
 -- when one of these callbacks flips the send STATE (connecting / sending a
--- file / done / failed) it does a flashing FULL refresh — bare forceRePaint()
--- partials over a whole-screen white card were being swallowed by the panel,
--- so the transfer ran to completion with the screen still showing the old
--- tab. Progress-while-streaming (onProgress) stays a partial repaint so it
--- never flashes every chunk; only the per-file/state boundaries flash.
+-- file / done / failed) it does a full refresh — bare forceRePaint() partials
+-- over a whole-screen white card were being swallowed by the panel, so the
+-- transfer ran to completion with the screen still showing the old tab.
+-- Not every transition flashes though: the "Connecting…" hint and MID-batch
+-- file starts repaint WITHOUT a flash (repaintSoft, "partial") — a reachable
+-- target answers the probe in milliseconds so its full flash would be wasted,
+-- and mid-batch the screen is already showing Sending. Only the first file
+-- start and the final done/failed boundary do the flashing full refresh
+-- (repaintNow), and if an early partial happens to be swallowed the next full
+-- always lands, so a soft repaint can never leave a stale screen.
+-- There is no per-chunk repaint at all now: the "Sending…" view is a plain
+-- waiting screen (the transfer drains faster than e-ink can repaint),
 --
 -- Uses only the plugin API exported from main.lua:
 --   configuredTargets() -> {kind, ip, port, folder}[]  (WiFi only)
@@ -87,6 +94,12 @@ local function folder_str(t)
     return folder
 end
 
+-- Display name of a folder path: "/CrossDropped Files" → "CrossDropped Files".
+local function folder_basename(path)
+    local base = tostring(path or ""):match("([^/]+)/*$")
+    return (base and base ~= "") and base or "CrossDropped Files"
+end
+
 local function status_word(reach)
     if reach == "ok" then return _("Reachable \226\151\128") end    -- ●
     if reach == "down" then return _("Offline \226\151\138") end    -- ○
@@ -109,7 +122,7 @@ local HomeDialog = InputContainer:extend{
     send_path = nil,      -- path of the file currently being sent
     send_filename = nil,  -- basename of send_path (for display)
     send_file_list = {},  -- basenames of files sent so far
-    send_widgets = nil,   -- live {bar_w, fill, pct, meta} during "sending"
+    send_widgets = nil,   -- reserved: the progress bar was removed (e-ink), onProgress is inert
     fail_reason = nil,    -- text shown on "failed"
 }
 
@@ -161,7 +174,7 @@ function HomeDialog:init()
             self:buildLogo(inner_w, sc),
             VerticalSpan:new{ width = sc(8) },
             self:buildTabBar(inner_w),
-            VerticalSpan:new{ width = sc(6) },
+            VerticalSpan:new{ width = sc(20) },
             content,
             VerticalSpan:new{ width = sc(8) },
         },
@@ -302,7 +315,7 @@ function HomeDialog:buildTabContent(tab, width)
         return self:renderSendConnecting()
     end
     if self.send_state == "sending" then
-        return self:renderSendProgress()
+        return self:renderSendWaiting()
     end
     if self.send_state == "done" then
         return self:renderSendDone()
@@ -397,7 +410,7 @@ function HomeDialog:renderConnections()
             .. _("3. On that screen, the device's IP address is below the QR code.\n")
             .. _("4. Tap \"Set WiFi IP\" to enter that address.\n")
             .. _("5. Then tap the connection row above to check \226\128\148 it should read \"Reachable\" when connected.\n")
-            .. _("6. Send from the Send A Book tab: pick books from the list, or send the currently open book. Books land in the CrossDropped Files folder on the reader.")
+            .. _("6. Send from the Send A Book tab: pick books from the list, or send the currently open book. Pick the destination folder there too \226\128\148 it defaults to CrossDropped Files on the reader.")
             .. "\n\nCrossDrop " .. tostring((self.plugin and self.plugin.VERSION) or ""),
         face = Font:getFace("smallinfofont"),
         width = self.row_w,
@@ -408,11 +421,12 @@ end
 
 -- ─────────────────────────── Send tab ───────────────────────────────────
 
--- Idle: pick books, or send the one that is open (and only shown when it is).
--- The destination lives on the Connections tab: nothing here repeats it.
+-- Idle: pick books, or send the one that is open (and only shown when it is),
+-- plus a Destination folder row that lists the reader's folders or takes a
+-- typed-in name (the CrossDropped Files default when nothing is chosen).
 function HomeDialog:renderSendIdle()
     local vg = VerticalGroup:new{ align = "left" }
-    local reach = self.plugin._reach or {}
+    local sc = function(v) return Device.screen:scaleBySize(v) end
     local book = self.plugin:currentBookPath()
 
     table.insert(vg,self:header(_("Send one or more books")))
@@ -421,8 +435,10 @@ function HomeDialog:renderSendIdle()
     }))
 
     -- "Currently open" only appears when there IS an open book (no empty
-    -- placeholder header when nothing is open).
+    -- placeholder header when nothing is open). Both book sections breathe
+    -- with a spacer so the Destination folder block sits clearly apart.
     if book and book ~= "" then
+        table.insert(vg, VerticalSpan:new{ width = sc(18) })
         local name = book:match("([^/]+)$") or book
         local size = file_size(book)
         table.insert(vg,self:header(_("Currently open")))
@@ -433,15 +449,226 @@ function HomeDialog:renderSendIdle()
         }))
     end
 
-    if reach.wifi ~= "ok" then
-        table.insert(vg,TextBoxWidget:new{
-            text = _("Send uses the WiFi connection \226\128\148 set or check it on the Connections tab."),
+    -- Destination folder: shows which reader folder books land in. Always
+    -- available (even offline) — picking a listed folder or typing a new name
+    -- only needs the reader when a send later creates/uses it.
+    table.insert(vg, VerticalSpan:new{ width = sc(18) })
+    local target = self.plugin:resolveTarget()
+    local dest_name = folder_basename(target and target.folder)
+    table.insert(vg, self:header(_("Destination folder")))
+    table.insert(vg, self:row(
+        string.format("%s\n%s  \226\128\164  tap to choose",
+            dest_name, _("folder on the reader")), {
+        callback = function() self:chooseDestination() end,
+    }))
+
+    return vg
+end
+
+-- ─────────────────────── destination folder picker ──────────────────────
+-- A full-screen modal (the dashboard's own full-screen look, like the picker:
+-- TitleBar + "menu_style" Button rows on a white card — this device renders
+-- NO other widget language). Lists the reader's folders (/api/files), lets
+-- the user type a brand-new name, or fall back to the CrossDropped Files
+-- default. Network problems never trap the dialog: a failed listing just
+-- hides the folder rows and the typed/default choices still work.
+
+local DestinationDialog = InputContainer:extend{
+    modal = true,
+    dismissable = false,
+    plugin = nil,     -- CROSSDROP instance (setFolder)
+    home = nil,       -- the HomeDialog to refresh after a pick
+    folders = nil,    -- sorted folder names, or nil when the listing failed
+    list_err = nil,   -- why the listing failed (shown when folders == nil)
+}
+
+function DestinationDialog:pick(path)
+    if self.plugin.setFolder then
+        self.plugin:setFolder(path)
+    end
+    UIManager:close(self)
+    if self.home and self.home.refresh then
+        self.home:refresh()
+    end
+end
+
+function DestinationDialog:init()
+    local sc = function(v) return Device.screen:scaleBySize(v) end
+    local sw = Device.screen:getWidth()
+    local sh = Device.screen:getHeight()
+    self.dimen = Geom:new{ w = sw, h = sh }
+    local pad = Size.padding.default
+    local inner_w = sw - pad * 2
+    self.row_w = inner_w
+
+    local title_bar = TitleBar:new{
+        width = inner_w,
+        title = _("Destination folder"),
+        fullscreen = false,
+        with_bottom_line = true,
+        close_callback = function() UIManager:close(self) end,
+        show_parent = self,
+    }
+
+    local vg = VerticalGroup:new{ align = "left" }
+    local current = self.plugin:resolveTarget()
+    local current_name = folder_basename(current and current.folder)
+
+    if self.folders and #self.folders > 0 then
+        table.insert(vg, self:foldersHeader(_("Folders on the reader")))
+        for _idx, name in ipairs(self.folders) do
+            local label = name
+            if name == current_name then
+                label = "\226\151\128  " .. name .. "   (" .. _("current") .. ")"
+            end
+            table.insert(vg, self:row(label, function() self:pick(name) end))
+        end
+    elseif self.list_err then
+        table.insert(vg, self:foldersHeader(_("Could not read the folders")))
+        table.insert(vg, TextBoxWidget:new{
+            text = _("The reader did not answer (") .. tostring(self.list_err) .. ").\n"
+                .. _("Tap Retry below, or type a new folder name \226\128\148 it is created on the reader when a book is sent."),
             face = Font:getFace("smallinfofont"),
             width = self.row_w,
         })
+        table.insert(vg, self:row(_("Retry listing the folders"), function()
+            UIManager:close(self)
+            if self.home and self.home.chooseDestination then
+                self.home:chooseDestination()
+            end
+        end))
     end
 
-    return vg
+    table.insert(vg, self:foldersHeader(_("New custom folder")))
+    table.insert(vg, self:row(_("Type a new folder name\226\128\166"), function() self:askNewName() end))
+    table.insert(vg, self:foldersHeader(_("Default")))
+    table.insert(vg, self:row(_("CrossDropped Files (back to the default)"), function() self:pick("CrossDropped Files") end))
+
+    local frame = FrameContainer:new{
+        dimen = Geom:new{ w = sw, h = sh },
+        width = sw,
+        height = sh,
+        bordersize = 0,
+        background = Blitbuffer.COLOR_WHITE,
+        padding = pad,
+        VerticalGroup:new{
+            align = "left",
+            title_bar,
+            VerticalSpan:new{ width = sc(8) },
+            vg,
+        },
+    }
+    self.frame = frame
+    self[1] = frame
+    if Device:hasKeys() then
+        self.key_events.Back = { { Device.input.group.Back } }
+    end
+end
+
+function DestinationDialog:onBack()
+    UIManager:close(self)
+    return true
+end
+
+function DestinationDialog:foldersHeader(text)
+    local sc = function(v) return Device.screen:scaleBySize(v) end
+    return FrameContainer:new{
+        padding_top = sc(6),
+        padding_bottom = sc(2),
+        bordersize = 0,
+        TextWidget:new{
+            text = text,
+            face = Font:getFace("smallinfofont"),
+        },
+    }
+end
+
+function DestinationDialog:row(text, callback)
+    return Button:new{
+        text = text,
+        menu_style = true,
+        width = self.row_w,
+        callback = callback,
+    }
+end
+
+-- Type a brand-new folder name (the InputDialog recipe editIp/SEARCH use).
+function DestinationDialog:askNewName()
+    local InputDialog = require("ui/widget/inputdialog")
+    local dialog = self
+    local current = dialog.plugin:resolveTarget()
+    local current_name = folder_basename(current and current.folder)
+    local new_dialog
+    new_dialog = InputDialog:new{
+        title = _("New destination folder"),
+        input = current_name,
+        input_hint = _("One folder name \226\128\148 it is created on the reader when a book is sent"),
+        type = "text",
+        modal = true,
+        buttons = {
+            {
+                {
+                    text = _("Save"),
+                    is_enter_default = true,
+                    callback = function()
+                        local text = new_dialog:getInputText() or ""
+                        local name = text:match("^%s*(.-)%s*$") or ""
+                        if name == "" then
+                            UIManager:show(Notification:new{ text = _("Enter a folder name first."), timeout = 3 })
+                            return
+                        end
+                        if name:find("/") then
+                            UIManager:show(Notification:new{ text = _("One folder name only \226\128\148 no slashes."), timeout = 3 })
+                            return
+                        end
+                        if name == "." or name == ".." then
+                            UIManager:show(Notification:new{ text = _("That is not usable as a folder name."), timeout = 3 })
+                            return
+                        end
+                        UIManager:close(new_dialog)
+                        dialog:pick(name)
+                    end,
+                },
+            },
+            {
+                {
+                    text = _("Cancel"),
+                    callback = function() UIManager:close(new_dialog) end,
+                },
+            },
+        },
+    }
+    UIManager:show(new_dialog)
+end
+
+-- Open the destination dialog. One bounded listing attempt (5s socketutil)
+-- happens first with a "Looking up…" notice; a failure only removes the
+-- folder rows, everything else stays usable.
+function HomeDialog:chooseDestination()
+    local InfoMessage = require("ui/widget/infomessage")
+    local target = self.plugin:resolveTarget()
+    if not target or not target.ip or target.ip == "" then
+        UIManager:show(InfoMessage:new{
+            text = _("Set the WiFi IP on the Connections tab first."),
+        })
+        return
+    end
+    local checking = Notification:new{ text = _("Looking up folders\226\128\166"), timeout = 0 }
+    UIManager:show(checking)
+    UIManager:forceRePaint()
+    local ok, folders, err = self.plugin:listFolders(target)
+    UIManager:close(checking)
+    -- "ui" refresh type, exactly like openHome/chooseAndSend: a bare show()
+    -- leaves the refresh to chance when a full-screen modal is already up —
+    -- which read as the dialog rendering "behind" the dashboard. This forces
+    -- it to paint on top.
+    UIManager:show(DestinationDialog:new{
+        plugin = self.plugin,
+        home = self,
+        folders = ok and folders or nil,
+        list_err = ok and nil or tostring(err or "unknown error"),
+    }, "ui")
+    UIManager:forceRePaint()
 end
 
 -- ─────────────── in-dashboard send: the progress sink ─────────────────────
@@ -472,9 +699,21 @@ function HomeDialog:repaintNow()
     UIManager:forceRePaint()
 end
 
+-- FLASH-FREE variant (1.3.32): rebuilds and repaints in place WITHOUT the
+-- full-refresh flash. Used where the change is almost always followed a frame
+-- later by a real full transition: the "Connecting…" hint (reachable targets
+-- reply in milliseconds) and MID-batch file starts (the screen is already
+-- showing Sending). If the panel swallows the partial, the next full always
+-- lands, so a soft repaint can never leave a stale screen.
+function HomeDialog:repaintSoft()
+    self:init()
+    UIManager:setDirty(self, "partial")
+    UIManager:forceRePaint()
+end
+
 function HomeDialog:onConnecting()
     self.send_state = "connecting"
-    self:repaintNow()
+    self:repaintSoft()
 end
 
 function HomeDialog:onConnected(target)
@@ -495,7 +734,14 @@ function HomeDialog:onBeginFile(path, target, idx, total)
     self.send_index = idx
     self.send_total = total
     self.send_widgets = nil
-    self:repaintNow()
+    -- First file start flashes (the real transition into Sending); MID-batch
+    -- file starts only soft-repaint (the screen already shows Sending and a
+    -- flash per file would make multi-book batches strobe).
+    if idx and idx > 1 then
+        self:repaintSoft()
+    else
+        self:repaintNow()
+    end
     local top = UIManager._window_stack
         and UIManager._window_stack[#UIManager._window_stack]
         and UIManager._window_stack[#UIManager._window_stack].widget
@@ -600,10 +846,11 @@ function HomeDialog:renderSendConnecting()
     return vg
 end
 
--- Live transfer: the same LineWidget bar + forceRePaint recipe the standalone
--- progress dialog used, but rendered as one of THIS dashboard's tabs — nothing
--- sits on top of CrossDrop while a book streams.
-function HomeDialog:renderSendProgress()
+-- Sending: NO progress bar. socket.http hands the whole file to the TCP
+-- buffers in milliseconds, so a bar would sit at 0% then jump straight to
+-- done — worse than useless. This paints once at transfer start and the
+-- device reply flips the tab to Done; onProgress stays inert.
+function HomeDialog:renderSendWaiting()
     local sc = function(v) return Device.screen:scaleBySize(v) end
     local vg = VerticalGroup:new{ align = "left" }
     local inner_w = self.row_w
@@ -618,63 +865,22 @@ function HomeDialog:renderSendProgress()
         max_width = inner_w,
     })
     local target = self.send_target
-    local subt
     if target then
-        subt = string.format("%s  %s  \226\134\146  %s",
-            _("WiFi"),
-            ip_str(target), folder_str(target))
-    else
-        subt = ""
+        table.insert(vg, TextWidget:new{
+            text = string.format("%s  %s  \226\134\146  %s",
+                _("WiFi"),
+                ip_str(target), folder_str(target)),
+            face = Font:getFace("smallinfofont"),
+            max_width = inner_w,
+        })
     end
-    table.insert(vg, VerticalSpan:new{ width = sc(2) })
-    table.insert(vg, TextWidget:new{
-        text = subt,
+
+    table.insert(vg, VerticalSpan:new{ width = sc(12) })
+    table.insert(vg, TextBoxWidget:new{
+        text = _("… please wait\n\nThe reader is writing to its card."),
         face = Font:getFace("smallinfofont"),
-        max_width = inner_w,
+        width = inner_w,
     })
-
-    local bar_w = inner_w
-    local bar_h = sc(16)
-    local border_w = Size.border.window or 1
-    local fill = LineWidget:new{
-        dimen = Geom:new{ w = 0, h = bar_h },
-        background = Blitbuffer.COLOR_BLACK,
-    }
-    local track = FrameContainer:new{
-        dimen = Geom:new{ w = bar_w, h = bar_h },
-        bordersize = border_w,
-        color = Blitbuffer.COLOR_DARK_GRAY,
-        background = Blitbuffer.COLOR_LIGHT_GRAY,
-        padding = 0,
-        LineWidget:new{
-            dimen = Geom:new{ w = bar_w - border_w * 2, h = bar_h - border_w * 2 },
-            background = Blitbuffer.COLOR_LIGHT_GRAY,
-        },
-    }
-    -- Track FIRST, fill LAST (OverlapGroup paints children in order).
-    local bar = OverlapGroup:new{
-        dimen = Geom:new{ w = bar_w, h = bar_h },
-        track,
-        fill,
-    }
-    local pct = TextWidget:new{
-        text = "0%",
-        face = Font:getFace("cfont", 20),
-        bold = true,
-    }
-    local meta = TextWidget:new{
-        text = "",
-        face = Font:getFace("smallinfofont"),
-        max_width = inner_w,
-    }
-    self.send_widgets = { bar_w = bar_w, fill = fill, pct = pct, meta = meta }
-
-    table.insert(vg, VerticalSpan:new{ width = sc(14) })
-    table.insert(vg, bar)
-    table.insert(vg, VerticalSpan:new{ width = sc(8) })
-    table.insert(vg, pct)
-    table.insert(vg, VerticalSpan:new{ width = sc(2) })
-    table.insert(vg, meta)
 
     return vg
 end

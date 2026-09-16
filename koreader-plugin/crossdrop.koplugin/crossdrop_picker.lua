@@ -12,9 +12,9 @@
 -- alphabetical "every book on this device" list — pick any of them without
 -- navigating folders.
 --
--- Screen layout (one cohesive style: every row the same font, every button a
--- framed box, hairline separators between rows, every interactive thing a
--- proper button):
+-- Screen layout (one cohesive style: every row the same font; action rows are
+-- framed boxes, book rows are bare text separated by hairline rules; every
+-- interactive thing a proper button):
 --
 --   TitleBar: "Send A Book" + "N books — tap to pick; the top row sends"
 --   [Send to Xteink — send N book(s) now]  (dark button: THE action)
@@ -23,7 +23,8 @@
 --   Search "treis" — 4 results            (only while a filter is active)
 --   [Clear search]                        (only while a filter is active)
 --   ─────────────
---   [book row]  ───────────── [book row] ───────────── …
+--   book title                          (no box — hairlines only)
+--   ───────────── book title ───────────── …
 --   ─────────────
 --   Page X of Y                       (caption, not a control)
 --   [Previous page] [Next page]        (only the ones that apply)
@@ -663,14 +664,15 @@ end
 -- it on, Button shrinks the font (down to a 2-line TextBoxWidget) for any
 -- title too wide for the row, so long and short titles rendered at visibly
 -- different sizes. Off, every row keeps font 22 and a too-long title is
--- truncated instead. Every row is a framed box (a real border).
+-- truncated instead. Action rows are framed boxes (a real border); book rows
+-- pass bordersize = 0 so the list shows as bare text separated by hairlines.
 function PickerDialog:row(text, opts)
     opts = opts or {}
     return Button:new{
         text = text,
         width = self.row_w,
         align = "left",
-        bordersize = Size.border.button,
+        bordersize = opts.bordersize or Size.border.button,
         avoid_text_truncation = false,
         padding_h = Size.padding.large,
         text_font_face = "smallinfofont",
@@ -761,6 +763,7 @@ function PickerDialog:buildContent()
             size_str .. (picked and _("  \226\128\148 picked, tap to un-pick")
                 or _("  \226\128\148 tap to pick"))
         table.insert(vg, self:row(text, {
+            bordersize = 0,
             background = picked and Blitbuffer.COLOR_LIGHT_GRAY or nil,
             callback = function() self:toggle(e.path) end,
         }))

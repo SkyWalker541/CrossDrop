@@ -6,11 +6,14 @@ dashboard and can hand the currently open book to the reader over the local
 network. It uses only the built-in web-server endpoints — no custom firmware:
 
     GET   /api/status          device info + connection test
-    MKCOL /CrossDropped Files  create the fixed destination folder if needed
-    PUT   /CrossDropped Files/<file>   stream the book, chunk by chunk
+    GET   /api/files           list folders on the reader (destination picker)
+    MKCOL /<folder>            create the destination folder if needed
+    PUT   /<folder>/<file>     stream the book, chunk by chunk
 
-Every transfer lands in the fixed **CrossDropped Files** folder on the reader's
-SD card — there is no folder picker, nothing to configure.
+The destination folder is optional: the Send A Book tab can list the
+reader's folders (/api/files), or take a typed-in name. Whatever the
+choice, it is MKCOL-created before the first send. Nothing chosen == the
+**CrossDropped Files** default, so a bare install keeps the old behavior.
 
 One connection is supported, matching the reader's File Transfer mode:
 
@@ -20,13 +23,11 @@ Its stored IP is set on the Connections tab. Sending a book probes it and
 streams the book to the reader over the shared Wi-Fi network. (The reader's
 "Create Hotspot" mode was dropped: it never worked reliably.)
 
-On the reader side, the matching "CrossDrop" SD plugin (the `crossdrop-plugin`
-folder on the SD card) is a setup-guide screen (Settings → System → Plugins).
-
 Pure LuaSocket (part of KOReader) — no external dependencies, and the file is
 streamed chunk-by-chunk from disk so devices with little RAM (like a Kindle)
-can send books of any size. The transfer progress dialog repaints live while
-the chunks stream (the same forceRePaint technique the Storefront plugin uses).
+can send books of any size. A waiting dialog shows while the chunks stream
+(progress bars never render on this e-ink build — the transfer drains faster
+than the panel can repaint, so a bar just sat at 0% then jumped to done).
 ]]
 
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
@@ -41,7 +42,7 @@ local _ = require("gettext")
 
 local DEFAULT_FOLDER = "/CrossDropped Files"
 
--- UI extras (toast, live progress, full-screen Home) are sibling modules in
+-- UI extras (toast, waiting dialog, full-screen Home) are sibling modules in
 -- this plugin folder. They must be required at plugin load (the Storefront
 -- pattern), because PluginLoader puts this folder on package.path only for the
 -- duration of loading main.lua and restores it afterwards: a lazy bare require
@@ -63,7 +64,7 @@ local CROSSDROP = WidgetContainer:extend{
     -- Shown on the dashboard's Connections tab so the running build is
     -- always identifiable on the device (KOReader loads plugins once at
     -- startup — a replaced plugin file does nothing until restart).
-    VERSION = "1.3.24",
+    VERSION = "1.3.32",
 }
 
 local socket, http
@@ -207,12 +208,15 @@ function CROSSDROP:req(method, url, headers, source_fn, timeout)
 end
 
 -- The single connection in send order: WiFi (the reader's File Transfer →
--- Join Network address). It always targets the fixed CrossDropped Files
--- folder on the reader's card. The IP is empty until the user sets it.
+-- Join Network address). Its destination folder comes from the Send A Book
+-- tab (crossdrop_folder) and falls back to the CrossDropped Files default.
+-- The IP is empty until the user sets it.
 function CROSSDROP:configuredTargets()
     local port = tonumber(G_reader_settings:readSetting("crossdrop_port") or 80) or 80
+    local dest = G_reader_settings:readSetting("crossdrop_folder")
+    local folder = (dest and dest ~= "") and dest or DEFAULT_FOLDER
     return {
-        { kind = "wifi", ip = wifiIp() or "", port = port, folder = DEFAULT_FOLDER },
+        { kind = "wifi", ip = wifiIp() or "", port = port, folder = folder },
     }
 end
 
@@ -271,6 +275,149 @@ function CROSSDROP:saveTarget(target)
     if target.port then
         G_reader_settings:saveSetting("crossdrop_port", target.port)
     end
+end
+
+-- Save the destination folder name (crossdrop_folder, settings.reader.lua).
+-- Stored with a leading "/" like the default; the name is trimmed and stript
+-- of slashes the user typed around it. An empty name clears the preference
+-- (back to the CrossDropped Files default).
+function CROSSDROP:setFolder(name)
+    name = (tostring(name or ""):match("^%s*(.-)%s*$") or "")
+        :gsub("^/+", ""):gsub("/+$", "")
+    if name == "" or name == "." or name == ".." then
+        G_reader_settings:saveSetting("crossdrop_folder", nil)
+        return
+    end
+    G_reader_settings:saveSetting("crossdrop_folder", "/" .. name)
+end
+
+-- Strip HTTP chunked-transfer framing (the reader streams /api/files in tiny
+-- chunks: "1CRLF[CRLF…" with no Content-Length; the device's socket.http does
+-- not decode it, so the raw framing reaches JSON.decode verbatim). Reassembles
+-- the payload up to the 0-size chunk, ignoring trailers. Returns nil if the
+-- body is not a well-formed chunked stream (e.g. a truncated read).
+local function dechunk(body)
+    if type(body) ~= "string" or body == "" then return nil end
+    local out, pos, n = {}, 1, #body
+    while pos <= n do
+        local size_s = body:match("((%x+)[^%c]*\r\n)", pos)
+        if not size_s then return nil end
+        pos = pos + #size_s
+        local bytes = tonumber(size_s:match("^(%x+)"), 16)
+        if not bytes then return nil end
+        if bytes == 0 then
+            return table.concat(out)
+        end
+        if pos + bytes > n then return nil end
+        out[#out + 1] = body:sub(pos, pos + bytes - 1)
+        pos = pos + bytes
+        if body:sub(pos, pos + 1) ~= "\r\n" then return nil end
+        pos = pos + 2
+    end
+    return nil
+end
+
+-- Read an HTTP response body over a plain socket. socket.http on this build
+-- returns only the FIRST LINE of a multi-line GET body (single-line /api/status
+-- parses, but /api/files came back as just "1"), so the folder listing reads a
+-- raw socket instead and splits headers / dechunks / decodes itself. The whole
+-- read runs under socketutil's bounded timeouts (no 60s socket.http freeze).
+-- Returns (true, code, body) or (nil, error_text, body_or_nil).
+function CROSSDROP:rawBody(target, path, timeout)
+    if not socket_available() then
+        return nil, "LuaSocket unavailable", nil
+    end
+    if not target or not target.ip or target.ip == "" then
+        return nil, _("WiFi IP not set (see the Connections tab)"), nil
+    end
+    local su = socketutilModule()
+    if timeout and timeout > 0 then
+        su:set_timeout(timeout, timeout)
+    else
+        su:set_timeout(su.FILE_BLOCK_TIMEOUT or 15, su.FILE_TOTAL_TIMEOUT or 60)
+    end
+    local sock, herr = socket.tcp()
+    if not sock then
+        su:reset_timeout()
+        return nil, tostring(herr or "socket error"), nil
+    end
+    sock:settimeout(timeout or 10)
+    local ok, cerr = sock:connect(target.ip, tonumber(target.port) or 80)
+    if not ok then
+        sock:close()
+        su:reset_timeout()
+        return nil, tostring(cerr or "connect error"), nil
+    end
+    sock:send("GET " .. path .. " HTTP/1.0\r\n"
+        .. "Host: " .. target.ip .. "\r\n"
+        .. "User-Agent: KOReader/crossdrop\r\n"
+        .. "Connection: close\r\n\r\n")
+    local parts, size = {}, 0
+    while true do
+        local chunk = sock:receive("*a")
+        if not chunk then break end
+        parts[#parts + 1] = chunk
+        size = size + #chunk
+    end
+    sock:close()
+    su:reset_timeout()
+    if size == 0 then
+        return nil, "no response body", nil
+    end
+    local raw = table.concat(parts)
+    local head_end = raw:find("\r\n\r\n", 1, true)
+    local code_s = raw:match("^HTTP/%d%.%d (%d+)")
+    local code = code_s and tonumber(code_s)
+    local body = (head_end and raw:sub(head_end + 4)) or raw
+    if not code or code < 200 or code >= 300 then
+        return nil,
+            (code and string.format("device replied %s", tostring(code)))
+            or "malformed HTTP response",
+            body
+    end
+    return true, code, body
+end
+
+-- List the top-level folders on the reader's card (GET /api/files; JSON
+-- entries carry isDirectory). Returns (true, sorted_names[]) or
+-- (nil, error_text). Slower than a status probe — the reader can take seconds
+-- to respond while it services the SD card — so the budget is 10s block+total
+-- (still socketutil-bounded, never the raw-http 60s freeze). The reader sends
+-- this listing chunked, so a body that refuses to decode is dechunked and
+-- retried before giving up. Diagnosis of a failure lands in crash.log.
+function CROSSDROP:listFolders(target)
+    if not target or not target.ip or target.ip == "" then
+        return nil, _("WiFi IP not set (see the Connections tab)")
+    end
+    local ok, code, body = self:rawBody(target, "/api/files", 10)
+    if not ok then
+        local err = (type(code) == "number")
+            and string.format("device replied %s", tostring(code))
+            or tostring(code or "unknown error")
+        logger.info("crossdrop: listFolders failed (", target.ip, "): ", err)
+        return nil, err
+    end
+    local folders = {}
+    if JSON then
+        local okj, parsed = pcall(JSON.decode, body)
+        if not (okj and type(parsed) == "table") then
+            okj, parsed = pcall(JSON.decode, dechunk(body))
+        end
+        if okj and type(parsed) == "table" then
+            for _, e in ipairs(parsed) do
+                if type(e) == "table" and e.isDirectory and e.name ~= "" then
+                    folders[#folders + 1] = tostring(e.name)
+                end
+            end
+        else
+            local head = type(body) == "string" and string.format("%q", body:sub(1, 96)) or tostring(body)
+            logger.info("crossdrop: listFolders could not parse the body from ", target.ip, " (head ", head, ")")
+            return nil, "could not parse the folder list"
+        end
+    end
+    table.sort(folders)
+    logger.info("crossdrop: listFolders (", target.ip, ") -> ", #folders, " folders")
+    return true, folders
 end
 
 -- Make sure the destination folder exists (MKCOL; 405 = already exists).
