@@ -5,23 +5,24 @@ Adds a "CrossDrop" entry to the reader menu that opens a full-screen
 dashboard and can hand the currently open book to the reader over the local
 network. It uses only the built-in web-server endpoints — no custom firmware:
 
-    GET   /api/status          device info + connection test
-    GET   /api/files           list folders on the reader (destination picker)
-    MKCOL /<folder>            create the destination folder if needed
-    PUT   /<folder>/<file>     stream the book, chunk by chunk
+    GET   /api/files                  list folders at the card root (destination picker)
+    GET   /api/files?path=<folder>    list the folders nested inside <folder>
+    MKCOL /<folder>/<child>           create a destination folder, parents first
+    PUT   /<folder>/<file>            stream the book, chunk by chunk
 
-The destination folder is optional: the Send A Book tab can list the
-reader's folders (/api/files), or take a typed-in name. Whatever the
-choice, it is MKCOL-created before the first send. Nothing chosen == the
-**CrossDropped Files** default, so a bare install keeps the old behavior.
+The destination folder is optional: the send tab can list the reader's
+folders (/api/files), drill into them at any depth, type a "/"-separated
+path, or create a brand-new subfolder under a chosen folder. Whatever the
+choice, every folder in the path is MKCOL-created before the first send.
+Nothing chosen == the **CrossDropped Files** default, so a bare install
+keeps the old behavior.
 
 One connection is supported, matching the reader's File Transfer mode:
 
     WiFi          File Transfer → Join Network   (address shown on screen)
 
 Its stored IP is set on the Connections tab. Sending a book probes it and
-streams the book to the reader over the shared Wi-Fi network. (The reader's
-"Create Hotspot" mode was dropped: it never worked reliably.)
+streams the book to the reader over the shared Wi-Fi network.
 
 Pure LuaSocket (part of KOReader) — no external dependencies, and the file is
 streamed chunk-by-chunk from disk so devices with little RAM (like a Kindle)
@@ -64,7 +65,7 @@ local CROSSDROP = WidgetContainer:extend{
     -- Shown on the dashboard's Connections tab so the running build is
     -- always identifiable on the device (KOReader loads plugins once at
     -- startup — a replaced plugin file does nothing until restart).
-    VERSION = "1.3.32",
+    VERSION = "1.3.33",
 }
 
 local socket, http
@@ -277,18 +278,29 @@ function CROSSDROP:saveTarget(target)
     end
 end
 
--- Save the destination folder name (crossdrop_folder, settings.reader.lua).
--- Stored with a leading "/" like the default; the name is trimmed and stript
--- of slashes the user typed around it. An empty name clears the preference
--- (back to the CrossDropped Files default).
+-- Save the destination folder path (crossdrop_folder, settings.reader.lua).
+-- Stored as a single "/"-normalized path with a leading "/", like the
+-- default. A nested destination is a plain "/"-separated path (Books/Sci-Fi)
+-- at any depth the user browses to or types. An empty name clears the
+-- preference (back to the CrossDropped Files default); "."/".." or empty
+-- path segments are rejected, so a destination can never escape the card
+-- root.
 function CROSSDROP:setFolder(name)
-    name = (tostring(name or ""):match("^%s*(.-)%s*$") or "")
-        :gsub("^/+", ""):gsub("/+$", "")
-    if name == "" or name == "." or name == ".." then
+    local segs = {}
+    for seg in (tostring(name or "")
+        :match("^%s*(.-)%s*$") or ""):gmatch("[^/]+") do
+        seg = seg:match("^%s*(.-)%s*$") or seg
+        if seg == "" or seg == "." or seg == ".." then
+            G_reader_settings:saveSetting("crossdrop_folder", nil)
+            return
+        end
+        segs[#segs + 1] = seg
+    end
+    if #segs == 0 then
         G_reader_settings:saveSetting("crossdrop_folder", nil)
         return
     end
-    G_reader_settings:saveSetting("crossdrop_folder", "/" .. name)
+    G_reader_settings:saveSetting("crossdrop_folder", "/" .. table.concat(segs, "/"))
 end
 
 -- Strip HTTP chunked-transfer framing (the reader streams /api/files in tiny
@@ -378,18 +390,27 @@ function CROSSDROP:rawBody(target, path, timeout)
     return true, code, body
 end
 
--- List the top-level folders on the reader's card (GET /api/files; JSON
--- entries carry isDirectory). Returns (true, sorted_names[]) or
--- (nil, error_text). Slower than a status probe — the reader can take seconds
--- to respond while it services the SD card — so the budget is 10s block+total
--- (still socketutil-bounded, never the raw-http 60s freeze). The reader sends
--- this listing chunked, so a body that refuses to decode is dechunked and
--- retried before giving up. Diagnosis of a failure lands in crash.log.
-function CROSSDROP:listFolders(target)
+-- List the folders inside a directory on the reader's card (GET /api/files;
+-- JSON entries carry isDirectory). With no `path` this is the card root;
+-- pass a folder path ("Books", "Books/Sci-Fi") to list what is nested inside
+-- it. The path is URL-encoded (%20 for spaces) into ?path=<folder>, which the
+-- reader answers with the same JSON shape as the root. Returns
+-- (true, sorted_names[]) or (nil, error_text). Slower than a status probe —
+-- the reader can take seconds to respond while it services the SD card — so
+-- the budget is 10s block+total (still socketutil-bounded, never the
+-- raw-http 60s freeze). The reader sends this listing chunked, so a body
+-- that refuses to decode is dechunked and retried before giving up.
+-- Diagnosis of a failure lands in crash.log.
+function CROSSDROP:listFolders(target, path)
     if not target or not target.ip or target.ip == "" then
         return nil, _("WiFi IP not set (see the Connections tab)")
     end
-    local ok, code, body = self:rawBody(target, "/api/files", 10)
+    local api_path = "/api/files"
+    local p = tostring(path or ""):gsub("^/+", ""):gsub("/+$", "")
+    if p ~= "" then
+        api_path = api_path .. "?path=" .. encode_path(p):gsub("^/", "")
+    end
+    local ok, code, body = self:rawBody(target, api_path, 10)
     if not ok then
         local err = (type(code) == "number")
             and string.format("device replied %s", tostring(code))
@@ -420,23 +441,29 @@ function CROSSDROP:listFolders(target)
     return true, folders
 end
 
--- Make sure the destination folder exists (MKCOL; 405 = already exists).
+-- Make sure the destination folder exists. A nested destination (Books/x)
+-- needs EVERY parent, so each "/"-separated segment is MKCOL-created in
+-- order — the reader answers 409 "Parent directory does not exist" for a
+-- deep create, which a single MKCOL can never survive. 201 (newly created)
+-- and 405 (already exists) are both success.
 function CROSSDROP:ensureFolder(target)
     local folder = tostring(target.folder or DEFAULT_FOLDER)
     if folder == "" or folder == "/" then
         return true
     end
-    local ok, code, errbody = self:req("MKCOL", base_url(target) .. encode_path(folder))
-    if ok then
-        return true
+    local so_far = {}
+    for seg in folder:gmatch("[^/]+") do
+        so_far[#so_far + 1] = seg
+        local prefix = "/" .. table.concat(so_far, "/")
+        local ok, code, errbody = self:req("MKCOL", base_url(target) .. encode_path(prefix))
+        if not ok and not (type(code) == "number" and code == 405) then
+            if type(code) == "number" then
+                return nil, string.format("could not create folder (%s: %s)", tostring(code), tostring(errbody or ""))
+            end
+            return nil, tostring(code or errbody or "unknown error")
+        end
     end
-    if type(code) == "number" and code == 405 then
-        return true
-    end
-    if type(code) == "number" then
-        return nil, string.format("could not create folder (%s: %s)", tostring(code), tostring(errbody or ""))
-    end
-    return nil, tostring(code or errbody or "unknown error")
+    return true
 end
 
 -- Current book file path (only file-based documents can be sent).

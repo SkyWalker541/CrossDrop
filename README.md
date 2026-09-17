@@ -13,9 +13,13 @@ Wi-Fi — no cable, no cloud.
   KOReader's Tools menu.
 - **Send A Book** scans your device for books: search and multi-pick from the
   list, or send the book you're currently reading.
-- Books land in a **destination folder** on the reader — pick one from the
-  reader's folders or type a name. Nothing chosen = the **CrossDropped Files**
-  default, created automatically on the first send (WebDAV MKCOL).
+- Books land in a **destination folder** on the reader. The destination picker
+  is a folder **tree**: tap a folder's ▸/▾ to scan its subfolders — they appear
+  indented right below it, and every other folder stays visible; tap a folder's
+  name for **Select / Create Subfolder / Cancel**. A new subfolder is picked
+  right away and is created on the reader when the books are sent (WebDAV
+  MKCOL, at any nesting depth). Nothing chosen = the **CrossDropped Files**
+  default, created automatically on the first send.
 - A "… please wait" screen while a book streams, and a toast when it lands.
   There's deliberately no progress bar: the transfer drains faster than
   e-ink can repaint.
@@ -29,9 +33,6 @@ Wi-Fi — no cable, no cloud.
 3. Open **Tools → CrossDrop → Connections → Set WiFi IP…** and enter the
    reader's IP. Tap the **WiFi** row to check it reads **Reachable**.
 4. Use the **Send A Book** tab to pick books and choose a destination folder.
-
-Wi-Fi is the only connection mode. The reader's "Create Hotspot" mode was
-dropped — it never worked reliably.
 
 ## Build & test
 

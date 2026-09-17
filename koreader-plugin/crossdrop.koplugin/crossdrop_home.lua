@@ -231,10 +231,13 @@ function HomeDialog:showTab(key)
     if self.tab == key then return end
     -- NOTE: there is NO UIManager:replace in this KOReader build (it crashed
     -- the plugin on the Kindle). Re-init the SAME widget for its new tab and
-    -- repaint it in place instead.
+    -- repaint it in place instead. "ui" (not "partial"): flashless AND never
+    -- promoted — the panel promotes every FULL_REFRESH_COUNT-th bare partial
+    -- to a flashing full, which is exactly the "random" flashing the
+    -- dashboard used to show.
     self.tab = key
     self:init()
-    UIManager:setDirty(self, "full")
+    UIManager:setDirty(self, "ui")
 end
 
 function HomeDialog:buildTabBar(content_w)
@@ -364,7 +367,8 @@ function HomeDialog:check(kind)
             .. tostring(err or "network error")
         UIManager:show(Notification:new{ text = text, timeout = 5 })
     end
-    UIManager:setDirty(self, "partial")
+    -- "ui": flashless, never promoted to a flashing full (partials are).
+    UIManager:setDirty(self, "ui")
     self:init()
 end
 
@@ -377,7 +381,8 @@ function HomeDialog:refresh()
     UIManager:nextTick(function()
         self.plugin._reach = {}
         self:init()
-        UIManager:setDirty(self, "partial")
+        -- "ui": flashless and never promoted to a flashing full (partials are).
+        UIManager:setDirty(self, "ui")
     end)
 end
 
@@ -400,9 +405,18 @@ function HomeDialog:renderConnections()
 
     -- Setup guide for a first-time reader (the space the WiFi rows need
     -- between the controls and the text). Steps mirror the buttons directly
-    -- above, so a new user reads exactly where each action happens.
+    -- above, so a new user reads exactly where each action happens. The
+    -- version line sits ABOVE the guide: at the guide's tail it ran off the
+    -- bottom of the panel. The guide itself uses the smaller info font so
+    -- the steps (some wrap to 2-3 lines) fit with room to spare.
     local sc = function(v) return Device.screen:scaleBySize(v) end
-    table.insert(vg, VerticalSpan:new{ width = sc(12) })
+    table.insert(vg, VerticalSpan:new{ width = sc(10) })
+    table.insert(vg, TextBoxWidget:new{
+        text = "CrossDrop " .. tostring((self.plugin and self.plugin.VERSION) or ""),
+        face = Font:getFace("smallinfofontbold"),
+        width = self.row_w,
+    })
+    table.insert(vg, VerticalSpan:new{ width = sc(6) })
     table.insert(vg, TextBoxWidget:new{
         text = _("To receive books, set up your Xteink device like this:\n")
             .. _("1. Put the Xteink and this Kindle on the same Wi-Fi network.\n")
@@ -410,9 +424,8 @@ function HomeDialog:renderConnections()
             .. _("3. On that screen, the device's IP address is below the QR code.\n")
             .. _("4. Tap \"Set WiFi IP\" to enter that address.\n")
             .. _("5. Then tap the connection row above to check \226\128\148 it should read \"Reachable\" when connected.\n")
-            .. _("6. Send from the Send A Book tab: pick books from the list, or send the currently open book. Pick the destination folder there too \226\128\148 it defaults to CrossDropped Files on the reader.")
-            .. "\n\nCrossDrop " .. tostring((self.plugin and self.plugin.VERSION) or ""),
-        face = Font:getFace("smallinfofont"),
+            .. _("6. Send from the Send A Book tab: pick books from the list, or send the currently open book. Pick the destination folder there too \226\128\148 it defaults to CrossDropped Files on the reader."),
+        face = Font:getFace("xx_smallinfofont"),
         width = self.row_w,
     })
 
@@ -449,12 +462,15 @@ function HomeDialog:renderSendIdle()
         }))
     end
 
-    -- Destination folder: shows which reader folder books land in. Always
-    -- available (even offline) — picking a listed folder or typing a new name
-    -- only needs the reader when a send later creates/uses it.
+    -- Destination folder: shows which reader folder (full nested path) books
+    -- land in. Always available (even offline) — picking a listed folder or
+    -- typing a new name/path only needs the reader when a send later creates
+    -- or uses it.
     table.insert(vg, VerticalSpan:new{ width = sc(18) })
     local target = self.plugin:resolveTarget()
-    local dest_name = folder_basename(target and target.folder)
+    local dest_raw = folder_str(target)
+    local dest_name = tostring(dest_raw):gsub("^/+", ""):gsub("/+$", "")
+    if dest_name == "" then dest_name = folder_basename(dest_raw) end
     table.insert(vg, self:header(_("Destination folder")))
     table.insert(vg, self:row(
         string.format("%s\n%s  \226\128\164  tap to choose",
@@ -465,28 +481,195 @@ function HomeDialog:renderSendIdle()
     return vg
 end
 
--- ─────────────────────── destination folder picker ──────────────────────
+-- ─────────────────────── destination folder tree ────────────────────────
 -- A full-screen modal (the dashboard's own full-screen look, like the picker:
--- TitleBar + "menu_style" Button rows on a white card — this device renders
--- NO other widget language). Lists the reader's folders (/api/files), lets
--- the user type a brand-new name, or fall back to the CrossDropped Files
--- default. Network problems never trap the dialog: a failed listing just
--- hides the folder rows and the typed/default choices still work.
+-- TitleBar + Button rows on a white card — this device renders NO other
+-- widget language). The destination picker is a FOLDER TREE, the way a
+-- computer file browser works:
+--
+--   · the card root is listed first;
+--   · every folder row carries an expand ▸ (or ▾ when open). Tapping the
+--     arrow fetches (GET /api/files?path=) and shows what is nested,
+--     indented under it so subfolders read as subfolders;
+--   · an open folder with no subfolders shows only
+--     "No subfolders found in /X" under it;
+--   · tapping the folder NAME opens a small action menu: Select (make it
+--     the destination), Create Subfolder… (picks /X/<name> and adds it to
+--     the tree), Cancel;
+--   · folder rows are BOXLESS (bare text, like the picker's book rows);
+--     action menu rows keep their box so actions stay distinct;
+--   · when the reader is unreachable the dialog shows ONLY
+--     "Device not found. Please check Xteink IP, and confirm that it
+--     matches in Connections." — no retry rows, no typed-path fallback.
+
+local TREE_INDENT = 24  -- scaled px of indentation per depth level
+local TREE_ARROW_W = 44 -- scaled px of the ▸/▾ expand control (a real tap target)
+
+-- One folder in the tree.
+local function new_node(name, path, depth)
+    return {
+        name = name,
+        path = path,                  -- relative, no leading slash ("Books/Fiction")
+        depth = depth,                -- 0 == card root
+        children = nil,               -- sorted child nodes, or nil until loaded
+        expanded = false,             -- showing its children inline?
+        pending = false,              -- created this session, not yet on the reader
+    }
+end
 
 local DestinationDialog = InputContainer:extend{
     modal = true,
     dismissable = false,
-    plugin = nil,     -- CROSSDROP instance (setFolder)
+    plugin = nil,     -- CROSSDROP instance (setFolder / listFolders)
     home = nil,       -- the HomeDialog to refresh after a pick
-    folders = nil,    -- sorted folder names, or nil when the listing failed
-    list_err = nil,   -- why the listing failed (shown when folders == nil)
+    nodes = nil,      -- root folder tree (a new_node list)
+    list_err = nil,   -- reader unreachable → message-only body
+    selected = nil,   -- chosen destination (relative path; nil == default)
 }
 
+-- Find a node by its path (depth-first search over the whole tree).
+function DestinationDialog:findNode(path)
+    local function walk(list)
+        for _, n in ipairs(list) do
+            if n.path == path then return n end
+            if n.children then
+                local hit = walk(n.children)
+                if hit then return hit end
+            end
+        end
+        return nil
+    end
+    return walk(self.nodes or {})
+end
+
+-- Repaint the tree in place, flash-free (the no-flash rule of the dashboard).
+-- "ui" (not "partial"): flashless AND never promoted — the panel promotes
+-- every FULL_REFRESH_COUNT-th bare partial to a flashing full, which read as
+-- "random" flashes while browsing the tree.
+function DestinationDialog:rebuild()
+    self:init()
+    UIManager:setDirty(self, "ui")
+    UIManager:forceRePaint()
+end
+
+-- Choose `path` as the destination and leave the dialog (dashboard refresh).
 function DestinationDialog:pick(path)
     if self.plugin.setFolder then
         self.plugin:setFolder(path)
     end
+    if type(path) == "string" and path ~= "" then
+        self.selected = tostring(path):gsub("^/+", ""):gsub("/+$", "")
+    end
+    local home = self.home
     UIManager:close(self)
+    UIManager:nextTick(function()
+        if home and home.refresh then home:refresh() end
+    end)
+end
+
+-- Leave the tree WITHOUT changing the destination (the back chevron and the
+-- ✕): back to the dashboard, refreshed so its destination row shows the
+-- folder as it stands — including a subfolder created here but not yet on
+-- the reader (it materializes when a book is sent).
+function DestinationDialog:leave()
+    local home = self.home
+    UIManager:close(self)
+    UIManager:nextTick(function()
+        if home and home.refresh then home:refresh() end
+    end)
+end
+
+-- Tap the ▸/▾ control: expand (fetching children if needed) or collapse.
+function DestinationDialog:toggleNode(node)
+    if node.expanded then
+        node.expanded = false
+    else
+        self:expandNode(node)
+    end
+    self:rebuild()
+end
+
+-- Open a folder: fetch its children once (GET /api/files?path=), or expand
+-- from cache. A just-created (pending) folder opens locally without a fetch.
+-- An empty folder still opens — its only content is the
+-- "No subfolders found in /X" note.
+function DestinationDialog:expandNode(node)
+    if node.expanded then return end
+    if node.pending then
+        node.children = node.children or {}
+        node.expanded = true
+        self:rebuild()
+        return
+    end
+    if node.children == nil then
+        local target = self.plugin:resolveTarget()
+        if not target or not target.ip or target.ip == "" then
+            self.list_err = true
+            self:rebuild()
+            return
+        end
+        local checking = Notification:new{ text = _("Looking up folders\226\128\166"), timeout = 0 }
+        UIManager:show(checking)
+        UIManager:forceRePaint()
+        local ok, folders, err = self.plugin:listFolders(target, node.path)
+        UIManager:close(checking)
+        if not ok then
+            self.list_err = true
+            self:rebuild()
+            return
+        end
+        node.children = {}
+        for _, name in ipairs(folders) do
+            node.children[#node.children + 1] = new_node(name, node.path .. "/" .. name, node.depth + 1)
+        end
+    end
+    node.expanded = true
+    self:rebuild()
+end
+
+-- The folder NAME tap: the tiny action popup (Select / Create Subfolder /
+-- Cancel), built like the picker's send-confirmation ConfirmBox — a small
+-- bordered card centered over the tree, not a full page. Shown with a
+-- flashless "ui" refresh exactly like that popup; only page-level state
+-- transitions (opening the tree, leaving the plugin) warrant the flashing
+-- full refresh on this panel.
+function DestinationDialog:showFolderMenu(node)
+    local popup = FolderMenuDialog:new{
+        plugin = self.plugin,
+        tree = self,
+        node = node,
+    }
+    -- "ui" refresh of ONLY the popup's box region (the third arg to show):
+    -- flashless, never promoted, and no whole-screen sweep for a 3-row card.
+    UIManager:show(popup, "ui", popup.region)
+    UIManager:forceRePaint()
+end
+
+-- Create a new subfolder under `node` (from the folder menu). The name is a
+-- single folder name (no slashes — the tree handles nesting). The folder is
+-- picked as the destination and added to the tree as a pending child; it
+-- exists on the reader once a book is sent to it. The dashboard behind the
+-- tree is refreshed too, so its destination row already shows /X/<name> —
+-- the folder does not exist yet, but that IS where books will land.
+function DestinationDialog:addSubfolder(node, name)
+    local full = node.path .. "/" .. name
+    if self.plugin.setFolder then
+        self.plugin:setFolder(full)
+    end
+    self.selected = full
+    node.children = node.children or {}
+    local already = false
+    for _, c in ipairs(node.children) do
+        if c.name == name then already = true break end
+    end
+    if not already then
+        local child = new_node(name, full, node.depth + 1)
+        child.pending = true
+        node.children[#node.children + 1] = child
+        table.sort(node.children, function(a, b) return a.name < b.name end)
+    end
+    node.expanded = true
+    self:rebuild()
     if self.home and self.home.refresh then
         self.home:refresh()
     end
@@ -501,48 +684,46 @@ function DestinationDialog:init()
     local inner_w = sw - pad * 2
     self.row_w = inner_w
 
+    -- Back chevron top-left returns to the dashboard. There is NO ✕ here:
+    -- the dashboard is still behind this page, and X is reserved for leaving
+    -- the plugin entirely (only the home dashboard carries it).
     local title_bar = TitleBar:new{
         width = inner_w,
         title = _("Destination folder"),
         fullscreen = false,
         with_bottom_line = true,
-        close_callback = function() UIManager:close(self) end,
+        left_icon = "chevron.left",
+        left_icon_tap_callback = function() self:leave() end,
         show_parent = self,
     }
 
     local vg = VerticalGroup:new{ align = "left" }
-    local current = self.plugin:resolveTarget()
-    local current_name = folder_basename(current and current.folder)
+    local dest_label = (self.selected and ("/" .. self.selected)) or folder_str(self.plugin:resolveTarget())
+    table.insert(vg, self:foldersHeader(_("Destination: ") .. dest_label))
 
-    if self.folders and #self.folders > 0 then
-        table.insert(vg, self:foldersHeader(_("Folders on the reader")))
-        for _idx, name in ipairs(self.folders) do
-            local label = name
-            if name == current_name then
-                label = "\226\151\128  " .. name .. "   (" .. _("current") .. ")"
-            end
-            table.insert(vg, self:row(label, function() self:pick(name) end))
-        end
-    elseif self.list_err then
-        table.insert(vg, self:foldersHeader(_("Could not read the folders")))
+    if self.list_err then
+        -- The reader is unreachable: ONLY this message, nothing else.
         table.insert(vg, TextBoxWidget:new{
-            text = _("The reader did not answer (") .. tostring(self.list_err) .. ").\n"
-                .. _("Tap Retry below, or type a new folder name \226\128\148 it is created on the reader when a book is sent."),
+            text = _("Device not found. Please check Xteink IP, and confirm that it matches in Connections."),
             face = Font:getFace("smallinfofont"),
             width = self.row_w,
         })
-        table.insert(vg, self:row(_("Retry listing the folders"), function()
-            UIManager:close(self)
-            if self.home and self.home.chooseDestination then
-                self.home:chooseDestination()
-            end
-        end))
+    else
+        table.insert(vg, self:foldersHeader(_("Folders on the reader")))
+        local nodes = self.nodes or {}
+        if #nodes > 0 then
+            self:appendNodes(vg, nodes, 0)
+        else
+            table.insert(vg, TextBoxWidget:new{
+                text = _("No folders on the reader."),
+                face = Font:getFace("smallinfofont"),
+                width = self.row_w,
+            })
+        end
+        table.insert(vg, self:foldersHeader(_("Default")))
+        table.insert(vg, self:plainRow(_("CrossDropped Files (back to the default)"),
+            function() self:pick("CrossDropped Files") end))
     end
-
-    table.insert(vg, self:foldersHeader(_("New custom folder")))
-    table.insert(vg, self:row(_("Type a new folder name\226\128\166"), function() self:askNewName() end))
-    table.insert(vg, self:foldersHeader(_("Default")))
-    table.insert(vg, self:row(_("CrossDropped Files (back to the default)"), function() self:pick("CrossDropped Files") end))
 
     local frame = FrameContainer:new{
         dimen = Geom:new{ w = sw, h = sh },
@@ -565,8 +746,95 @@ function DestinationDialog:init()
     end
 end
 
+-- Render a folder list into `vg`, one indented BOXLESS row per node (bare
+-- text, like the picker's book rows). Open nodes recurse into their children
+-- one level deeper; an open folder with no children shows the
+-- "No subfolders found in /X" note in its place.
+function DestinationDialog:appendNodes(vg, nodes, depth)
+    local sc = function(v) return Device.screen:scaleBySize(v) end
+    local indent = math.min(depth * sc(TREE_INDENT), sc(140))
+    for i = 1, #nodes do
+        local node = nodes[i]
+        self:treeRowInto(vg, node, indent)
+        if node.expanded then
+            local kids = node.children or {}
+            if #kids > 0 then
+                self:appendNodes(vg, kids, depth + 1)
+            else
+                table.insert(vg, HorizontalGroup:new{
+                    HorizontalSpan:new{ width = indent + sc(TREE_ARROW_W) + sc(6) },
+                    TextBoxWidget:new{
+                        text = string.format(_("No subfolders found in /%s"), node.path),
+                        face = Font:getFace("smallinfofont"),
+                        width = math.max(self.row_w - indent - sc(TREE_ARROW_W) - sc(6), 1),
+                    },
+                })
+            end
+        end
+    end
+end
+-- One tree row: the ▸/▾ expand control and the folder name are SEPARATE
+-- buttons (separate tap targets), placed after the indentation. Tapping
+-- the control opens/closes the folder's sub-tree INLINE (children appear
+-- indented under it, other root folders stay visible); tapping the folder
+-- NAME opens the tiny Select / Create Subfolder / Cancel popup.
+function DestinationDialog:treeRowInto(vg, node, indent)
+    local sc = function(v) return Device.screen:scaleBySize(v) end
+    local is_expanded = node.expanded
+    local arrow_text = is_expanded and "\226\150\190" or "\226\150\184" -- ▾ / ▸
+
+    local toggle = Button:new{
+        text = arrow_text,
+        width = sc(TREE_ARROW_W),
+        align = "center",
+        bordersize = 0,
+        padding_h = 0,
+        avoid_text_truncation = false,
+        text_font_face = "smallinfofont",
+        text_font_size = 28, -- bigger glyph than the row text: an easy tap target
+        callback = function() self:toggleNode(node) end,
+    }
+
+    local name_text = node.name
+    if node.path == self.selected then
+        name_text = "\226\151\128  " .. name_text .. "   (" .. _("chosen") .. ")"
+    end
+    local name = Button:new{
+        text = name_text,
+        width = math.max(self.row_w - indent - sc(TREE_ARROW_W), 1),
+        align = "left",
+        bordersize = 0,
+        padding_h = Size.padding.large,
+        avoid_text_truncation = false,
+        text_font_face = "smallinfofont",
+        text_font_size = 22,
+        callback = function() self:showFolderMenu(node) end,
+    }
+
+    table.insert(vg, HorizontalGroup:new{
+        HorizontalSpan:new{ width = indent },
+        toggle,
+        name,
+    })
+end
+
+-- A plain boxless action row (boxless, to match the tree rows).
+function DestinationDialog:plainRow(text, callback)
+    return Button:new{
+        text = text,
+        width = self.row_w,
+        align = "left",
+        bordersize = 0,
+        padding_h = Size.padding.large,
+        avoid_text_truncation = false,
+        text_font_face = "smallinfofont",
+        text_font_size = 22,
+        callback = callback,
+    }
+end
+
 function DestinationDialog:onBack()
-    UIManager:close(self)
+    self:leave()
     return true
 end
 
@@ -583,26 +851,49 @@ function DestinationDialog:foldersHeader(text)
     }
 end
 
-function DestinationDialog:row(text, callback)
-    return Button:new{
-        text = text,
-        menu_style = true,
-        width = self.row_w,
-        callback = callback,
-    }
+-- ─────────────────────── folder action menu ────────────────────────────
+-- Select / Create Subfolder… / Cancel for one tapped folder. Built like the
+-- picker's send-confirmation ConfirmBox: a small bordered card, auto-sized
+-- to its rows and centered over the tree via a full-screen CenterContainer
+-- (the ConfirmBox recipe — this device renders no other popup language).
+-- Action rows keep their box so the menu reads as actions, a step apart
+-- from the boxless tree rows behind it.
+
+FolderMenuDialog = InputContainer:extend{
+    modal = true,
+    dismissable = false,
+    plugin = nil,   -- CROSSDROP instance (setFolder)
+    tree = nil,     -- the DestinationDialog to apply choices to
+    node = nil,     -- the folder being acted on
+}
+
+-- Select: like the picker's send-confirmation, the work after the closes is
+-- deferred with nextTick — running the close→close→dashboard-repaint chain
+-- synchronously inside the tap handler froze the panel once on the device.
+-- The close passes the popup's box region: only that hole repaints, not the
+-- whole screen.
+function FolderMenuDialog:onSelect()
+    local tree, node = self.tree, self.node
+    UIManager:close(self, "ui", self.region)
+    UIManager:nextTick(function()
+        if tree and node then tree:pick(node.path) end
+    end)
 end
 
--- Type a brand-new folder name (the InputDialog recipe editIp/SEARCH use).
-function DestinationDialog:askNewName()
+function FolderMenuDialog:onCancel()
+    UIManager:close(self, "ui", self.region)
+end
+
+-- Create a subfolder under this folder: a single-name input dialog. The new
+-- folder becomes the destination and is added to the tree as a pending child.
+function FolderMenuDialog:onCreate()
     local InputDialog = require("ui/widget/inputdialog")
-    local dialog = self
-    local current = dialog.plugin:resolveTarget()
-    local current_name = folder_basename(current and current.folder)
-    local new_dialog
-    new_dialog = InputDialog:new{
-        title = _("New destination folder"),
-        input = current_name,
-        input_hint = _("One folder name \226\128\148 it is created on the reader when a book is sent"),
+    local menu = self
+    local name_dialog
+    name_dialog = InputDialog:new{
+        title = _("New subfolder"),
+        input = "",
+        input_hint = string.format(_("Under /%s \226\128\148 created on the reader when a book is sent"), tostring(menu.node.path)),
         type = "text",
         modal = true,
         buttons = {
@@ -611,7 +902,7 @@ function DestinationDialog:askNewName()
                     text = _("Save"),
                     is_enter_default = true,
                     callback = function()
-                        local text = new_dialog:getInputText() or ""
+                        local text = name_dialog:getInputText() or ""
                         local name = text:match("^%s*(.-)%s*$") or ""
                         if name == "" then
                             UIManager:show(Notification:new{ text = _("Enter a folder name first."), timeout = 3 })
@@ -625,25 +916,105 @@ function DestinationDialog:askNewName()
                             UIManager:show(Notification:new{ text = _("That is not usable as a folder name."), timeout = 3 })
                             return
                         end
-                        UIManager:close(new_dialog)
-                        dialog:pick(name)
+                        UIManager:close(name_dialog)
+                        UIManager:close(menu)
+                        -- nextTick, like Select: the close→rebuild repaint
+                        -- chain must not run inside the tap handler.
+                        UIManager:nextTick(function()
+                            if menu.tree then menu.tree:addSubfolder(menu.node, name) end
+                        end)
                     end,
                 },
             },
             {
                 {
                     text = _("Cancel"),
-                    callback = function() UIManager:close(new_dialog) end,
+                    callback = function() UIManager:close(name_dialog) end,
                 },
             },
         },
     }
-    UIManager:show(new_dialog)
+    UIManager:show(name_dialog)
 end
 
--- Open the destination dialog. One bounded listing attempt (5s socketutil)
--- happens first with a "Looking up…" notice; a failure only removes the
--- folder rows, everything else stays usable.
+function FolderMenuDialog:init()
+    local sc = function(v) return Device.screen:scaleBySize(v) end
+    local sw = Device.screen:getWidth()
+    local sh = Device.screen:getHeight()
+    local pad = Size.padding.default
+    -- The ConfirmBox look: the card is a modest share of the screen, sized
+    -- to its three rows — nothing like a full page.
+    local box_w = math.min(math.floor(sw * 0.6), sw - sc(40))
+    local inner_w = box_w - pad * 2
+
+    local vg = VerticalGroup:new{}
+    table.insert(vg, VerticalSpan:new{ width = sc(4) })
+    table.insert(vg, TextBoxWidget:new{
+        text = string.format(_("/%s"), tostring(self.node and self.node.path or "")),
+        face = Font:getFace("smallinfofontbold"),
+        width = inner_w,
+        alignment = "center",
+    })
+    table.insert(vg, VerticalSpan:new{ width = sc(8) })
+    table.insert(vg, self:menuRow(inner_w, _("Select"), function() self:onSelect() end))
+    table.insert(vg, self:menuRow(inner_w, _("Create Subfolder\226\128\166"), function() self:onCreate() end))
+    table.insert(vg, self:menuRow(inner_w, _("Cancel"), function() self:onCancel() end))
+    table.insert(vg, VerticalSpan:new{ width = sc(4) })
+
+    local frame = FrameContainer:new{
+        background = Blitbuffer.COLOR_WHITE,
+        bordersize = Size.border.window,
+        padding = pad,
+        vg,
+    }
+    self.frame = frame
+    -- Full-screen CenterContainer centers the small card over the tree:
+    -- the ConfirmBox recipe (this is how KOReader centers popups).
+    self[1] = CenterContainer:new{
+        dimen = Geom:new{ w = sw, h = sh },
+        frame,
+    }
+    self.dimen = Geom:new{ w = sw, h = sh }
+    -- The popup's OWN box region (where the CenterContainer places the
+    -- frame). UIManager:show/close accept a refresh region — passing this
+    -- one refreshes ONLY the box on open and repaints ONLY the box-sized
+    -- hole on close, instead of sweeping the whole screen both times.
+    local fs = frame:getSize()
+    local bw = fs and fs.w or box_w
+    local bh = fs and fs.h or sh
+    self.region = Geom:new{
+        x = math.floor((sw - bw) / 2),
+        y = math.floor((sh - bh) / 2),
+        w = bw,
+        h = bh,
+    }
+    if Device:hasKeys() then
+        self.key_events.Back = { { Device.input.group.Back } }
+    end
+end
+
+function FolderMenuDialog:menuRow(row_w, text, callback)
+    return Button:new{
+        text = text,
+        menu_style = true,
+        width = row_w,
+        callback = callback,
+    }
+end
+
+function FolderMenuDialog:onBack()
+    UIManager:close(self, "ui", self.region)
+    return true
+end
+
+-- Open the destination folder tree. The root listing is one bounded attempt
+-- (socketutil); if the reader does not answer, the tree opens with ONLY the
+-- "Device not found…" message — nothing to retry or type around. No
+-- "Looking up…" notice first: against a reachable reader the listing returns
+-- in milliseconds, and the notice's show/close repaint cycle both added a
+-- paint to every open and raced the tree's first paint (a stale region
+-- half-covered it). The tree paints in ONE flashless "ui" pass, exactly
+-- like the picker.
 function HomeDialog:chooseDestination()
     local InfoMessage = require("ui/widget/infomessage")
     local target = self.plugin:resolveTarget()
@@ -653,20 +1024,19 @@ function HomeDialog:chooseDestination()
         })
         return
     end
-    local checking = Notification:new{ text = _("Looking up folders\226\128\166"), timeout = 0 }
-    UIManager:show(checking)
-    UIManager:forceRePaint()
-    local ok, folders, err = self.plugin:listFolders(target)
-    UIManager:close(checking)
-    -- "ui" refresh type, exactly like openHome/chooseAndSend: a bare show()
-    -- leaves the refresh to chance when a full-screen modal is already up —
-    -- which read as the dialog rendering "behind" the dashboard. This forces
-    -- it to paint on top.
+    local ok, folders = self.plugin:listFolders(target)
+    local nodes
+    if ok and folders then
+        nodes = {}
+        for _, name in ipairs(folders) do
+            nodes[#nodes + 1] = new_node(name, name, 0)
+        end
+    end
     UIManager:show(DestinationDialog:new{
         plugin = self.plugin,
         home = self,
-        folders = ok and folders or nil,
-        list_err = ok and nil or tostring(err or "unknown error"),
+        nodes = nodes,
+        list_err = not ok,
     }, "ui")
     UIManager:forceRePaint()
 end

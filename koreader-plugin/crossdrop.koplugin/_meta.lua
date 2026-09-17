@@ -1,6 +1,6 @@
 return {
     fullname = "CrossDrop",
-    description = "Send books from KOReader to your Xteink reader over Wi-Fi (File Transfer / WebDAV).",
-    version = "1.3.32",
+    description = "Send books from KOReader to your Xteink reader over Wi-Fi (File Transfer / WebDAV). Destination folders, nested any depth.",
+    version = "1.3.33",
     icon = "icon.png",
 }

@@ -77,6 +77,5 @@ Hard-won device lessons (KPW5SE, KOReader 2026.07.2):
   (storefront's rule), or KOReader crashes on the destroyed widget.
 - Never pass a `selected` option to Menu-derived widgets (FocusManager owns
   that field — the 1.3.9 crash); the picker set is named `picked`.
-- **WiFi only** — the reader's hotspot mode was dropped (never worked
-  reliably); `configuredTargets()` returns exactly one `wifi` target whose
-  `ip` is `""` until the user sets it (probe answers "not set").
+- **WiFi only** — `configuredTargets()` returns exactly one `wifi` target
+  whose `ip` is `""` until the user sets it (probe answers "not set").

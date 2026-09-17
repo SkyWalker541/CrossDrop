@@ -463,7 +463,7 @@ function PickerDialog:upgradeVisibleTitles()
             if picker.title_cache_dirty then picker:saveTitleCache() end
             if not picker._closed then
                 picker:init()
-                UIManager:setDirty(picker, "partial")
+                UIManager:setDirty(picker, "ui")
             end
         end
     end
@@ -524,7 +524,7 @@ function PickerDialog:showSearchDialog()
                         picker.page = 1
                         UIManager:close(search_dialog)
                         picker:init()
-                        UIManager:setDirty(picker, "partial")
+                        UIManager:setDirty(picker, "ui")
                     end,
                 },
             },
@@ -545,7 +545,7 @@ function PickerDialog:clearSearch()
     self.query = nil
     self.page = 1
     self:init()
-    UIManager:setDirty(self, "partial")
+    UIManager:setDirty(self, "ui")
 end
 
 -- The action row text: the send button the user asked for, always visible,
@@ -629,13 +629,13 @@ function PickerDialog:toggle(path)
         self.picked[path] = true
     end
     self:init()
-    UIManager:setDirty(self, "partial")
+    UIManager:setDirty(self, "ui")
 end
 
 function PickerDialog:gotoPage(n)
     self.page = math.max(1, n)
     self:init()
-    UIManager:setDirty(self, "partial")
+    UIManager:setDirty(self, "ui")
 end
 
 -- Exiting (the TitleBar ✕, the one the user already uses on the dashboard)
@@ -847,9 +847,11 @@ function PickerDialog:init()
     -- inheritance for the field UIManager's stacking depends on).
     self.modal = true
 
-    -- The dashboard's exact TitleBar config — the ✕ top-right the user
-    -- already sees and uses on the dashboard, on this very device. The
-    -- subtitle carries the book count (static for the dialog's lifetime).
+    -- The dashboard's exact TitleBar config, with one difference: this page
+    -- sits on top of the still-open dashboard, so it carries the back
+    -- chevron top-left and NO ✕ — X is reserved for leaving the plugin
+    -- entirely (only the home dashboard carries it). The subtitle carries
+    -- the book count (static for the dialog's lifetime).
     local title_bar = TitleBar:new{
         width = inner_w,
         title = _("Send A Book"),
@@ -857,7 +859,8 @@ function PickerDialog:init()
             #self.books),
         fullscreen = false,
         with_bottom_line = true,
-        close_callback = function()
+        left_icon = "chevron.left",
+        left_icon_tap_callback = function()
             self:close()
         end,
         show_parent = self,

@@ -196,6 +196,23 @@ function class:init() end
 function class:new(o)
     o = setmetatable(o or {}, { __index = self })
     o:init()
+    -- Match the device: the real HorizontalGroup only paints for align
+    -- top/center/bottom (nil == top) and VerticalGroup for left/center/right
+    -- (nil == left); anything else just logs "[!] invalid alignment" and
+    -- paints NOTHING — the whole folder tree was invisible on the Kindle
+    -- while every harness check stayed green. Fail here instead.
+    if o.__name == "HorizontalGroup" and o.align ~= nil
+        and o.align ~= "top" and o.align ~= "center" and o.align ~= "bottom" then
+        error(string.format(
+            "HorizontalGroup align %q is invalid on the device (top/center/bottom) — it would paint nothing",
+            tostring(o.align)))
+    end
+    if o.__name == "VerticalGroup" and o.align ~= nil
+        and o.align ~= "left" and o.align ~= "center" and o.align ~= "right" then
+        error(string.format(
+            "VerticalGroup align %q is invalid on the device (left/center/right)",
+            tostring(o.align)))
+    end
     return o
 end
 function class:extend(over)
@@ -333,9 +350,23 @@ UIManager = {
     -- switch and check() would be tested against an API that doesn't exist).
     _shown = {},
     last_dirty = nil,
-    show = function(_, w) table.insert(UIManager._shown, w) end,
-    close = function() end,
-    setDirty = function(_, _, mode) UIManager.last_dirty = mode end,
+    last_show_mode = nil,
+    last_show_region = nil,
+    last_close_mode = nil,
+    last_close_region = nil,
+    show = function(_, w, mode, region)
+        UIManager.last_show_mode = mode
+        UIManager.last_show_region = region
+        table.insert(UIManager._shown, w)
+    end,
+    close = function(_, w, mode, region)
+        UIManager.last_close_mode = mode
+        UIManager.last_close_region = region
+    end,
+    setDirty = function(_, _, mode, region)
+        UIManager.last_dirty = mode
+        UIManager.last_dirty_region = region
+    end,
     forceRePaint = function() end,
     nextTick = function(_, f) return f() end,
     scheduleIn = function() return { cancel = function() end } end,
@@ -350,7 +381,9 @@ local FAKE = {
     fail_put = false,       -- network is up, but the PUT transfer drops (string error)
     chunked = false,        -- /api/files replies with raw chunked-transfer framing
     garbage = false,        -- /api/files replies with a non-JSON body
-    mkcol_count = 0,
+    mkcol_count = 0,        -- first MKCOL -> 201, rest -> 405 (see fake_request)
+    mkcol_urls = {},        -- every MKCOL url answered (asserts the parent walk)
+    mkcol_returns = nil,    -- optional { [url] = status } to force per-URL replies
 }
 
 -- Real wire capture from the Xteink reader (nc at 192.168.7.45:80): it streams
@@ -394,6 +427,10 @@ local function fake_request(args)
             .. '{"name":"CrossDropped Files","size":0,"isDirectory":true,"isEpub":false}]', 200
     end
     if method == "MKCOL" then
+        FAKE.mkcol_urls[#FAKE.mkcol_urls + 1] = url
+        if FAKE.mkcol_returns and FAKE.mkcol_returns[url] then
+            return "", FAKE.mkcol_returns[url]
+        end
         FAKE.mkcol_count = FAKE.mkcol_count + 1
         if FAKE.mkcol_count == 1 then return "", 201 end
         return "", 405
@@ -415,7 +452,11 @@ local CLEAN_FILES_JSON = '[{"name":"Books","size":0,"isDirectory":true,"isEpub":
     .. '{"name":"MyBook.epub","size":123,"isDirectory":false,"isEpub":true},'
     .. '{"name":"sleep","size":0,"isDirectory":true,"isEpub":false},'
     .. '{"name":"CrossDropped Files","size":0,"isDirectory":true,"isEpub":false}]'
+-- A listing inside a folder (Books/), for the nested-browser regression.
+local SUBDIR_JSON = '[{"name":"Fiction","size":0,"isDirectory":true,"isEpub":false},'
+    .. '{"name":"Non-Fiction","size":0,"isDirectory":true,"isEpub":false}]'
 local TCP_RESP = "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n" .. CLEAN_FILES_JSON
+local last_raw_request = "" -- the GET line the raw socket was asked to send
 local function raw_ok(payload)
     TCP_RESP = "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n" .. payload
 end
@@ -428,7 +469,7 @@ stubs["socket"] = {
         return {
             settimeout = function() end,
             connect = function() if FAKE.fail then return nil, "connection refused" end return 1 end,
-            send = function() return 1 end,
+            send = function(_, data) last_raw_request = tostring(data or "") return 1 end,
             receive = function()
                 local r = TCP_RESP
                 if r == nil then return nil end
@@ -538,10 +579,10 @@ local pok, presult = inst:putFile({ ip = "192.168.1.50", port = 80, folder = "/C
 check("putFile success", pok == true, presult)
 check("putFile progress reported", #seen > 0 and seen[#seen] == 256000, #seen and "#seen=" .. #seen)
 
--- 3. ONE connection: WiFi only (hotspot was dropped), fixed folder
+-- 3. ONE connection: WiFi only, fixed folder
 inst:saveTarget({ ip = "192.168.1.50", port = 80 })
 local targets = inst:configuredTargets()
-check("configuredTargets: wifi only, no hotspot",
+check("configuredTargets: wifi only",
     #targets == 1 and targets[1].kind == "wifi" and targets[1].ip == "192.168.1.50",
     #targets and ("#targets=" .. #targets))
 check("wifi uses CrossDropped Files", targets[1].folder == "/CrossDropped Files", targets[1].folder)
@@ -610,8 +651,8 @@ check("toggle unpicks a book (no send on tap)",
 check("send row count follows the selection",
     tostring(picker:sendRowText()):match("1 book"), picker:sendRowText())
 picker:toggle("/tmp/fakebook.epub") -- both books picked again
-check("toggles repaint flashless (partial, no full-screen wipe)",
-    UIManager.last_dirty == "partial", tostring(UIManager.last_dirty))
+check("toggles repaint flashless (ui — never promoted to a full)",
+    UIManager.last_dirty == "ui", tostring(UIManager.last_dirty))
 -- the device scan (bookshelf-style walk) finds every book — including
 -- nested and other source folders — and skips app/system/sidecar junk
 local books = picker:scanAllBooks("/mnt/us")
@@ -767,8 +808,8 @@ for _, row in ipairs(sd2.buttons or {}) do
 end
 check("search Save applies a trimmed, lowercased filter",
     picker.query == "book", tostring(picker.query))
-check("search applies and clears repaint flashless (partial)",
-    UIManager.last_dirty == "partial", tostring(UIManager.last_dirty))
+check("search applies and clears repaint flashless (ui)",
+    UIManager.last_dirty == "ui", tostring(UIManager.last_dirty))
 check("search narrows the visible books", #picker:visibleBooks() == 2,
     tostring(#picker:visibleBooks()))
 picker:clearSearch()
@@ -776,10 +817,10 @@ check("clear search restores the full list",
     picker.query == nil and #picker:visibleBooks() == 5,
     tostring(picker.query) .. "/" .. tostring(#picker:visibleBooks()))
 check("clear search repaints flashless too",
-    UIManager.last_dirty == "partial", tostring(UIManager.last_dirty))
+    UIManager.last_dirty == "ui", tostring(UIManager.last_dirty))
 picker:gotoPage(2)
-check("page turns repaint flashless (partial)",
-    UIManager.last_dirty == "partial", tostring(UIManager.last_dirty))
+check("page turns repaint flashless (ui — never promoted)",
+    UIManager.last_dirty == "ui", tostring(UIManager.last_dirty))
 
 -- 1.3.18 follow-up: uniform font + a framed box on EVERY row (Button no
 -- longer shrinks long titles into a smaller font), and the active-filter
@@ -976,6 +1017,22 @@ inst:setFolder("CrossDropped Files")
 check("setFolder('CrossDropped Files') restores the default",
     inst:configuredTargets()[1].folder == "/CrossDropped Files",
     inst:configuredTargets()[1].folder)
+inst:setFolder("Books/Sci-Fi")
+check("setFolder accepts a nested folder path (any depth)",
+    inst:configuredTargets()[1].folder == "/Books/Sci-Fi",
+    inst:configuredTargets()[1].folder)
+inst:setFolder("/Books//Sci-Fi/")
+check("setFolder normalizes leading/skip/trailing slashes",
+    inst:configuredTargets()[1].folder == "/Books/Sci-Fi",
+    inst:configuredTargets()[1].folder)
+inst:setFolder("Books/../etc")
+check("setFolder rejects a '..' segment",
+    inst:configuredTargets()[1].folder == "/CrossDropped Files",
+    inst:configuredTargets()[1].folder)
+inst:setFolder("Books/./etc")
+check("setFolder rejects a '.' segment",
+    inst:configuredTargets()[1].folder == "/CrossDropped Files",
+    inst:configuredTargets()[1].folder)
 
 -- 9. menu registration: CrossDrop opens the dashboard directly (no submenu)
 local menu_items = {}
@@ -1067,6 +1124,19 @@ home:check("wifi")
 check("home check() marks wifi down (no crash)", inst._reach.wifi == "down", inst._reach.wifi)
 FAKE.fail = false
 
+-- Walk a rendered widget tree collecting every text string (headers, rows,
+-- buttons). Declared before the first section that needs it.
+local function flatten_texts(w, out)
+    out = out or {}
+    if type(w) == "table" then
+        if type(w.text) == "string" then out[#out + 1] = w.text end
+        for i = 1, #w do
+            if type(w[i]) == "table" then flatten_texts(w[i], out) end
+        end
+    end
+    return out
+end
+
 -- 11c. Tab switching and check() must NOT use UIManager:replace (that exact
 -- call crashed KOReader on the Kindle — the method does not exist). They
 -- re-init the same widget in place and repaint.
@@ -1078,22 +1148,20 @@ if home then
     home:showTab("connections")
     check("showTab no-op on same tab", home.tab == "connections")
     check("tab switch re-inits the widget", home.frame ~= nil and home[1] ~= nil)
+    -- The version line sits ABOVE the setup guide (at the guide's tail it ran
+    -- off the bottom of the panel on the device).
+    local conn_flat = table.concat(flatten_texts(home.frame))
+    local v_pos = conn_flat:find("CrossDrop " .. tostring(inst.VERSION or ""), 1, true)
+    local g_pos = conn_flat:find("To receive books", 1, true)
+    check("connections shows the version above the setup guide",
+        v_pos ~= nil and g_pos ~= nil and v_pos < g_pos,
+        tostring(v_pos) .. "/" .. tostring(g_pos))
 end
 
 -- 12. THE SEND DIALOG: a plain "… please wait" view (NO progress bar — on this
--- build socket.http drains the file to the TCP buffers in milliseconds, so the
--- bar sat at 0% then jumped to done). It must build without crashing and its
--- update() must be inert.
-local function flatten_texts(w, out)
-    out = out or {}
-    if type(w) == "table" then
-        if type(w.text) == "string" then out[#out + 1] = w.text end
-        for i = 1, #w do
-            if type(w[i]) == "table" then flatten_texts(w[i], out) end
-        end
-    end
-    return out
-end
+-- build socket.http drains the file to the TCP buffers in milliseconds, so
+-- the bar sat at 0% then jumped to done). It must build without crashing and
+-- its update() must be inert.
 local ProgressMod = require("crossdrop_progress")
 local dlg = ProgressMod.new("mybook.epub", { ip = "192.168.1.50", port = 80, folder = "/CrossDropped Files" })
 check("waiting dialog builds (no crash)", type(dlg) == "table", dlg)
@@ -1381,9 +1449,10 @@ check("listFolders guards the empty IP",
     lf3_ok == nil and tostring(lf3_err):find("WiFi IP not set", 1, true) ~= nil, tostring(lf3_err))
 G_reader_settings:saveSetting("crossdrop_wifi_ip", "10.1.2.3")
 
--- 14d. DESTINATION DIALOG: reached from the Send tab, lists the reader's
--- folders, and a pick persists. A failed listing still leaves the typed-name
--- and default choices usable; an unset IP just shows the hint.
+-- 14d. DESTINATION FOLDER TREE: reached from the Send tab, renders the
+-- reader's folders as a tree. The reader being unreachable shows ONLY the
+-- "Device not found…" message (no retry / typed-path fallback); an unset IP
+-- just shows the hint.
 inst:setFolder("CrossDropped Files")
 raw_ok(CLEAN_FILES_JSON)
 UIManager._shown = {}
@@ -1391,13 +1460,20 @@ inst:openHome()
 home = UIManager._shown[#UIManager._shown]
 home:chooseDestination()
 local dlg = UIManager._shown[#UIManager._shown]
-check("chooseDestination opens the folder dialog",
+check("chooseDestination opens the folder tree",
     dlg ~= nil and type(dlg) == "table", dlg and tostring(dlg.__name))
-check("folder dialog lists the reader folders",
-    dlg and dlg.folders and dlg.folders[1] == "Books"
-        and dlg.folders[2] == "CrossDropped Files" and dlg.folders[3] == "sleep",
-    dlg and dlg.folders and table.concat(dlg.folders, ","))
-check("folder dialog renders a full-screen card",
+local root_names, root_list = {}, {}
+for _, node in ipairs(dlg and dlg.nodes or {}) do
+    if not root_names[node.name] then
+        root_names[node.name] = true
+        root_list[#root_list + 1] = node.name
+    end
+end
+check("folder tree lists the reader folders at the root",
+    root_names["Books"] and root_names["CrossDropped Files"] and root_names["sleep"]
+        and not root_names["MyBook.epub"],
+    table.concat(root_list, ","))
+check("folder tree renders a full-screen card",
     dlg and dlg.frame ~= nil and dlg.frame:getSize().w <= SCREEN_W,
     dlg and dlg.frame and dlg.frame:getSize().w)
 dlg:pick("Books")
@@ -1405,7 +1481,7 @@ check("picking a folder saves it",
     inst:configuredTargets()[1].folder == "/Books",
     inst:configuredTargets()[1].folder)
 check("picking a folder refreshes the dashboard in place",
-    UIManager.last_dirty == "partial", tostring(UIManager.last_dirty))
+    UIManager.last_dirty == "ui", tostring(UIManager.last_dirty))
 FAKE.fail = true
 inst:setFolder("CrossDropped Files")
 UIManager._shown = {}
@@ -1413,16 +1489,16 @@ inst:openHome()
 home = UIManager._shown[#UIManager._shown]
 home:chooseDestination()
 dlg = UIManager._shown[#UIManager._shown]
-check("failed listing shows the error but keeps the dialog usable",
-    dlg ~= nil and dlg.folders == nil and tostring(dlg.list_err) ~= "",
-    dlg and tostring(dlg.list_err))
+check("unreachable reader opens the tree with no folders",
+    dlg ~= nil and dlg.nodes == nil and dlg.list_err == true)
 local dlg_flat = table.concat(flatten_texts(dlg.frame), "\n")
-check("failed listing offers a retry in the dialog",
-    dlg_flat:find("Retry listing", 1, true) ~= nil, dlg_flat)
-dlg:pick("New Novels")
-check("typed destination saves even when the reader is down",
-    inst:configuredTargets()[1].folder == "/New Novels",
-    inst:configuredTargets()[1].folder)
+check("unreachable reader shows ONLY the device-not-found message",
+    dlg_flat:find("Device not found", 1, true) ~= nil
+        and dlg_flat:find("check Xteink IP", 1, true) ~= nil
+        and dlg_flat:find("Folders on the reader", 1, true) == nil
+        and dlg_flat:find("Retry", 1, true) == nil
+        and dlg_flat:find("Type a folder path", 1, true) == nil,
+    dlg_flat)
 FAKE.fail = false
 inst:setFolder("CrossDropped Files")
 G_reader_settings:saveSetting("crossdrop_wifi_ip", nil)
@@ -1436,6 +1512,308 @@ check("unset IP shows the Set WiFi IP hint instead of the dialog",
         and dlg_msg.text:find("WiFi IP", 1, true) ~= nil,
     dlg_msg and dlg_msg.text)
 G_reader_settings:saveSetting("crossdrop_wifi_ip", "10.1.2.3")
+
+-- 14e. NESTED DESTINATIONS (network): listFolders answers ?path= for what
+-- sits inside a folder (URL-decoded by the reader), and a deep destination
+-- is MKCOL-created parent by parent so the reader's 409 (missing parent)
+-- can never abort a deep create.
+local tgf = { ip = "192.168.1.50", port = 80 }
+raw_ok(SUBDIR_JSON)
+local ln_ok, ln_folders, ln_err = inst:listFolders(tgf, "Books")
+check("listFolders lists the folders inside a path",
+    ln_ok == true and ln_folders[1] == "Fiction" and ln_folders[2] == "Non-Fiction",
+    ln_folders and table.concat(ln_folders, ",") or tostring(ln_err))
+check("listFolders asks ?path= for the subfolder",
+    last_raw_request:find("GET /api/files?path=Books ", 1, true) ~= nil, last_raw_request)
+raw_ok(SUBDIR_JSON)
+local ln2, ln2f = inst:listFolders(tgf, "/Books")
+check("listFolders tolerates a leading slash in the path",
+    ln2 == true and ln2f and ln2f[1] == "Fiction", ln2f and table.concat(ln2f, ","))
+raw_ok(SUBDIR_JSON)
+local ln3 = inst:listFolders(tgf, "CrossDropped Files")
+check("listFolders URL-encodes spaces in the path",
+    ln3 ~= nil and last_raw_request:find("?path=CrossDropped%20Files", 1, true) ~= nil,
+    last_raw_request)
+local deep_target = { ip = "192.168.1.50", port = 80, folder = "/Books/Sci-Fi" }
+FAKE.mkcol_returns = { ["http://192.168.1.50:80/Books"] = 405, ["http://192.168.1.50:80/Books/Sci-Fi"] = 201 }
+FAKE.mkcol_urls = {}
+local nf_ok, nf_err = inst:ensureFolder(deep_target)
+check("ensureFolder creates a nested folder",
+    nf_ok == true, nf_err)
+check("ensureFolder MKCOLs every parent prefix in order",
+    FAKE.mkcol_urls[1] == "http://192.168.1.50:80/Books"
+        and FAKE.mkcol_urls[2] == "http://192.168.1.50:80/Books/Sci-Fi",
+    table.concat(FAKE.mkcol_urls, " | "))
+FAKE.mkcol_returns = { ["http://192.168.1.50:80/Books"] = 409 }
+FAKE.mkcol_urls = {}
+local nf_bad, nf_berr = inst:ensureFolder(deep_target)
+check("ensureFolder stops on a missing parent (reader 409)",
+    nf_bad == nil and tostring(nf_berr):find("could not create folder", 1, true) ~= nil, nf_berr)
+FAKE.mkcol_returns = nil
+
+-- 14f. FOLDER TREE NAVIGATION: an ▸ tap fetches and opens a folder, showing
+-- subfolders indented under it; an open folder with nothing inside says only
+-- "No subfolders found in /X"; tapping a folder NAME opens Select / Create
+-- Subfolder… / Cancel; creating a subfolder adds it to the tree and picks it.
+inst:setFolder("CrossDropped Files")
+raw_ok(CLEAN_FILES_JSON)
+UIManager._shown = {}
+inst:openHome()
+home = UIManager._shown[#UIManager._shown]
+home:chooseDestination()
+dlg = UIManager._shown[#UIManager._shown]
+local flat_root = table.concat(flatten_texts(dlg.frame), "\n")
+check("root tree is boxless (no create/typed clutter)",
+    flat_root:find("Folders on the reader", 1, true) ~= nil
+        and flat_root:find("back to the default", 1, true) ~= nil
+        and flat_root:find("Device not found", 1, true) == nil
+        and flat_root:find("Type a folder path", 1, true) == nil,
+    flat_root)
+raw_ok(SUBDIR_JSON)
+local books_node = dlg:findNode("Books")
+dlg:expandNode(books_node)
+check("expanding a folder fetches and lists its subfolders",
+    dlg:findNode("Books/Fiction") ~= nil and dlg:findNode("Books/Non-Fiction") ~= nil,
+    tostring(dlg:findNode("Books/Fiction") and dlg:findNode("Books/Fiction").path))
+local flat_open = table.concat(flatten_texts(dlg.frame), "\n")
+check("open folder shows its subfolders with no empty note",
+    flat_open:find("Fiction", 1, true) ~= nil
+        and flat_open:find("No subfolders found", 1, true) == nil,
+    flat_open)
+check("expanding repaints flashless (ui — never promoted)",
+    UIManager.last_dirty == "ui", tostring(UIManager.last_dirty))
+dlg:toggleNode(books_node)
+local flat_collapsed = table.concat(flatten_texts(dlg.frame), "\n")
+check("collapsing hides the subfolders again",
+    dlg:findNode("Books/Fiction") ~= nil -- structure kept, just not rendered
+        and flat_collapsed:find("Fiction", 1, true) == nil,
+    flat_collapsed)
+raw_ok("[]")
+local sleep_node = dlg:findNode("sleep")
+dlg:expandNode(sleep_node)
+local flat_empty = table.concat(flatten_texts(dlg.frame), "\n")
+check("an empty folder says only 'No subfolders found in /X'",
+    dlg:findNode("sleep") ~= nil
+        and dlg:findNode("sleep").children ~= nil
+        and #dlg:findNode("sleep").children == 0
+        and flat_empty:find("No subfolders found in /sleep", 1, true) ~= nil
+        and flat_empty:find("Device not found", 1, true) == nil,
+    flat_empty)
+dlg:showFolderMenu(dlg:findNode("Books"))
+local menu = UIManager._shown[#UIManager._shown]
+check("tapping a folder name opens the action menu",
+    type(menu) == "table" and menu.modal == true, menu and tostring(menu.modal))
+local flat_menu = table.concat(flatten_texts(menu.frame), "\n")
+check("the action menu offers Select / Create Subfolder / Cancel",
+    flat_menu:find("Select", 1, true) ~= nil
+        and flat_menu:find("Create Subfolder", 1, true) ~= nil
+        and flat_menu:find("Cancel", 1, true) ~= nil,
+    flat_menu)
+menu:onSelect()
+check("Select makes the folder the destination",
+    inst:configuredTargets()[1].folder == "/Books",
+    inst:configuredTargets()[1].folder)
+raw_ok(CLEAN_FILES_JSON)
+UIManager._shown = {}
+inst:openHome()
+home = UIManager._shown[#UIManager._shown]
+home:chooseDestination()
+dlg = UIManager._shown[#UIManager._shown]
+dlg:showFolderMenu(dlg:findNode("Books"))
+menu = UIManager._shown[#UIManager._shown]
+menu:onCreate()
+local sub_dlg = UIManager._shown[#UIManager._shown]
+check("Create Subfolder opens a modal name dialog",
+    type(sub_dlg) == "table" and sub_dlg.modal == true,
+    sub_dlg and tostring(sub_dlg.__name))
+sub_dlg.getInputText = function() return "Sci-Fi" end
+for _, row in ipairs(sub_dlg.buttons or {}) do
+    for _, btn in ipairs(row) do
+        if btn.text == "Save" then btn.callback() end
+    end
+end
+check("creating a subfolder picks <folder>/<name> as the destination",
+    inst:configuredTargets()[1].folder == "/Books/Sci-Fi",
+    inst:configuredTargets()[1].folder)
+local created = dlg:findNode("Books/Sci-Fi")
+check("creating a subfolder adds it to the tree under its parent",
+    created ~= nil and created.pending == true,
+    created and created.path)
+dlg:expandNode(created) -- pending child: expands locally, no network call
+local flat_created = table.concat(flatten_texts(dlg.frame), "\n")
+check("a just-created subfolder expands locally (no subfolders yet)",
+    flat_created:find("No subfolders found in /Books/Sci-Fi", 1, true) ~= nil,
+    flat_created)
+dlg:pick("CrossDropped Files")
+check("leaving the tree restores the default",
+    inst:configuredTargets()[1].folder == "/CrossDropped Files",
+    inst:configuredTargets()[1].folder)
+
+-- 14g. TREE WIRING: the rendered ▸ control and the folder NAME must be
+-- wired to the right actions — ▸ expands/collapses INLINE (fetches the
+-- children, renders them indented, does NOT pick), the NAME opens the tiny
+-- Select / Create Subfolder / Cancel popup (small like the send-confirmation
+-- ConfirmBox, never a full page). This is exactly the wiring that once
+-- regressed: both taps picked the folder and the tree never opened.
+local function collect_buttons(w, acc)
+    acc = acc or {}
+    if type(w) == "table" then
+        if w.__name == "ui/widget/button" then acc[#acc + 1] = w end
+        for i = 1, #w do
+            if type(w[i]) == "table" then collect_buttons(w[i], acc) end
+        end
+    end
+    return acc
+end
+inst:setFolder("CrossDropped Files")
+raw_ok(CLEAN_FILES_JSON)
+UIManager._shown = {}
+inst:openHome()
+home = UIManager._shown[#UIManager._shown]
+home:chooseDestination()
+dlg = UIManager._shown[#UIManager._shown]
+local row_btns = collect_buttons(dlg.frame)
+local books_arrow, books_name
+for _, b in ipairs(row_btns) do
+    if books_arrow == nil and b.text == "\226\150\184" then books_arrow = b end -- first ▸ is Books
+    if b.text == "Books" then books_name = b end
+end
+check("each tree row exposes a ▸ control and a folder-name button",
+    books_arrow ~= nil and books_name ~= nil,
+    tostring(books_arrow ~= nil) .. "/" .. tostring(books_name ~= nil))
+raw_ok(SUBDIR_JSON)
+books_arrow.callback()
+check("tapping ▸ expands the folder inline (no pick, no menu)",
+    dlg:findNode("Books/Fiction") ~= nil
+        and inst:configuredTargets()[1].folder ~= "/Books",
+    inst:configuredTargets()[1].folder)
+local flat_after_arrow = table.concat(flatten_texts(dlg.frame), "\n")
+check("▸ tap renders the subfolders indented under the mother folder",
+    flat_after_arrow:find("Fiction", 1, true) ~= nil
+        and flat_after_arrow:find("CrossDropped Files", 1, true) ~= nil,
+    flat_after_arrow)
+UIManager._shown = {}
+books_name.callback()
+local popup = UIManager._shown[#UIManager._shown]
+check("tapping the folder NAME opens the action popup",
+    type(popup) == "table" and popup.modal == true
+        and popup.node ~= nil and popup.node.path == "Books",
+    popup and popup.node and popup.node.path)
+local popup_flat = table.concat(flatten_texts(popup.frame), "\n")
+check("the popup offers Select / Create Subfolder / Cancel",
+    popup_flat:find("Select", 1, true) ~= nil
+        and popup_flat:find("Create Subfolder", 1, true) ~= nil
+        and popup_flat:find("Cancel", 1, true) ~= nil,
+    popup_flat)
+check("the popup is a tiny centered card, not a full page",
+    popup.frame ~= nil and popup.frame:getSize().w < SCREEN_W,
+    popup.frame and popup.frame:getSize().w)
+check("the popup refreshes ONLY its box region (no whole-screen sweep)",
+    UIManager.last_show_mode == "ui"
+        and UIManager.last_show_region ~= nil
+        and UIManager.last_show_region.w < SCREEN_W
+        and UIManager.last_show_region.h < SCREEN_H,
+    tostring(UIManager.last_show_mode) .. " "
+        .. (UIManager.last_show_region and (UIManager.last_show_region.w .. "x" .. UIManager.last_show_region.h) or "no-region"))
+popup:onCancel()
+check("closing the popup repaints only the box-sized hole too",
+    UIManager.last_close_mode == "ui" and UIManager.last_close_region ~= nil,
+    tostring(UIManager.last_close_mode))
+check("popup Cancel leaves the destination alone",
+    inst:configuredTargets()[1].folder ~= "/Books",
+    inst:configuredTargets()[1].folder)
+books_arrow.callback() -- now ▾: collapses the tree back
+local flat_recollapsed = table.concat(flatten_texts(dlg.frame), "\n")
+check("tapping ▾ collapses the tree back (root folders stay visible)",
+    flat_recollapsed:find("Fiction", 1, true) == nil
+        and flat_recollapsed:find("Books", 1, true) ~= nil
+        and flat_recollapsed:find("sleep", 1, true) ~= nil,
+    flat_recollapsed)
+dlg:pick("CrossDropped Files")
+
+-- 14h. BACK CHEVRON + LIVE DASHBOARD + TAP TARGET: both pages carry a back
+-- chevron top-left (dashboard-return, no "closing the app" reading); leaving
+-- the tree refreshes the dashboard's destination row; a subfolder created
+-- in the tree (pending, not yet on the reader) already shows on that row;
+-- the ▸ control is a real tap target, not a hairline glyph.
+local function collect_named(w, want, acc)
+    acc = acc or {}
+    if type(w) == "table" then
+        if w.__name == want then acc[#acc + 1] = w end
+        for i = 1, #w do
+            if type(w[i]) == "table" then collect_named(w[i], want, acc) end
+        end
+    end
+    return acc
+end
+inst:setFolder("CrossDropped Files")
+raw_ok(CLEAN_FILES_JSON)
+UIManager._shown = {}
+inst:openHome()
+home = UIManager._shown[#UIManager._shown]
+home.tab = "send" -- the destination row lives on the Send tab
+home:init()
+home:chooseDestination()
+dlg = UIManager._shown[#UIManager._shown]
+local tree_tbars = collect_named(dlg.frame, "ui/widget/titlebar")
+check("the tree carries a back chevron and NO ✕ (home is behind it)",
+    #tree_tbars > 0 and tree_tbars[1].left_icon == "chevron.left"
+        and type(tree_tbars[1].left_icon_tap_callback) == "function"
+        and tree_tbars[1].close_callback == nil,
+    tree_tbars[1] and tostring(tree_tbars[1].left_icon))
+local home_tbars = collect_named(home.frame, "ui/widget/titlebar")
+check("the home dashboard keeps the ✕ (it alone leaves the plugin)",
+    #home_tbars > 0 and home_tbars[1].close_callback ~= nil
+        and home_tbars[1].left_icon == nil,
+    tostring(#home_tbars))
+row_btns = collect_buttons(dlg.frame)
+local arrow_btn
+for _, b in ipairs(row_btns) do
+    if arrow_btn == nil and b.text == "\226\150\184" then arrow_btn = b end
+end
+check("the ▸ control is a real tap target (wide, bigger glyph)",
+    arrow_btn ~= nil and arrow_btn.width >= scal(40)
+        and (arrow_btn.text_font_size or 0) >= 26,
+    arrow_btn and (tostring(arrow_btn.width) .. "/" .. tostring(arrow_btn.text_font_size)))
+raw_ok(SUBDIR_JSON)
+dlg:expandNode(dlg:findNode("Books"))
+UIManager._shown = {}
+dlg:showFolderMenu(dlg:findNode("Books"))
+menu = UIManager._shown[#UIManager._shown]
+menu:onCreate()
+local sub_dlg2 = UIManager._shown[#UIManager._shown]
+sub_dlg2.getInputText = function() return "Sci-Fi" end
+for _, row in ipairs(sub_dlg2.buttons or {}) do
+    for _, btn in ipairs(row) do
+        if btn.text == "Save" then btn.callback() end
+    end
+end
+check("a created (still-pending) subfolder already shows on the dashboard row",
+    inst:configuredTargets()[1].folder == "/Books/Sci-Fi"
+        and table.concat(flatten_texts(home.frame)):find("Books/Sci-Fi", 1, true) ~= nil,
+    table.concat(flatten_texts(home.frame)))
+UIManager._shown = {}
+dlg:leave()
+check("the back chevron leaves the tree and refreshes the dashboard",
+    inst:configuredTargets()[1].folder == "/Books/Sci-Fi" -- destination kept
+        and table.concat(flatten_texts(home.frame)):find("Books/Sci-Fi", 1, true) ~= nil,
+    inst:configuredTargets()[1].folder)
+
+-- The picker carries the same back chevron, wired to its dashboard-return.
+UIManager._shown = {}
+inst:chooseAndSend()
+local picker_dlg = UIManager._shown[#UIManager._shown]
+check("chooseAndSend opens the picker", type(picker_dlg) == "table" and picker_dlg.books ~= nil)
+local picker_tbars = collect_named(picker_dlg.frame, "ui/widget/titlebar")
+check("the picker carries the back chevron and NO ✕ (home is behind it)",
+    #picker_tbars > 0 and picker_tbars[1].left_icon == "chevron.left"
+        and type(picker_tbars[1].left_icon_tap_callback) == "function"
+        and picker_tbars[1].close_callback == nil,
+    picker_tbars[1] and tostring(picker_tbars[1].left_icon))
+picker_tbars[1].left_icon_tap_callback()
+check("tapping the picker's back chevron returns to the dashboard",
+    picker_dlg._closed == true, tostring(picker_dlg._closed))
+dlg:pick("CrossDropped Files")
 
 -- 15. IP PERSISTENCE: the WiFi IP lives in KOReader's global settings; in
 -- this plugin it is only ever written by the Set WiFi IP dialog.
