@@ -384,6 +384,8 @@ local FAKE = {
     mkcol_count = 0,        -- first MKCOL -> 201, rest -> 405 (see fake_request)
     mkcol_urls = {},        -- every MKCOL url answered (asserts the parent walk)
     mkcol_returns = nil,    -- optional { [url] = status } to force per-URL replies
+    delete_urls = {},       -- every DELETE url answered (the delete tab's tree)
+    delete_returns = nil,   -- optional { [url] = status } to force per-URL replies
 }
 
 -- Real wire capture from the Xteink reader (nc at 192.168.7.45:80): it streams
@@ -434,6 +436,13 @@ local function fake_request(args)
         FAKE.mkcol_count = FAKE.mkcol_count + 1
         if FAKE.mkcol_count == 1 then return "", 201 end
         return "", 405
+    end
+    if method == "DELETE" then
+        FAKE.delete_urls[#FAKE.delete_urls + 1] = url
+        if FAKE.delete_returns and FAKE.delete_returns[url] then
+            return "", FAKE.delete_returns[url]
+        end
+        return "", 204
     end
     if method == "PUT" then
         if args and args.source then
@@ -1814,6 +1823,163 @@ picker_tbars[1].left_icon_tap_callback()
 check("tapping the picker's back chevron returns to the dashboard",
     picker_dlg._closed == true, tostring(picker_dlg._closed))
 dlg:pick("CrossDropped Files")
+
+-- 14i. DELETE TAB (1.4.0): its OWN tab (never inside Send A Book), the same
+-- tree system but listing FILES too, a confirm popup before anything dies,
+-- one WebDAV DELETE on confirm, a popup reporting the result, and the tree
+-- live-refreshing in place. Deleting the destination (or its parent) resets
+-- the destination to the default.
+local ENTRIES_JSON = '[{"name":"Books","size":0,"isDirectory":true,"isEpub":false},'
+    .. '{"name":"MyBook.epub","size":123,"isDirectory":false,"isEpub":true},'
+    .. '{"name":"CrossDropped Files","size":0,"isDirectory":true,"isEpub":false}]'
+local SUBDIR_ENTRIES_JSON = '[{"name":"Fiction","size":0,"isDirectory":true,"isEpub":false},'
+    .. '{"name":"Artemis Fowl.epub","size":456,"isDirectory":false,"isEpub":true}]'
+inst:setFolder("CrossDropped Files")
+raw_ok(ENTRIES_JSON)
+local lek, entries = inst:listEntries(inst:resolveTarget())
+check("listEntries lists folders AND files",
+    lek and type(entries) == "table" and #entries == 3
+        and entries[1].name == "Books" and entries[1].is_dir == true
+        and entries[3].name == "MyBook.epub" and entries[3].is_dir == false,
+    lek and type(entries) == "table" and #entries or tostring(lek))
+check("listEntries sorts folders before files",
+    entries and entries[1].is_dir == true and entries[2].is_dir == true
+        and entries[#entries].is_dir == false)
+raw_ok(SUBDIR_ENTRIES_JSON)
+inst:listEntries(inst:resolveTarget(), "Books")
+check("listEntries asks ?path= for the subfolder",
+    last_raw_request:find("/api/files?path=Books", 1, true) ~= nil, last_raw_request)
+FAKE.delete_urls = {}
+local dek, derr = inst:deleteEntry(inst:resolveTarget(), "Books/Fiction")
+check("deleteEntry sends one WebDAV DELETE",
+    dek == true and #FAKE.delete_urls == 1
+        and FAKE.delete_urls[1]:find("Books/Fiction", 1, true) ~= nil,
+    tostring(dek) .. " " .. table.concat(FAKE.delete_urls, " | "))
+FAKE.delete_returns = { ["http://10.1.2.3:80/Books/Fiction"] = 500 }
+local dfk, dferr = inst:deleteEntry(inst:resolveTarget(), "Books/Fiction")
+check("deleteEntry reports a device error",
+    dfk == nil and type(dferr) == "string", tostring(dferr))
+FAKE.delete_returns = nil
+
+-- The tab itself: its own screen, never mixed into the Send tab.
+raw_ok(ENTRIES_JSON)
+UIManager._shown = {}
+inst:openHome()
+home = UIManager._shown[#UIManager._shown]
+home:showTab("delete")
+local del_tab_flat = table.concat(flatten_texts(home.frame))
+check("Delete Folders/Files is its own tab with its own screen",
+    home.tab == "delete"
+        and del_tab_flat:find("Delete on the reader", 1, true) ~= nil
+        and del_tab_flat:find("Browse the reader and pick things to delete", 1, true) ~= nil
+        and del_tab_flat:find("Nothing is deleted until you confirm", 1, true) ~= nil,
+    del_tab_flat)
+UIManager._shown = {}
+home:openDeleteTree()
+local dtree = UIManager._shown[#UIManager._shown]
+check("openDeleteTree opens the delete tree (folders AND files at the root)",
+    type(dtree) == "table" and dtree.modal == true and dtree.nodes ~= nil
+        and dtree:findNode("Books") ~= nil and dtree:findNode("MyBook.epub") ~= nil,
+    tostring(dtree and dtree.nodes and #dtree.nodes))
+local dtree_flat = table.concat(flatten_texts(dtree.frame))
+check("the delete tree renders folder and file rows",
+    dtree_flat:find("Books", 1, true) ~= nil
+        and dtree_flat:find("MyBook.epub", 1, true) ~= nil,
+    dtree_flat)
+local del_btns = collect_buttons(dtree.frame)
+local del_arrow_count = 0
+for _, b in ipairs(del_btns) do
+    if b.text == "\226\150\184" then del_arrow_count = del_arrow_count + 1 end
+end
+check("only folders carry the ▸ control — files have none",
+    del_arrow_count == 2, tostring(del_arrow_count))
+raw_ok(SUBDIR_ENTRIES_JSON)
+dtree:expandNode(dtree:findNode("Books"))
+local dopen_flat = table.concat(flatten_texts(dtree.frame))
+check("expanding shows the subfolder's files and folders inline",
+    dopen_flat:find("Fiction", 1, true) ~= nil
+        and dopen_flat:find("Artemis Fowl.epub", 1, true) ~= nil
+        and dopen_flat:find("MyBook.epub", 1, true) ~= nil,
+    dopen_flat)
+-- The confirm popup: says exactly WHAT dies (file vs folder), only its box
+-- region refreshes.
+FAKE.delete_urls = {}
+UIManager._shown = {}
+dtree:showDeletePopup(dtree:findNode("Books/Fiction"))
+local dpop = UIManager._shown[#UIManager._shown]
+local dpop_flat = table.concat(flatten_texts(dpop.frame), "\n")
+check("the folder popup asks 'Delete folder and its contents?' by name",
+    dpop_flat:find("Delete folder and its contents?", 1, true) ~= nil
+        and dpop_flat:find("/Books/Fiction", 1, true) ~= nil
+        and dpop_flat:find("Delete", 1, true) ~= nil
+        and dpop_flat:find("Cancel", 1, true) ~= nil,
+    dpop_flat)
+check("the delete popup refreshes only its box region",
+    UIManager.last_show_region ~= nil and UIManager.last_show_region.w < SCREEN_W,
+    UIManager.last_show_region and UIManager.last_show_region.w)
+dpop:onCancel()
+check("Cancel deletes nothing",
+    dtree:findNode("Books/Fiction") ~= nil and #FAKE.delete_urls == 0,
+    tostring(#FAKE.delete_urls))
+-- A FILE popup says "Delete file?" instead.
+UIManager._shown = {}
+dtree:showDeletePopup(dtree:findNode("Books/Artemis Fowl.epub"))
+dpop = UIManager._shown[#UIManager._shown]
+dpop_flat = table.concat(flatten_texts(dpop.frame), "\n")
+check("the file popup asks 'Delete file?' by name",
+    dpop_flat:find("Delete file?", 1, true) ~= nil
+        and dpop_flat:find("Artemis Fowl.epub", 1, true) ~= nil,
+    dpop_flat)
+dpop:onCancel()
+-- Confirm: one DELETE, the tree live-refreshes, a popup reports it.
+UIManager._shown = {}
+FAKE.delete_urls = {}
+dtree:showDeletePopup(dtree:findNode("Books/Fiction"))
+dpop = UIManager._shown[#UIManager._shown]
+dpop:onConfirm()
+check("confirm sends the DELETE and the node leaves the tree",
+    #FAKE.delete_urls == 1
+        and FAKE.delete_urls[1]:find("Books/Fiction", 1, true) ~= nil
+        and dtree:findNode("Books/Fiction") == nil,
+    table.concat(FAKE.delete_urls, " | "))
+local del_after_flat = table.concat(flatten_texts(dtree.frame))
+check("the tree repaints without the deleted folder (live refresh)",
+    del_after_flat:find("Fiction", 1, true) == nil
+        and del_after_flat:find("Books", 1, true) ~= nil,
+    del_after_flat)
+check("a popup reports the deletion",
+    UIManager._shown[#UIManager._shown] ~= nil
+        and type(UIManager._shown[#UIManager._shown].text) == "string"
+        and UIManager._shown[#UIManager._shown].text:find("Deleted", 1, true) ~= nil,
+    UIManager._shown[#UIManager._shown] and UIManager._shown[#UIManager._shown].text)
+-- Deleting the destination (or its parent) resets the destination.
+inst:setFolder("Books/Fiction")
+raw_ok(ENTRIES_JSON)
+UIManager._shown = {}
+home:openDeleteTree()
+dtree = UIManager._shown[#UIManager._shown]
+UIManager._shown = {}
+FAKE.delete_urls = {}
+dtree:showDeletePopup(dtree:findNode("Books"))
+dpop = UIManager._shown[#UIManager._shown]
+dpop:onConfirm()
+check("deleting the destination's parent resets it to the default",
+    #FAKE.delete_urls == 1 and FAKE.delete_urls[1]:find("/Books$", 1) ~= nil
+        and inst:configuredTargets()[1].folder == "/CrossDropped Files",
+    inst:configuredTargets()[1].folder)
+-- Unreachable reader: message-only, nothing to tap but back.
+FAKE.fail = true
+UIManager._shown = {}
+home:openDeleteTree()
+local derr_dlg = UIManager._shown[#UIManager._shown]
+local derr_flat = table.concat(flatten_texts(derr_dlg.frame))
+check("unreachable reader: the delete tree shows only the device message",
+    derr_dlg.list_err == true
+        and derr_flat:find("Device not found", 1, true) ~= nil
+        and derr_flat:find("Nothing on the reader", 1, true) == nil,
+    derr_flat)
+FAKE.fail = false
+inst:setFolder("CrossDropped Files")
 
 -- 15. IP PERSISTENCE: the WiFi IP lives in KOReader's global settings; in
 -- this plugin it is only ever written by the Set WiFi IP dialog.

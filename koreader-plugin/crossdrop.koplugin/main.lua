@@ -65,7 +65,7 @@ local CROSSDROP = WidgetContainer:extend{
     -- Shown on the dashboard's Connections tab so the running build is
     -- always identifiable on the device (KOReader loads plugins once at
     -- startup — a replaced plugin file does nothing until restart).
-    VERSION = "1.3.33",
+    VERSION = "1.4.0",
 }
 
 local socket, http
@@ -439,6 +439,77 @@ function CROSSDROP:listFolders(target, path)
     table.sort(folders)
     logger.info("crossdrop: listFolders (", target.ip, ") -> ", #folders, " folders")
     return true, folders
+end
+
+-- List EVERYTHING in a folder — folders AND files — for the delete tab's
+-- tree: { { name = "Fiction", is_dir = true, size = 0 }, ... }, folders
+-- first, each group name-sorted.
+function CROSSDROP:listEntries(target, path)
+    if not target or not target.ip or target.ip == "" then
+        return nil, _("WiFi IP not set (see the Connections tab)")
+    end
+    local api_path = "/api/files"
+    local p = tostring(path or ""):gsub("^/+", ""):gsub("/+$", "")
+    if p ~= "" then
+        api_path = api_path .. "?path=" .. encode_path(p):gsub("^/", "")
+    end
+    local ok, code, body = self:rawBody(target, api_path, 10)
+    if not ok then
+        local err = (type(code) == "number")
+            and string.format("device replied %s", tostring(code))
+            or tostring(code or "unknown error")
+        logger.info("crossdrop: listEntries failed (", target.ip, "): ", err)
+        return nil, err
+    end
+    local entries = {}
+    if JSON then
+        local okj, parsed = pcall(JSON.decode, body)
+        if not (okj and type(parsed) == "table") then
+            okj, parsed = pcall(JSON.decode, dechunk(body))
+        end
+        if okj and type(parsed) == "table" then
+            for _, e in ipairs(parsed) do
+                if type(e) == "table" and e.name ~= "" then
+                    entries[#entries + 1] = {
+                        name = tostring(e.name),
+                        is_dir = e.isDirectory == true,
+                        size = tonumber(e.size) or 0,
+                    }
+                end
+            end
+        else
+            logger.info("crossdrop: listEntries could not parse the body from ", target.ip)
+            return nil, "could not parse the folder list"
+        end
+    end
+    table.sort(entries, function(a, b)
+        if a.is_dir ~= b.is_dir then return a.is_dir end
+        return a.name < b.name
+    end)
+    logger.info("crossdrop: listEntries (", target.ip, ") -> ", #entries, " entries")
+    return true, entries
+end
+
+-- Delete one file or folder (a folder deletes everything inside it) over
+-- WebDAV: DELETE http://<ip>:<port>/<path> — the reader answers 204.
+function CROSSDROP:deleteEntry(target, path)
+    if not target or not target.ip or target.ip == "" then
+        return nil, _("WiFi IP not set (see the Connections tab)")
+    end
+    local p = tostring(path or ""):gsub("^/+", ""):gsub("/+$", "")
+    if p == "" then
+        return nil, "nothing to delete"
+    end
+    local ok, code, errbody = self:req("DELETE", base_url(target) .. encode_path("/" .. p))
+    if ok then
+        logger.info("crossdrop: deleted /", p)
+        return true
+    end
+    local err = (type(code) == "number")
+        and string.format("device replied %s (%s)", tostring(code), tostring(errbody or ""))
+        or tostring(code or errbody or "unknown error")
+    logger.info("crossdrop: delete failed (", target.ip, "): ", err)
+    return nil, err
 end
 
 -- Make sure the destination folder exists. A nested destination (Books/x)

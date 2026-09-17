@@ -245,6 +245,7 @@ function HomeDialog:buildTabBar(content_w)
     local tabs = {
         { key = "connections", label = _("Connections") },
         { key = "send", label = _("Send A Book") },
+        { key = "delete", label = _("Delete Folders/Files") },
     }
     local tabs_widgets = {}
     for i, t in ipairs(tabs) do
@@ -313,6 +314,9 @@ function HomeDialog:buildTabContent(tab, width)
     self.row_w = width
     if tab == "connections" then
         return self:renderConnections()
+    end
+    if tab == "delete" then
+        return self:renderDelete()
     end
     if self.send_state == "connecting" then
         return self:renderSendConnecting()
@@ -1039,6 +1043,454 @@ function HomeDialog:chooseDestination()
         list_err = not ok,
     }, "ui")
     UIManager:forceRePaint()
+end
+
+-- The Delete Folders/Files tab body: its own screen (never mixed into Send
+-- A Book), so a delete can't happen while picking books.
+function HomeDialog:renderDelete()
+    local vg = VerticalGroup:new{ align = "left" }
+    local sc = function(v) return Device.screen:scaleBySize(v) end
+
+    table.insert(vg, self:header(_("Delete on the reader")))
+    table.insert(vg, self:row(_("Browse the reader and pick things to delete"), {
+        callback = function() self:openDeleteTree() end,
+    }))
+    table.insert(vg, VerticalSpan:new{ width = sc(12) })
+    table.insert(vg, TextBoxWidget:new{
+        text = _("Deleting happens on the reader itself. Folders take everything inside them.")
+            .. "\n" .. _("Nothing is deleted until you confirm it on the popup."),
+        face = Font:getFace("xx_smallinfofont"),
+        width = self.row_w,
+    })
+    return vg
+end
+
+-- Open the delete tree: the destination tree's system, listing FILES too.
+-- Same shape as chooseDestination — one flashless "ui" pass, no notice.
+function HomeDialog:openDeleteTree()
+    local InfoMessage = require("ui/widget/infomessage")
+    local target = self.plugin:resolveTarget()
+    if not target or not target.ip or target.ip == "" then
+        UIManager:show(InfoMessage:new{
+            text = _("Set the WiFi IP on the Connections tab first."),
+        })
+        return
+    end
+    local ok, entries = self.plugin:listEntries(target)
+    local nodes
+    if ok and entries then
+        nodes = {}
+        for _, e in ipairs(entries) do
+            local n = new_node(e.name, e.name, 0)
+            n.is_file = not e.is_dir
+            nodes[#nodes + 1] = n
+        end
+    end
+    UIManager:show(DeleteDialog:new{
+        plugin = self.plugin,
+        home = self,
+        nodes = nodes,
+        list_err = not ok,
+    }, "ui")
+    UIManager:forceRePaint()
+end
+
+-- ───────────────────── delete tab (files & folders) ─────────────────────
+-- A third tab, SEPARATE from Send A Book on purpose: deleting is a
+-- destructive act and gets its own screen so it can never happen by
+-- accident while picking books. It reuses the destination tree's system
+-- (▸/▾ inline expansion, boxless rows, tiny centered popups) but lists FILES
+-- as well as folders. Every delete is confirmed first, a popup reports the
+-- result, and the tree live-refreshes in place — no separate waiting screen.
+
+-- Global (like FolderMenuDialog): openDeleteTree, defined above, shows it.
+DeleteDialog = InputContainer:extend{
+    modal = true,
+    dismissable = false,
+    plugin = nil,     -- CROSSDROP instance (listEntries / deleteEntry)
+    home = nil,       -- the HomeDialog to return to
+    nodes = nil,      -- root tree (new_node list; file rows carry is_file)
+    list_err = nil,   -- reader unreachable → message-only body
+}
+
+function DeleteDialog:findNode(path)
+    local function walk(list)
+        for _, n in ipairs(list) do
+            if n.path == path then return n end
+            if n.children then
+                local hit = walk(n.children)
+                if hit then return hit end
+            end
+        end
+        return nil
+    end
+    return walk(self.nodes or {})
+end
+
+-- Remove `path` (and thus everything under it) from the cached tree.
+function DeleteDialog:removeNode(path)
+    local function drop_from(list)
+        for i = 1, #list do
+            if list[i].path == path then
+                table.remove(list, i)
+                return true
+            end
+        end
+        return false
+    end
+    if drop_from(self.nodes or {}) then return true end
+    local function walk(list)
+        for _, n in ipairs(list) do
+            if n.children then
+                if drop_from(n.children) then return true end
+                if walk(n.children) then return true end
+            end
+        end
+        return false
+    end
+    return walk(self.nodes or {})
+end
+
+function DeleteDialog:rebuild()
+    self:init()
+    UIManager:setDirty(self, "ui")
+    UIManager:forceRePaint()
+end
+
+function DeleteDialog:leave()
+    local home = self.home
+    UIManager:close(self)
+    UIManager:nextTick(function()
+        if home and home.refresh then home:refresh() end
+    end)
+end
+
+function DeleteDialog:onBack()
+    self:leave()
+    return true
+end
+
+function DeleteDialog:toggleNode(node)
+    if node.expanded then
+        node.expanded = false
+    else
+        self:expandNode(node)
+    end
+    self:rebuild()
+end
+
+function DeleteDialog:expandNode(node)
+    if node.expanded or node.is_file then return end
+    if node.pending then
+        node.children = node.children or {}
+        node.expanded = true
+        self:rebuild()
+        return
+    end
+    if node.children == nil then
+        local target = self.plugin:resolveTarget()
+        if not target or not target.ip or target.ip == "" then
+            self.list_err = true
+            self:rebuild()
+            return
+        end
+        local checking = Notification:new{ text = _("Looking up\226\128\166"), timeout = 0 }
+        UIManager:show(checking)
+        UIManager:forceRePaint()
+        local ok, entries = self.plugin:listEntries(target, node.path)
+        UIManager:close(checking)
+        if not ok then
+            self.list_err = true
+            self:rebuild()
+            return
+        end
+        node.children = {}
+        for _, e in ipairs(entries) do
+            local child = new_node(e.name, node.path .. "/" .. e.name, node.depth + 1)
+            child.is_file = not e.is_dir
+            node.children[#node.children + 1] = child
+        end
+    end
+    node.expanded = true
+    self:rebuild()
+end
+
+-- The confirmed delete: one WebDAV DELETE, a popup reporting the result, and
+-- the tree refreshing in place. If the deleted folder WAS the destination,
+-- the destination falls back to the CrossDropped Files default so a later
+-- send cannot target a deleted folder.
+function DeleteDialog:deleteNode(node)
+    local target = self.plugin:resolveTarget()
+    if not target or not target.ip or target.ip == "" then
+        UIManager:show(Notification:new{ text = _("Set the WiFi IP on the Connections tab first."), timeout = 4 })
+        return
+    end
+    local ok, err = self.plugin:deleteEntry(target, node.path)
+    if not ok then
+        UIManager:show(Notification:new{
+            text = _("Could not delete /" .. tostring(node.path) .. ":\n") .. tostring(err or "unknown error"),
+            timeout = 5,
+        })
+        return
+    end
+    -- A deleted destination (or a deleted parent of it) resets to default.
+    local cur = tostring((target and target.folder) or ""):gsub("^/+", ""):gsub("/+$", "")
+    local gone = node.path
+    local reset_dest = cur == gone or cur:sub(1, #gone + 1) == gone .. "/"
+    if reset_dest and self.plugin.setFolder then
+        self.plugin:setFolder("CrossDropped Files")
+    end
+    self:removeNode(gone)
+    self:rebuild()
+    local text = _("Deleted /" .. tostring(gone))
+    if node.is_file ~= true then
+        text = text .. _(" and everything inside it")
+    end
+    if reset_dest then
+        text = text .. _("\nDestination reset to CrossDropped Files.")
+    end
+    UIManager:show(Notification:new{ text = text, timeout = 4 })
+end
+
+function DeleteDialog:showDeletePopup(node)
+    local popup = DeleteConfirmDialog:new{
+        plugin = self.plugin,
+        tree = self,
+        node = node,
+    }
+    UIManager:show(popup, "ui", popup.region)
+    UIManager:forceRePaint()
+end
+
+function DeleteDialog:appendNodes(vg, nodes, depth)
+    local sc = function(v) return Device.screen:scaleBySize(v) end
+    local indent = math.min(depth * sc(TREE_INDENT), sc(140))
+    for i = 1, #nodes do
+        local node = nodes[i]
+        self:treeRowInto(vg, node, indent)
+        if node.expanded then
+            local kids = node.children or {}
+            if #kids > 0 then
+                self:appendNodes(vg, kids, depth + 1)
+            else
+                table.insert(vg, HorizontalGroup:new{
+                    HorizontalSpan:new{ width = indent + sc(TREE_ARROW_W) + sc(6) },
+                    TextBoxWidget:new{
+                        text = string.format(_("Nothing else in /%s"), node.path),
+                        face = Font:getFace("smallinfofont"),
+                        width = math.max(self.row_w - indent - sc(TREE_ARROW_W) - sc(6), 1),
+                    },
+                })
+            end
+        end
+    end
+end
+
+-- One tree row: folders carry the ▸/▾ control, files just a spacer in its
+-- place (nothing to expand). The NAME always opens the delete confirmation.
+function DeleteDialog:treeRowInto(vg, node, indent)
+    local sc = function(v) return Device.screen:scaleBySize(v) end
+    local lead
+    if node.is_file then
+        lead = HorizontalSpan:new{ width = sc(TREE_ARROW_W) }
+    else
+        lead = Button:new{
+            text = node.expanded and "\226\150\190" or "\226\150\184", -- ▾ / ▸
+            width = sc(TREE_ARROW_W),
+            align = "center",
+            bordersize = 0,
+            padding_h = 0,
+            avoid_text_truncation = false,
+            text_font_face = "smallinfofont",
+            text_font_size = 28,
+            callback = function() self:toggleNode(node) end,
+        }
+    end
+    local name = Button:new{
+        text = node.name,
+        width = math.max(self.row_w - indent - sc(TREE_ARROW_W), 1),
+        align = "left",
+        bordersize = 0,
+        padding_h = Size.padding.large,
+        avoid_text_truncation = false,
+        text_font_face = "smallinfofont",
+        text_font_size = 22,
+        callback = function() self:showDeletePopup(node) end,
+    }
+    table.insert(vg, HorizontalGroup:new{
+        HorizontalSpan:new{ width = indent },
+        lead,
+        name,
+    })
+end
+
+function DeleteDialog:plainRow(text, callback)
+    return Button:new{
+        text = text,
+        width = self.row_w,
+        align = "left",
+        bordersize = 0,
+        padding_h = Size.padding.large,
+        avoid_text_truncation = false,
+        text_font_face = "smallinfofont",
+        text_font_size = 22,
+        callback = callback,
+    }
+end
+
+function DeleteDialog:init()
+    local sc = function(v) return Device.screen:scaleBySize(v) end
+    local sw = Device.screen:getWidth()
+    local sh = Device.screen:getHeight()
+    self.dimen = Geom:new{ w = sw, h = sh }
+    local pad = Size.padding.default
+    local inner_w = sw - pad * 2
+    self.row_w = inner_w
+
+    local title_bar = TitleBar:new{
+        width = inner_w,
+        title = _("Delete Folders/Files"),
+        fullscreen = false,
+        with_bottom_line = true,
+        left_icon = "chevron.left",
+        left_icon_tap_callback = function() self:leave() end,
+        show_parent = self,
+    }
+
+    local vg = VerticalGroup:new{ align = "left" }
+    if self.list_err then
+        table.insert(vg, TextBoxWidget:new{
+            text = _("Device not found. Please check Xteink IP, and confirm that it matches in Connections."),
+            face = Font:getFace("smallinfofont"),
+            width = self.row_w,
+        })
+    else
+        local nodes = self.nodes or {}
+        if #nodes > 0 then
+            self:appendNodes(vg, nodes, 0)
+        else
+            table.insert(vg, TextBoxWidget:new{
+                text = _("Nothing on the reader."),
+                face = Font:getFace("smallinfofont"),
+                width = self.row_w,
+            })
+        end
+    end
+
+    local frame = FrameContainer:new{
+        dimen = Geom:new{ w = sw, h = sh },
+        width = sw,
+        height = sh,
+        bordersize = 0,
+        background = Blitbuffer.COLOR_WHITE,
+        padding = pad,
+        VerticalGroup:new{
+            align = "left",
+            title_bar,
+            VerticalSpan:new{ width = sc(8) },
+            vg,
+        },
+    }
+    self.frame = frame
+    self[1] = frame
+    if Device:hasKeys() then
+        self.key_events.Back = { { Device.input.group.Back } }
+    end
+end
+
+-- The delete confirmation: a tiny centered popup (the folder menu's exact
+-- recipe). Delete / Cancel; deleting a folder says so, and that everything
+-- inside goes with it.
+DeleteConfirmDialog = InputContainer:extend{
+    modal = true,
+    dismissable = false,
+    plugin = nil,
+    tree = nil,     -- the DeleteDialog to apply the delete to
+    node = nil,     -- the file/folder being deleted
+}
+
+function DeleteConfirmDialog:onConfirm()
+    local tree, node = self.tree, self.node
+    UIManager:close(self, "ui", self.region)
+    -- nextTick, like every close→work chain on this build: the network
+    -- delete and the tree refresh run after the popup's repaint settles.
+    UIManager:nextTick(function()
+        if tree and node then tree:deleteNode(node) end
+    end)
+end
+
+function DeleteConfirmDialog:onCancel()
+    UIManager:close(self, "ui", self.region)
+end
+
+function DeleteConfirmDialog:onBack()
+    UIManager:close(self, "ui", self.region)
+    return true
+end
+
+function DeleteConfirmDialog:init()
+    local sc = function(v) return Device.screen:scaleBySize(v) end
+    local sw = Device.screen:getWidth()
+    local sh = Device.screen:getHeight()
+    local pad = Size.padding.default
+    local box_w = math.min(math.floor(sw * 0.6), sw - sc(40))
+    local inner_w = box_w - pad * 2
+
+    -- The question says WHAT dies: a file alone, or a folder and everything
+    -- inside it — never a bare path the user has to parse.
+    local title
+    if self.node and self.node.is_file then
+        title = string.format(_("Delete file?\n/%s"), tostring(self.node.path))
+    else
+        title = string.format(_("Delete folder and its contents?\n/%s"),
+            tostring(self.node and self.node.path or ""))
+    end
+    local vg = VerticalGroup:new{}
+    table.insert(vg, VerticalSpan:new{ width = sc(4) })
+    table.insert(vg, TextBoxWidget:new{
+        text = title,
+        face = Font:getFace("smallinfofontbold"),
+        width = inner_w,
+        alignment = "center",
+    })
+    table.insert(vg, VerticalSpan:new{ width = sc(8) })
+    table.insert(vg, self:menuRow(inner_w, _("Delete"), function() self:onConfirm() end))
+    table.insert(vg, self:menuRow(inner_w, _("Cancel"), function() self:onCancel() end))
+    table.insert(vg, VerticalSpan:new{ width = sc(4) })
+
+    local frame = FrameContainer:new{
+        background = Blitbuffer.COLOR_WHITE,
+        bordersize = Size.border.window,
+        padding = pad,
+        vg,
+    }
+    self.frame = frame
+    self[1] = CenterContainer:new{
+        dimen = Geom:new{ w = sw, h = sh },
+        frame,
+    }
+    self.dimen = Geom:new{ w = sw, h = sh }
+    local fs = frame:getSize()
+    local bw = fs and fs.w or box_w
+    local bh = fs and fs.h or sh
+    self.region = Geom:new{
+        x = math.floor((sw - bw) / 2),
+        y = math.floor((sh - bh) / 2),
+        w = bw,
+        h = bh,
+    }
+    if Device:hasKeys() then
+        self.key_events.Back = { { Device.input.group.Back } }
+    end
+end
+
+function DeleteConfirmDialog:menuRow(row_w, text, callback)
+    return Button:new{
+        text = text,
+        menu_style = true,
+        width = row_w,
+        callback = callback,
+    }
 end
 
 -- ─────────────── in-dashboard send: the progress sink ─────────────────────
