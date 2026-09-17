@@ -1330,6 +1330,13 @@ function DeleteDialog:deleteNode(node)
         UIManager:show(Notification:new{ text = _("Set the WiFi IP on the Connections tab first."), timeout = 4 })
         return
     end
+    -- "Deleting…" painted BEFORE the blocking DELETE (the dashboard's
+    -- paint-progress-then-block rule — check() and expandNode both do this).
+    -- Without it, fast follow-up deletes queue multi-second blind blocks and
+    -- the plugin reads as frozen.
+    local busy = Notification:new{ text = _("Deleting\226\128\166"), timeout = 0 }
+    UIManager:show(busy)
+    UIManager:forceRePaint()
     local ok, err, code
     if node.is_file then
         ok, err = self.plugin:deleteEntry(target, node.path)
@@ -1340,6 +1347,7 @@ function DeleteDialog:deleteNode(node)
             ok, err = self:purgeFolder(target, node.path)
         end
     end
+    UIManager:close(busy)
     if not ok then
         UIManager:show(Notification:new{
             text = _("Could not delete /" .. tostring(node.path) .. ":\n") .. tostring(err or "unknown error"),

@@ -9,10 +9,17 @@ Wi-Fi — no cable, no cloud.
 
 ## What it does
 
-- A full-screen CrossDrop dashboard (**Connections** / **Send A Book**) inside
-  KOReader's Tools menu.
-- **Send A Book** scans your device for books: search and multi-pick from the
-  list, or send the book you're currently reading.
+- A full-screen CrossDrop dashboard (**Connections** / **Send A File** /
+  **Delete Files**) inside KOReader's Tools menu.
+- **Send A File** scans your device and lists only what the reader can
+  actually open — **EPUB, XTC/XTCH, TXT, and BMP** (case-insensitive): search
+  and multi-pick from the list, or send the file you're currently reading.
+- **Delete Files** is its own tab on purpose: deleting never lives among the
+  send controls. It browses the reader as the same folder tree (files and
+  folders), asks **"Delete file?"** / **"Delete folder and its contents?"**
+  first, then removes it — a folder that still holds anything is purged
+  depth-first first (the reader's WebDAV DELETE does not recurse), and the
+  tree refreshes in place.
 - Books land in a **destination folder** on the reader. The destination picker
   is a folder **tree**: tap a folder's ▸/▾ to scan its subfolders — they appear
   indented right below it, and every other folder stays visible; tap a folder's
@@ -20,7 +27,7 @@ Wi-Fi — no cable, no cloud.
   right away and is created on the reader when the books are sent (WebDAV
   MKCOL, at any nesting depth). Nothing chosen = the **CrossDropped Files**
   default, created automatically on the first send.
-- A "… please wait" screen while a book streams, and a toast when it lands.
+- A "… please wait" screen while a file streams, and a toast when it lands.
   There's deliberately no progress bar: the transfer drains faster than
   e-ink can repaint.
 
@@ -32,7 +39,7 @@ Wi-Fi — no cable, no cloud.
    folder and restart KOReader.
 3. Open **Tools → CrossDrop → Connections → Set WiFi IP…** and enter the
    reader's IP. Tap the **WiFi** row to check it reads **Reachable**.
-4. Use the **Send A Book** tab to pick books and choose a destination folder.
+4. Use the **Send A File** tab to pick files and choose a destination folder.
 
 ## Build & test
 

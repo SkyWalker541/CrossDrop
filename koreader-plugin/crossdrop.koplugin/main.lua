@@ -502,7 +502,12 @@ function CROSSDROP:deleteEntry(target, path)
     if p == "" then
         return nil, "nothing to delete", nil
     end
-    local ok, code, errbody = self:req("DELETE", base_url(target) .. encode_path("/" .. p))
+    -- Bounded timeout: rapid deletes queue against a reader that is still
+    -- finishing the previous one on slow flash — with req's default 15s/60s
+    -- socketutil timeouts each queued delete read as a frozen UI. 5s bounds
+    -- the wait; a stuck reader reports an error instead of hanging.
+    local ok, code, errbody = self:req("DELETE", base_url(target) .. encode_path("/" .. p),
+        nil, nil, 5)
     if ok then
         logger.info("crossdrop: deleted /", p)
         return true, nil, code
