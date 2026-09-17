@@ -1,4 +1,4 @@
--- CrossDrop picker: the "Send A Book" screen, built on the SAME widget
+-- CrossDrop picker: the "Send A File" screen, built on the SAME widget
 -- architecture as the CrossDrop dashboard (crossdrop_home.lua) — the only
 -- widget set proven to render and take taps on this device: rows are
 -- Buttons (menu-style), everything sits on the full-screen white card, and
@@ -16,10 +16,10 @@
 -- framed boxes, book rows are bare text separated by hairline rules; every
 -- interactive thing a proper button):
 --
---   TitleBar: "Send A Book" + "N books — tap to pick; the top row sends"
---   [Send to Xteink — send N book(s) now]  (dark button: THE action)
+--   TitleBar: "Send A File" + "N files — tap to pick; the top row sends"
+--   [Send to Xteink — send N file(s) now]  (dark button: THE action)
 --   ─────────────
---   [Search books…]                       (opens a keyword-search popup)
+--   [Search files…]                       (opens a keyword-search popup)
 --   Search "treis" — 4 results            (only while a filter is active)
 --   [Clear search]                        (only while a filter is active)
 --   ─────────────
@@ -85,15 +85,14 @@ do
     end
 end
 
--- Book extensions (bookshelf.koplugin's SUPPORTED_EXT pattern, minus the
--- plain-text/markup forms: on a real device .txt/.md are almost always
--- system files — logs, notes, readmes — not books).
+-- Sendable extensions = exactly what the Xteink/CrossPoint reader can OPEN
+-- (device spec): EPUB 2/3, native XTC/XTCH (specialized layouts, RTL),
+-- plain TXT, and BMP (custom sleep screens). KOReader reads much more
+-- (mobi, pdf, fb2, …) but those would land on the reader as unopenable
+-- files, so the scan never lists them. Case is handled by lowercasing the
+-- extension (real devices carry ".EPUB" files).
 local SUPPORTED_EXT = {
-    epub = true, epub3 = true, fb2 = true, fb3 = true, mobi = true,
-    azw = true, azw3 = true, prc = true, pdb = true,
-    pdf = true, djvu = true, djv = true, doc = true, docx = true,
-    rtf = true, odt = true,
-    cbz = true, cbr = true, cbt = true,
+    epub = true, xtc = true, xtch = true, txt = true, bmp = true,
 }
 
 -- Directory names never descended into: the KOReader install itself and the
@@ -506,7 +505,7 @@ function PickerDialog:showSearchDialog()
     local picker = self
     local search_dialog
     search_dialog = InputDialog:new{
-        title = _("Search books"),
+        title = _("Search files"),
         input = self.query or "",
         input_hint = _("Keyword \226\128\148 matches any part of a title or file name"),
         type = "text",
@@ -553,7 +552,7 @@ end
 function PickerDialog:sendRowText()
     local n = self:pickedCount()
     if n > 0 then
-        return string.format(_("Send to Xteink  \226\128\162  send %d book(s) now"), n)
+        return string.format(_("Send to Xteink  \226\128\162  send %d file(s) now"), n)
     end
     return _("Send to Xteink  \226\128\162  pick books below")
 end
@@ -588,7 +587,7 @@ function PickerDialog:confirmAndSend()
     local plugin = self.plugin
     local confirm
     confirm = ConfirmBox:new{
-        text = string.format(_("Send %d book(s) to the reader?"), #paths)
+        text = string.format(_("Send %d file(s) to the reader?"), #paths)
             .. "\n" .. table.concat(names, "\n"),
         ok_text = _("Send to Xteink"),
         ok_callback = function()
@@ -732,7 +731,7 @@ function PickerDialog:buildContent()
     -- Search: the button is always there; the active filter is spelled out in
     -- a caption ("the field that shows the current search filter") with a
     -- Clear button right under it.
-    table.insert(vg, self:row(_("Search books\226\128\166"), {
+    table.insert(vg, self:row(_("Search files\226\128\166"), {
         callback = function() self:showSearchDialog() end,
     }))
     if self.query then
@@ -749,9 +748,9 @@ function PickerDialog:buildContent()
 
     if #books == 0 then
         if self.query then
-            table.insert(vg, self:caption(_("No books match this search.")))
+            table.insert(vg, self:caption(_("No files match this search.")))
         else
-            table.insert(vg, self:caption(_("No books found on this device.")))
+            table.insert(vg, self:caption(_("No files found on this device.")))
         end
     end
 
@@ -832,7 +831,7 @@ function PickerDialog:init()
         UIManager:forceRePaint()
         self.books = self:scanAllBooks()
         UIManager:close(scanning)
-        logger.info("crossdrop: device scan found ", #self.books, " book(s)")
+        logger.info("crossdrop: device scan found ", #self.books, " file(s)")
     end
     self.picked = self.picked or {}
 
@@ -854,8 +853,8 @@ function PickerDialog:init()
     -- the book count (static for the dialog's lifetime).
     local title_bar = TitleBar:new{
         width = inner_w,
-        title = _("Send A Book"),
-        subtitle = string.format(_("%d book(s) on this device \226\128\148 tap to pick; the top row sends"),
+        title = _("Send A File"),
+        subtitle = string.format(_("%d file(s) on this device \226\128\148 tap to pick; the top row sends"),
             #self.books),
         fullscreen = false,
         with_bottom_line = true,

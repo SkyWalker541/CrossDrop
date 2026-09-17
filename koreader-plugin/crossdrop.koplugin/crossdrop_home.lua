@@ -11,7 +11,7 @@
 -- onConnecting/onConnected/onBeginFile/onProgress/onDone callbacks rebuild the
 -- Send tab in place (the same forceRePaint recipe the standalone progress
 -- dialog and Storefront use). The dashboard never closes during a transfer,
--- and "Send more books…"/"Try again" keep going from the same window.
+-- and "Send more files…"/"Try again" keep going from the same window.
 --
 -- E-INK REPAINT RULE (the issue that hid the whole flow on the device):
 -- when one of these callbacks flips the send STATE (connecting / sending a
@@ -244,7 +244,7 @@ function HomeDialog:buildTabBar(content_w)
     local sc = function(v) return Device.screen:scaleBySize(v) end
     local tabs = {
         { key = "connections", label = _("Connections") },
-        { key = "send", label = _("Send A Book") },
+        { key = "send", label = _("Send A File") },
         { key = "delete", label = _("Delete Files") },
     }
     -- Fixed equal widths: the bar EXACTLY fills the row no matter how many
@@ -264,6 +264,7 @@ function HomeDialog:buildTabBar(content_w)
             menu_style = true,
             bold = active,
             width = btn_w,
+            align = "center",
             avoid_text_truncation = false,
             callback = function()
                 self:showTab(t.key)
@@ -436,7 +437,7 @@ function HomeDialog:renderConnections()
             .. _("3. On that screen, the device's IP address is below the QR code.\n")
             .. _("4. Tap \"Set WiFi IP\" to enter that address.\n")
             .. _("5. Then tap the connection row above to check \226\128\148 it should read \"Reachable\" when connected.\n")
-            .. _("6. Send from the Send A Book tab: pick books from the list, or send the currently open book. Pick the destination folder there too \226\128\148 it defaults to CrossDropped Files on the reader."),
+            .. _("6. Send from the Send A File tab: pick files from the list, or send the currently open file. Pick the destination folder there too \226\128\148 it defaults to CrossDropped Files on the reader."),
         face = Font:getFace("xx_smallinfofont"),
         width = self.row_w,
     })
@@ -454,15 +455,17 @@ function HomeDialog:renderSendIdle()
     local sc = function(v) return Device.screen:scaleBySize(v) end
     local book = self.plugin:currentBookPath()
 
-    table.insert(vg,self:header(_("Send one or more books")))
-    table.insert(vg,self:row(_("Click Here To Select Book(s)"), {
+    table.insert(vg,self:header(_("Send one or more files")))
+    table.insert(vg,self:row(_("Click Here To Select File(s)"), {
         callback = function() self.plugin:chooseAndSend() end,
     }))
 
-    -- "Currently open" only appears when there IS an open book (no empty
-    -- placeholder header when nothing is open). Both book sections breathe
-    -- with a spacer so the Destination folder block sits clearly apart.
-    if book and book ~= "" then
+    -- "Currently open" only appears when there IS an open book AND the
+    -- reader can open it (the Xteink list: epub/xtc/xtch/txt/bmp — sending
+    -- anything else would ship the user a file their device can't open).
+    -- Both book sections breathe with a spacer so the Destination folder
+    -- block sits clearly apart.
+    if book and book ~= "" and self.plugin:isCrossPointFile(book) then
         table.insert(vg, VerticalSpan:new{ width = sc(18) })
         local name = book:match("([^/]+)$") or book
         local size = file_size(book)
@@ -697,10 +700,16 @@ function DestinationDialog:init()
     local pad = Size.padding.default
     local inner_w = sw - pad * 2
     self.row_w = inner_w
-    -- Rows per page from the panel height. The allowance is larger than the
-    -- delete tree's: this page also carries the destination line, section
-    -- headers, and the Default row.
-    self.rows_per_page = math.max(8, math.floor((sh - sc(280)) / sc(32)))
+    -- Rows per page MEASURED from one real row (see the delete tree's note:
+    -- a guessed count once pushed the page-nav rows off the fold). The
+    -- allowance is larger than the delete tree's — this page also carries
+    -- the destination line, section headers, and the Default row.
+    if not self.rows_per_page then
+        local probe = VerticalGroup:new{}
+        self:treeRowInto(probe, new_node("sample", "sample", 0), 0)
+        local rh = (probe:getSize() and probe:getSize().h) or sc(60)
+        self.rows_per_page = math.max(5, math.floor((sh - sc(340)) / math.max(rh, 1)))
+    end
 
     -- Back chevron top-left returns to the dashboard. There is NO ✕ here:
     -- the dashboard is still behind this page, and X is reserved for leaving
@@ -1160,7 +1169,7 @@ function HomeDialog:openDeleteTree()
 end
 
 -- ───────────────────── delete tab (files & folders) ─────────────────────
--- A third tab, SEPARATE from Send A Book on purpose: deleting is a
+-- A third tab, SEPARATE from Send A File on purpose: deleting is a
 -- destructive act and gets its own screen so it can never happen by
 -- accident while picking books. It reuses the destination tree's system
 -- (▸/▾ inline expansion, boxless rows, tiny centered popups) but lists FILES
@@ -1499,9 +1508,18 @@ function DeleteDialog:init()
     local pad = Size.padding.default
     local inner_w = sw - pad * 2
     self.row_w = inner_w
-    -- Rows per page from the panel height (one row ≈ sc(32) real px; the
-    -- allowance covers the title bar and the page-nav rows below).
-    self.rows_per_page = math.max(8, math.floor((sh - sc(150)) / sc(32)))
+    -- Rows per page MEASURED from one real row (the panel's fonts and
+    -- paddings decide, not a guessed row height — a guessed count once put
+    -- the page-nav rows themselves below the fold, so long folders looked
+    -- unscrollable). The allowance covers the title bar, the spans, and
+    -- the page-nav rows below the tree. Setting self.rows_per_page before
+    -- init skips the probe (how the tests pin it).
+    if not self.rows_per_page then
+        local probe = VerticalGroup:new{}
+        self:treeRowInto(probe, new_node("sample", "sample", 0), 0)
+        local rh = (probe:getSize() and probe:getSize().h) or sc(60)
+        self.rows_per_page = math.max(5, math.floor((sh - sc(240)) / math.max(rh, 1)))
+    end
 
     local title_bar = TitleBar:new{
         width = inner_w,
@@ -1875,13 +1893,13 @@ function HomeDialog:renderSendDone()
     local vg = VerticalGroup:new{ align = "left" }
     table.insert(vg, self:header(_("Done")))
     table.insert(vg, TextBoxWidget:new{
-        text = string.format(_("Sent %d book(s) to the reader."), #names)
+        text = string.format(_("Sent %d file(s) to the reader."), #names)
             .. (#lines > 0 and ("\n\n" .. table.concat(lines, "\n")) or ""),
         face = Font:getFace("smallinfofont"),
         width = self.row_w,
     })
     table.insert(vg, VerticalSpan:new{ width = sc(8) })
-    table.insert(vg, self:row(_("Send more books\226\128\166"), {
+    table.insert(vg, self:row(_("Send more files\226\128\166"), {
         callback = function() self:sendMore() end,
     }))
     table.insert(vg, self:row(_("Back"), {
@@ -1903,7 +1921,7 @@ function HomeDialog:renderSendFailed()
     table.insert(vg, self:row(_("Try again"), {
         callback = function() self:tryAgain() end,
     }))
-    table.insert(vg, self:row(_("Send more books\226\128\166"), {
+    table.insert(vg, self:row(_("Send more files\226\128\166"), {
         callback = function() self:sendMore() end,
     }))
     table.insert(vg, self:row(_("Back"), {

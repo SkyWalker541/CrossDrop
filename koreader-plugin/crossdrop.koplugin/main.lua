@@ -209,7 +209,7 @@ function CROSSDROP:req(method, url, headers, source_fn, timeout)
 end
 
 -- The single connection in send order: WiFi (the reader's File Transfer →
--- Join Network address). Its destination folder comes from the Send A Book
+-- Join Network address). Its destination folder comes from the Send A File
 -- tab (crossdrop_folder) and falls back to the CrossDropped Files default.
 -- The IP is empty until the user sets it.
 function CROSSDROP:configuredTargets()
@@ -548,6 +548,18 @@ function CROSSDROP:currentBookPath()
     return doc.file
 end
 
+-- File types the Xteink/CrossPoint reader can actually OPEN (device spec):
+-- EPUB 2/3, the native XTC/XTCH (specialized layouts, RTL scripts), plain
+-- TXT, and BMP images (custom sleep screens). KOReader itself reads far
+-- more (mobi, pdf, fb2, …) — but anything outside this list would arrive on
+-- the reader as a file it cannot open, so the Send A File browser only
+-- lists these. Case-insensitive: real devices carry ".EPUB" files.
+local CROSSPOINT_EXT = { epub = true, xtc = true, xtch = true, txt = true, bmp = true }
+function CROSSDROP:isCrossPointFile(path)
+    local ext = tostring(path or ""):match("%.([^.]+)$")
+    return ext ~= nil and CROSSPOINT_EXT[ext:lower()] == true
+end
+
 -- The whole "nothing answered" message: the Tried list (with the probe's own
 -- error) plus the concrete fixes.
 function CROSSDROP:noReaderText()
@@ -836,19 +848,19 @@ function CROSSDROP:sendFile(book_path)
 end
 
 -- Send the currently open book. Guarded so a nil document just shows a hint
--- instead of crashing (the Home "Send A Book" picker never hits this path).
+-- instead of crashing (the Home "Send A File" picker never hits this path).
 function CROSSDROP:sendCurrentBook()
     local book_path = self:currentBookPath()
     if not book_path then
         UIManager:show(InfoMessage:new{
-            text = _("There is no book file to send. Use Send A Book to pick one."),
+            text = _("There is no file to send. Use Send A File to pick one."),
         })
         return
     end
     self:sendFile(book_path)
 end
 
--- "Send A Book": open the CrossDrop book picker (crossdrop_picker.lua) —
+-- "Send A File": open the CrossDrop book picker (crossdrop_picker.lua) —
 -- a device-wide book scan (the bookshelf.koplugin walk pattern) rendered on
 -- the dashboard's proven widgets (rows of Buttons on the full-screen card,
 -- the dashboard's TitleBar with its ✕). The built-in file browser is not

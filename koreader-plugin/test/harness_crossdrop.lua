@@ -272,9 +272,9 @@ local FontStub = {
 -- the scan MUST skip (koreader, system, screenshots, .hidden, .sdr,
 -- AppleDouble "._" companions).
 local FAKE_FS = {
-    ["/mnt/us"] = { "Books", "Boldonic Books", "documents", "koreader", "system", "screenshots", ".hidden", "sneaky.azw3" },
+    ["/mnt/us"] = { "Books", "Boldonic Books", "documents", "koreader", "system", "screenshots", ".hidden", "sneaky.azw3", "wallpaper.bmp", "Guide.EPUB" },
     ["/mnt/us/Books"] = { "fakebook.epub", "sub", "fakebook.sdr", "._fakebook.epub" },
-    ["/mnt/us/Books/sub"] = { "nested.epub" },
+    ["/mnt/us/Books/sub"] = { "nested.epub", "rtl.xtc" },
     ["/mnt/us/Books/fakebook.sdr"] = { "meta.epub" },
     ["/mnt/us/Boldonic Books"] = { "bold.epub" },
     ["/mnt/us/documents"] = { "fakebook2.azw" },
@@ -634,7 +634,7 @@ inst:sendCurrentBook()
 local last_notif = UIManager._shown[#UIManager._shown]
 check("send success shows Book sent", last_notif and type(last_notif.text) == "string" and last_notif.text:match("Book sent"), last_notif and last_notif.text)
 
--- 5b. "Send A Book" opens the CROSSDROP PICKER (crossdrop_picker.lua) — a
+-- 5b. "Send A File" opens the CROSSDROP PICKER (crossdrop_picker.lua) — a
 -- device-wide book scan (the bookshelf.koplugin walk pattern) rendered on
 -- the dashboard's proven widgets: its own picked set (toggle), the
 -- always-visible "Send to Xteink" action row (sendRowText → confirmAndSend),
@@ -657,47 +657,65 @@ check("send row names the action from the start",
 picker:toggle("/tmp/fakebook.epub")
 check("toggle picks a book", picker.picked["/tmp/fakebook.epub"] == true, picker.picked["/tmp/fakebook.epub"])
 check("send row carries the count once books are picked",
-    tostring(picker:sendRowText()):match("1 book"), picker:sendRowText())
+    tostring(picker:sendRowText()):match("1 file"), picker:sendRowText())
 picker:toggle("/tmp/fakebook2.epub")
 picker:toggle("/tmp/fakebook.epub")
 check("toggle unpicks a book (no send on tap)",
     picker.picked["/tmp/fakebook.epub"] == nil, picker.picked["/tmp/fakebook.epub"])
 check("send row count follows the selection",
-    tostring(picker:sendRowText()):match("1 book"), picker:sendRowText())
+    tostring(picker:sendRowText()):match("1 file"), picker:sendRowText())
 picker:toggle("/tmp/fakebook.epub") -- both books picked again
 check("toggles repaint flashless (ui — never promoted to a full)",
     UIManager.last_dirty == "ui", tostring(UIManager.last_dirty))
--- the device scan (bookshelf-style walk) finds every book — including
--- nested and other source folders — and skips app/system/sidecar junk
+-- the device scan (bookshelf-style walk) finds every SENDABLE file — the
+-- Xteink/CrossPoint list (epub/xtc/xtch/txt/bmp), case-insensitive — in
+-- nested and other source folders, and skips app/system/sidecar junk AND
+-- everything the reader cannot open (mobi/azw/pdf/…)
 local books = picker:scanAllBooks("/mnt/us")
 local names = {}
 for _, b in ipairs(books) do names[b.name] = true end
 local all_names = {}
 for n in pairs(names) do all_names[#all_names + 1] = n end
-check("device scan finds the books (all folders, nested)",
-    names["fakebook.epub"] and names["nested.epub"] and names["fakebook2.azw"]
-        and names["bold.epub"] and names["sneaky.azw3"],
+check("device scan finds the sendable files (epub/xtc/bmp, nested)",
+    names["fakebook.epub"] and names["nested.epub"] and names["bold.epub"]
+        and names["rtl.xtc"] and names["wallpaper.bmp"] and names["Guide.EPUB"],
     table.concat(all_names, ", "))
 check("scan skips app/system/hidden/sidecar dirs and AppleDouble files",
     not names["junk.epub"] and not names["junk2.pdf"] and not names["meta.epub"]
         and not names["hidden.epub"] and not names["._fakebook.epub"] and not names["screen.png"],
     names["junk.epub"] and "koreader walked" or "ok")
-check("picker scanned at open (books cached on the dialog)",
-    picker.books ~= nil and #picker.books == 5, picker.books and #picker.books)
+check("scan never lists files the reader cannot open (azw/azw3)",
+    not names["fakebook2.azw"] and not names["sneaky.azw3"],
+    names["fakebook2.azw"] and "azw listed" or "ok")
+check("picker scanned at open (files cached on the dialog)",
+    picker.books ~= nil and #picker.books == 6, picker.books and #picker.books)
 
 -- 5d. 1.3.18 real titles + search: rows show title-like names, not raw
 -- filenames, and a case-insensitive keyword search filters the pageable list.
 
--- System text files join FAKE_FS: the scan must still NOT pick them up
-FAKE_FS["/mnt/us"] = { "Books", "Boldonic Books", "documents", "koreader", "system", "screenshots", ".hidden", "sneaky.azw3", "notes.txt" }
+-- Plain .txt joins FAKE_FS: the Xteink OPENS plain text natively, so .txt
+-- files ARE sendable now (1.4.0) — while .md stays out (not a CrossPoint
+-- type, and on a real device it is almost always a readme/log).
+FAKE_FS["/mnt/us"] = { "Books", "Boldonic Books", "documents", "koreader", "system", "screenshots", ".hidden", "sneaky.azw3", "wallpaper.bmp", "Guide.EPUB", "notes.txt" }
 FAKE_FS["/mnt/us/Books"] = { "fakebook.epub", "sub", "fakebook.sdr", "._fakebook.epub", "readme.md" }
 local rescan = picker:scanAllBooks("/mnt/us")
 local pk_names = {}
 for _, b in ipairs(rescan) do pk_names[b.name] = true end
-check("scan still finds 5 books with .txt/.md present", #rescan == 5, #rescan)
-check("scan excludes notes.txt and readme.md",
-    not pk_names["notes.txt"] and not pk_names["readme.md"],
+check("scan lists the .txt (Xteink-supported) among 7 files", #rescan == 7, #rescan)
+check("scan still skips .md (not a CrossPoint type)",
+    pk_names["notes.txt"] == true and not pk_names["readme.md"],
     pk_names["notes.txt"] and "notes.txt listed" or "ok")
+
+-- isCrossPointFile: the exact Xteink list, case-insensitive
+check("isCrossPointFile accepts the Xteink list (epub/xtc/xtch/txt/bmp)",
+    inst:isCrossPointFile("/x/A.EPUB") == true and inst:isCrossPointFile("/x/b.xtc") == true
+        and inst:isCrossPointFile("/x/c.XTCH") == true and inst:isCrossPointFile("/x/d.txt") == true
+        and inst:isCrossPointFile("/x/e.bmp") == true,
+    "epub/xtc/xtch/txt/bmp")
+check("isCrossPointFile rejects what KOReader reads but the reader cannot open",
+    inst:isCrossPointFile("/x/a.mobi") ~= true and inst:isCrossPointFile("/x/a.azw3") ~= true
+        and inst:isCrossPointFile("/x/a.pdf") ~= true and inst:isCrossPointFile("/x/a.fb2") ~= true,
+    "mobi/azw3/pdf/fb2")
 
 -- cleanTitle: the side-loader junk on this very device
 check("cleanTitle turns underscores into spaces",
@@ -787,22 +805,22 @@ check("scan uses a persisted real title at once", real_title == "The Real Fake B
 
 -- search: case-insensitive substring over the DISPLAYED title and the raw name
 picker.query = "fake"
-check("search matches the displayed title (fake)", #picker:visibleBooks() == 2,
+check("search matches the displayed title (fake)", #picker:visibleBooks() == 1,
     tostring(#picker:visibleBooks()))
 picker.query = "BOLD"
 check("search ignores capitalisation (BOLD)", #picker:visibleBooks() == 1,
     tostring(#picker:visibleBooks()))
 picker.query = "book"
-check("search is a plain substring, no pattern magic (book)", #picker:visibleBooks() == 2,
+check("search is a plain substring, no pattern magic (book)", #picker:visibleBooks() == 1,
     tostring(#picker:visibleBooks()))
 picker.query = "azw"
-check("search also matches the raw filename (azw)", #picker:visibleBooks() == 2,
-    tostring(#picker:visibleBooks()))
+check("no unsupported azw files are listed to search (Xteink filter)",
+    #picker:visibleBooks() == 0, tostring(#picker:visibleBooks()))
 picker.query = "zzzz"
 check("unmatched search yields nothing (no crash)", #picker:visibleBooks() == 0,
     tostring(#picker:visibleBooks()))
 picker.query = nil
-check("clearing the query shows the full list", #picker:visibleBooks() == 5,
+check("clearing the query shows the full list", #picker:visibleBooks() == 6,
     tostring(#picker:visibleBooks()))
 
 -- The Search popup is a modal InputDialog; Save applies a trimmed,
@@ -824,11 +842,11 @@ check("search Save applies a trimmed, lowercased filter",
     picker.query == "book", tostring(picker.query))
 check("search applies and clears repaint flashless (ui)",
     UIManager.last_dirty == "ui", tostring(UIManager.last_dirty))
-check("search narrows the visible books", #picker:visibleBooks() == 2,
+check("search narrows the visible files", #picker:visibleBooks() == 1,
     tostring(#picker:visibleBooks()))
 picker:clearSearch()
 check("clear search restores the full list",
-    picker.query == nil and #picker:visibleBooks() == 5,
+    picker.query == nil and #picker:visibleBooks() == 6,
     tostring(picker.query) .. "/" .. tostring(#picker:visibleBooks()))
 check("clear search repaints flashless too",
     UIManager.last_dirty == "ui", tostring(UIManager.last_dirty))
@@ -891,9 +909,9 @@ local hairline = find_widgets(content, function(w)
 end)
 check("thin rule separates rows (hairline separators present)",
     #hairline >= #row_btns, #hairline .. " hairlines / " .. #row_btns .. " rows")
-check("search caption reads Search \"X\" — N results",
+check("search caption reads Search \"X\" — N result(s)",
     search_caption ~= nil and search_caption:find("Search", 1, true) ~= nil
-        and search_caption:find("results", 1, true) ~= nil, tostring(search_caption))
+        and search_caption:find("result", 1, true) ~= nil, tostring(search_caption))
 picker.query = "bold"
 local _, cap_one = find_row_buttons(picker:buildContent())
 check("search caption singularises one result",
@@ -923,7 +941,7 @@ UIManager._shown = {}
 picker:confirmAndSend()
 local cdlg = UIManager._shown[#UIManager._shown]
 check("send action opens a confirm dialog with a Send to Xteink button",
-    cdlg and cdlg.ok_text == "Send to Xteink" and tostring(cdlg.text):match("Send 2 book"),
+    cdlg and cdlg.ok_text == "Send to Xteink" and tostring(cdlg.text):match("Send 2 file"),
     cdlg and ((cdlg.ok_text or "") .. " / " .. tostring(cdlg.text or "")))
 UIManager._shown = {}
 cdlg.ok_callback()
@@ -967,7 +985,7 @@ UIManager._shown = {}
 inst:sendCurrentBook()
 local no_book = UIManager._shown[#UIManager._shown]
 check("no-book send shows hint (no crash)",
-    no_book and type(no_book.text) == "string" and no_book.text:match("Send A Book"),
+    no_book and type(no_book.text) == "string" and no_book.text:match("Send A File"),
     no_book and no_book.text)
 inst.ui.document = { file = "/tmp/fakebook.epub" }
 
@@ -1386,10 +1404,10 @@ inst:openHome()
 home = UIManager._shown[#UIManager._shown]
 home:backToIdle() -- force send_state == "idle"
 local idle_joined = table.concat(flatten_texts(home:buildTabContent("send", home.row_w)), "\n")
-check("pick button reads Click Here To Select Book(s)",
-    idle_joined:find("Click Here To Select Book(s)", 1, true) ~= nil, idle_joined)
-check("Send tab header above the picker reads Send one or more books",
-    idle_joined:find("Send one or more books", 1, true) ~= nil, idle_joined)
+check("pick button reads Click Here To Select File(s)",
+    idle_joined:find("Click Here To Select File(s)", 1, true) ~= nil, idle_joined)
+check("Send tab header above the picker reads Send one or more files",
+    idle_joined:find("Send one or more files", 1, true) ~= nil, idle_joined)
 check("Send tab shows the destination folder row (default CrossDropped Files)",
     idle_joined:find("Destination folder", 1, true) ~= nil
         and idle_joined:find("CrossDropped Files", 1, true) ~= nil,
@@ -1400,6 +1418,16 @@ check("Send tab carries no WiFi hint text",
     not idle_joined:find("Send uses the WiFi", 1, true), idle_joined)
 check("Currently open shown when a book is open",
     idle_joined:find("Currently open", 1, true) ~= nil, idle_joined)
+-- The Currently-open row only offers files the reader can OPEN: a pdf (or
+-- any non-CrossPoint type) must not be sendable from here.
+inst.ui.document = { file = "/tmp/fakebook.pdf" }
+local pdf_joined = table.concat(flatten_texts(home:buildTabContent("send", home.row_w)), "\n")
+check("Currently open hidden when the open file is not Xteink-openable (pdf)",
+    not pdf_joined:find("Currently open", 1, true), pdf_joined)
+inst.ui.document = { file = "/tmp/fakebook.txt" }
+local txt_joined = table.concat(flatten_texts(home:buildTabContent("send", home.row_w)), "\n")
+check("Currently open shown for Xteink-openable types (txt)",
+    txt_joined:find("Currently open", 1, true) ~= nil, txt_joined)
 inst.ui.document = nil
 local no_book_joined = table.concat(flatten_texts(home:buildTabContent("send", home.row_w)), "\n")
 check("Currently open hidden when no book is open",
@@ -1843,7 +1871,7 @@ end -- do (14d-14h block)
 -- 200-local limit; they reference only earlier main-chunk locals.)
 do
 
--- 14i. DELETE TAB (1.4.0): its OWN tab (never inside Send A Book), the same
+-- 14i. DELETE TAB (1.4.0): its OWN tab (never inside Send A File), the same
 -- tree system but listing FILES too, a confirm popup before anything dies,
 -- one WebDAV DELETE on confirm, a popup reporting the result, and the tree
 -- live-refreshing in place. Deleting the destination (or its parent) resets
@@ -2031,6 +2059,8 @@ FAKE.delete_409_once = nil
 -- 14k. PAGING: long trees slice into pages (the picker's device-proven
 -- recipe), and a deletion that shortens the list clamps the page and
 -- repaints the whole (shortened) tree — nothing missing, nothing stale.
+-- rows_per_page is pinned to 10 (the dialogs MEASURE it from a real row on
+-- the panel — the stub's synthetic row height would give ~33).
 local function many_folders_json(n)
     local parts = {}
     for i = 1, n do
@@ -2043,17 +2073,19 @@ raw_ok(many_folders_json(21))
 UIManager._shown = {}
 home:openDeleteTree()
 local ptree = UIManager._shown[#UIManager._shown]
+ptree.rows_per_page = 10
+ptree:init()
 local pflat = table.concat(flatten_texts(ptree.frame))
 check("long lists page: page 1 slices the rows and offers Next",
-    pflat:find("Page 1 of 2", 1, true) ~= nil
+    pflat:find("Page 1 of 3", 1, true) ~= nil
         and pflat:find("Next page", 1, true) ~= nil
         and pflat:find("Folder01", 1, true) ~= nil
-        and pflat:find("Folder21", 1, true) == nil,
+        and pflat:find("Folder11", 1, true) == nil,
     pflat)
-ptree:gotoPage(2)
+ptree:gotoPage(3)
 local pflat2 = table.concat(flatten_texts(ptree.frame))
-check("page 2 shows the tail with Previous and no Next",
-    pflat2:find("Page 2 of 2", 1, true) ~= nil
+check("the last page shows the tail with Previous and no Next",
+    pflat2:find("Page 3 of 3", 1, true) ~= nil
         and pflat2:find("Previous page", 1, true) ~= nil
         and pflat2:find("Folder21", 1, true) ~= nil
         and pflat2:find("Next page", 1, true) == nil,
@@ -2066,11 +2098,11 @@ dpop:onConfirm()
 local pflat3 = table.concat(flatten_texts(ptree.frame))
 check("a deletion that shortens the list clamps the page and repaints it",
     ptree:findNode("Folder21") == nil
-        and ptree.page == 1
+        and ptree.page == 2
         and pflat3:find("Folder21", 1, true) == nil
-        and pflat3:find("Folder01", 1, true) ~= nil
+        and pflat3:find("Folder11", 1, true) ~= nil
         and pflat3:find("Folder20", 1, true) ~= nil
-        and pflat3:find("Next page", 1, true) == nil,
+        and pflat3:find("Page 2 of 2", 1, true) ~= nil,
     pflat3)
 -- The destination tree pages the same way; its Default row stays visible.
 inst:setFolder("CrossDropped Files")
@@ -2078,9 +2110,11 @@ raw_ok(many_folders_json(21))
 UIManager._shown = {}
 home:chooseDestination()
 local dtree2 = UIManager._shown[#UIManager._shown]
+dtree2.rows_per_page = 10
+dtree2:init()
 local dflat2 = table.concat(flatten_texts(dtree2.frame))
 check("the destination tree pages too (Default stays visible)",
-    dflat2:find("Page 1 of 2", 1, true) ~= nil
+    dflat2:find("Page 1 of 3", 1, true) ~= nil
         and dflat2:find("Next page", 1, true) ~= nil
         and dflat2:find("back to the default", 1, true) ~= nil,
     dflat2)
