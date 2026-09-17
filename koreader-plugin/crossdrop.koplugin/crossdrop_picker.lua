@@ -554,7 +554,7 @@ function PickerDialog:sendRowText()
     if n > 0 then
         return string.format(_("Send to Xteink  \226\128\162  send %d file(s) now"), n)
     end
-    return _("Send to Xteink  \226\128\162  pick books below")
+    return _("Send to Xteink  \226\128\162  pick files below")
 end
 
 -- The action: confirm dialog whose OK button is the labeled
@@ -566,7 +566,7 @@ function PickerDialog:confirmAndSend()
     for p in pairs(self.picked or {}) do paths[#paths + 1] = p end
     if #paths == 0 then
         UIManager:show(Notification:new{
-            text = _("Tap books below to pick them \226\128\148 then this row sends them."),
+            text = _("Tap files below to pick them \226\128\148 then this row sends them."),
             timeout = 4,
         })
         return

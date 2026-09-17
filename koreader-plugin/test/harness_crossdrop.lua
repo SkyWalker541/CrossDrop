@@ -966,7 +966,7 @@ picker.picked = {}
 picker:confirmAndSend()
 local hint0 = UIManager._shown[#UIManager._shown]
 check("send action with no selection shows a hint",
-    hint0 and type(hint0.text) == "string" and hint0.text:match("Tap books"), hint0 and hint0.text)
+    hint0 and type(hint0.text) == "string" and hint0.text:match("Tap files"), hint0 and hint0.text)
 
 -- exiting the picker (its TitleBar ✕, the dashboard's own) ALWAYS lands back
 -- on the CrossDrop dashboard: if Home is still open it is repainted; if it
@@ -1908,7 +1908,9 @@ check("deleteEntry reports a device error",
     dfk == nil and type(dferr) == "string", tostring(dferr))
 FAKE.delete_returns = nil
 
--- The tab itself: its own screen, never mixed into the Send tab.
+-- The tab itself: its own screen, never mixed into the Send tab. The tab
+-- labels are CENTERED (menu_style force-sets align="left" in Button:init —
+-- the tabs set their styling directly to bypass that).
 raw_ok(ENTRIES_JSON)
 UIManager._shown = {}
 inst:openHome()
@@ -1921,6 +1923,21 @@ check("Delete Folders/Files is its own tab with its own screen",
         and del_tab_flat:find("Browse the reader and pick things to delete", 1, true) ~= nil
         and del_tab_flat:find("Nothing is deleted until you confirm", 1, true) ~= nil,
     del_tab_flat)
+local tab_btns = {}
+for _, b in ipairs(collect_buttons(home.frame)) do
+    if b.text == "Connections" or b.text == "Send A File" or b.text == "Delete Files" then
+        tab_btns[#tab_btns + 1] = b
+    end
+end
+check("tab labels are centered (menu_style's forced left is bypassed)",
+    #tab_btns == 3 and tab_btns[1].align == "center"
+        and tab_btns[2].align == "center" and tab_btns[3].align == "center",
+    #tab_btns)
+check("the active tab is the bold one",
+    home.tab == "delete"
+        and tab_btns[3].text_font_bold == true
+        and tab_btns[1].text_font_bold == false,
+    tostring(tab_btns[3] and tab_btns[3].text_font_bold))
 UIManager._shown = {}
 home:openDeleteTree()
 local dtree = UIManager._shown[#UIManager._shown]
@@ -1933,6 +1950,16 @@ check("the delete tree renders folder and file rows",
     dtree_flat:find("Books", 1, true) ~= nil
         and dtree_flat:find("MyBook.epub", 1, true) ~= nil,
     dtree_flat)
+local del_tbars = collect_named(dtree.frame, "ui/widget/titlebar")
+check("the delete browser wears the picker's look (title + subtitle)",
+    #del_tbars > 0 and type(del_tbars[1].subtitle) == "string"
+        and del_tbars[1].subtitle:find("tap a name to delete", 1, true) ~= nil,
+    del_tbars[1] and tostring(del_tbars[1].subtitle))
+local del_hairlines = find_widgets(dtree.frame, function(w)
+    return w.dimen ~= nil and w.dimen.h == require("ui/size").line.thick
+end)
+check("delete rows are separated by hairlines like the picker's",
+    #del_hairlines >= 2, #del_hairlines)
 local del_btns = collect_buttons(dtree.frame)
 local del_arrow_count = 0
 for _, b in ipairs(del_btns) do

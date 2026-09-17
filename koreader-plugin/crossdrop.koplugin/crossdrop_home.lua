@@ -259,12 +259,17 @@ function HomeDialog:buildTabBar(content_w)
             tabs_widgets[#tabs_widgets + 1] = HorizontalSpan:new{ width = sc(6) }
         end
         local active = self.tab == t.key
+        -- No menu_style here: it force-sets align="left" inside Button:init
+        -- (why the labels refused to center). The same look is set directly —
+        -- and text_font_bold actually works, so the ACTIVE tab reads bold.
         local btn = Button:new{
             text = t.label,
-            menu_style = true,
-            bold = active,
             width = btn_w,
             align = "center",
+            text_font_face = "smallinfofont",
+            text_font_size = 22,
+            text_font_bold = active,
+            padding_h = Size.padding.large,
             avoid_text_truncation = false,
             callback = function()
                 self:showTab(t.key)
@@ -447,7 +452,7 @@ end
 
 -- ─────────────────────────── Send tab ───────────────────────────────────
 
--- Idle: pick books, or send the one that is open (and only shown when it is),
+-- Idle: pick files, or send the one that is open (and only shown when it is),
 -- plus a Destination folder row that lists the reader's folders or takes a
 -- typed-in name (the CrossDropped Files default when nothing is chosen).
 function HomeDialog:renderSendIdle()
@@ -1393,10 +1398,11 @@ function DeleteDialog:visibleRows()
     return rows
 end
 
--- Paged rendering (the picker's device-proven recipe): long lists slice
--- into pages with Previous/Next rows, and the page CLAMPS to the last page
--- whenever the list shortens (a deletion) — the whole tree repaints with
--- nothing missing and nothing stale.
+-- Paged rendering in the picker's exact presentation (hairline separators
+-- between rows, boxed Previous/Next, a plain caption — so the delete
+-- browser reads as the SAME app as Send A File). The page CLAMPS to the
+-- last page whenever the list shortens (a deletion) — the whole tree
+-- repaints with nothing missing and nothing stale.
 function DeleteDialog:appendPaged(vg)
     local sc = function(v) return Device.screen:scaleBySize(v) end
     local rows = self:visibleRows()
@@ -1421,24 +1427,56 @@ function DeleteDialog:appendPaged(vg)
         else
             self:treeRowInto(vg, r.node, indent)
         end
+        if i < hi then
+            table.insert(vg, self:separator())
+        end
     end
-    -- Page navigation: the caption plus only the buttons that apply.
+    -- Page navigation: the picker's shape — separator, caption, boxed rows,
+    -- and only the buttons that apply.
     if #rows > rpp then
-        table.insert(vg, VerticalSpan:new{ width = sc(10) })
-        table.insert(vg, TextBoxWidget:new{
-            text = string.format(_("Page %d of %d"), self.page, max_page),
-            face = Font:getFace("xx_smallinfofont"),
-            width = self.row_w,
-        })
+        table.insert(vg, self:separator())
+        table.insert(vg, self:caption(string.format(_("Page %d of %d"), self.page, max_page)))
+        table.insert(vg, VerticalSpan:new{ width = sc(2) })
         if self.page > 1 then
-            table.insert(vg, self:plainRow(_("Previous page"),
+            table.insert(vg, self:menuRow(_("Previous page"),
                 function() self:gotoPage(self.page - 1) end))
         end
         if hi < #rows then
-            table.insert(vg, self:plainRow(_("Next page"),
+            table.insert(vg, self:menuRow(_("Next page"),
                 function() self:gotoPage(self.page + 1) end))
         end
     end
+end
+
+-- The picker's exact presentation pieces (crossdrop_picker.lua's recipes),
+-- so both browsers share one visual language.
+function DeleteDialog:separator()
+    local sc = function(v) return Device.screen:scaleBySize(v) end
+    return VerticalGroup:new{
+        VerticalSpan:new{ width = sc(2) },
+        LineWidget:new{
+            dimen = Geom:new{ w = self.row_w, h = Size.line.thick },
+            background = Blitbuffer.COLOR_LIGHT_GRAY,
+        },
+        VerticalSpan:new{ width = sc(2) },
+    }
+end
+
+function DeleteDialog:caption(text)
+    return TextBoxWidget:new{
+        text = text,
+        face = Font:getFace("smallinfofont"),
+        width = self.row_w,
+    }
+end
+
+function DeleteDialog:menuRow(text, callback)
+    return Button:new{
+        text = text,
+        menu_style = true,
+        width = self.row_w,
+        callback = callback,
+    }
 end
 
 function DeleteDialog:gotoPage(n)
@@ -1486,20 +1524,6 @@ function DeleteDialog:treeRowInto(vg, node, indent)
     })
 end
 
-function DeleteDialog:plainRow(text, callback)
-    return Button:new{
-        text = text,
-        width = self.row_w,
-        align = "left",
-        bordersize = 0,
-        padding_h = Size.padding.large,
-        avoid_text_truncation = false,
-        text_font_face = "smallinfofont",
-        text_font_size = 22,
-        callback = callback,
-    }
-end
-
 function DeleteDialog:init()
     local sc = function(v) return Device.screen:scaleBySize(v) end
     local sw = Device.screen:getWidth()
@@ -1508,22 +1532,31 @@ function DeleteDialog:init()
     local pad = Size.padding.default
     local inner_w = sw - pad * 2
     self.row_w = inner_w
-    -- Rows per page MEASURED from one real row (the panel's fonts and
-    -- paddings decide, not a guessed row height — a guessed count once put
-    -- the page-nav rows themselves below the fold, so long folders looked
-    -- unscrollable). The allowance covers the title bar, the spans, and
-    -- the page-nav rows below the tree. Setting self.rows_per_page before
-    -- init skips the probe (how the tests pin it).
+    -- Rows per page MEASURED from one real row PLUS its hairline separator
+    -- (the panel's fonts and paddings decide, not a guessed row height — a
+    -- guessed count once put the page-nav rows themselves below the fold,
+    -- so long folders looked unscrollable). The allowance covers the title
+    -- bar, the subtitle, and the page-nav rows below the tree. Setting
+    -- self.rows_per_page before init skips the probe (how the tests pin it).
     if not self.rows_per_page then
         local probe = VerticalGroup:new{}
         self:treeRowInto(probe, new_node("sample", "sample", 0), 0)
+        table.insert(probe, self:separator())
         local rh = (probe:getSize() and probe:getSize().h) or sc(60)
-        self.rows_per_page = math.max(5, math.floor((sh - sc(240)) / math.max(rh, 1)))
+        self.rows_per_page = math.max(5, math.floor((sh - sc(290)) / math.max(rh, 1)))
     end
 
+    -- The picker's TitleBar shape: title + a subtitle line that says what
+    -- the page holds and how to act on it.
+    local subtitle
+    if not self.list_err then
+        subtitle = string.format(_("%d item(s) at the root \226\128\148 tap a name to delete"),
+            #(self.nodes or {}))
+    end
     local title_bar = TitleBar:new{
         width = inner_w,
         title = _("Delete Folders/Files"),
+        subtitle = subtitle,
         fullscreen = false,
         with_bottom_line = true,
         left_icon = "chevron.left",
