@@ -386,6 +386,7 @@ local FAKE = {
     mkcol_returns = nil,    -- optional { [url] = status } to force per-URL replies
     delete_urls = {},       -- every DELETE url answered (the delete tab's tree)
     delete_returns = nil,   -- optional { [url] = status } to force per-URL replies
+    delete_409_once = nil,  -- optional { [url] = true }: first DELETE -> 409 (not empty), then 204
 }
 
 -- Real wire capture from the Xteink reader (nc at 192.168.7.45:80): it streams
@@ -441,6 +442,10 @@ local function fake_request(args)
         FAKE.delete_urls[#FAKE.delete_urls + 1] = url
         if FAKE.delete_returns and FAKE.delete_returns[url] then
             return "", FAKE.delete_returns[url]
+        end
+        if FAKE.delete_409_once and FAKE.delete_409_once[url] then
+            FAKE.delete_409_once[url] = nil
+            return "", 409
         end
         return "", 204
     end
@@ -1458,6 +1463,33 @@ check("listFolders guards the empty IP",
     lf3_ok == nil and tostring(lf3_err):find("WiFi IP not set", 1, true) ~= nil, tostring(lf3_err))
 G_reader_settings:saveSetting("crossdrop_wifi_ip", "10.1.2.3")
 
+-- Walk a rendered widget tree collecting the Buttons / a named widget class
+-- (file scope: several sections use these).
+local function collect_buttons(w, acc)
+    acc = acc or {}
+    if type(w) == "table" then
+        if w.__name == "ui/widget/button" then acc[#acc + 1] = w end
+        for i = 1, #w do
+            if type(w[i]) == "table" then collect_buttons(w[i], acc) end
+        end
+    end
+    return acc
+end
+local function collect_named(w, want, acc)
+    acc = acc or {}
+    if type(w) == "table" then
+        if w.__name == want then acc[#acc + 1] = w end
+        for i = 1, #w do
+            if type(w[i]) == "table" then collect_named(w[i], want, acc) end
+        end
+    end
+    return acc
+end
+
+-- (do..end: sections 14d-14h keep their many locals out of the main chunk's
+-- 200-local limit; the helpers they share live at file scope.)
+do
+
 -- 14d. DESTINATION FOLDER TREE: reached from the Send tab, renders the
 -- reader's folders as a tree. The reader being unreachable shows ONLY the
 -- "Device not found…" message (no retry / typed-path fallback); an unset IP
@@ -1663,17 +1695,8 @@ check("leaving the tree restores the default",
 -- children, renders them indented, does NOT pick), the NAME opens the tiny
 -- Select / Create Subfolder / Cancel popup (small like the send-confirmation
 -- ConfirmBox, never a full page). This is exactly the wiring that once
--- regressed: both taps picked the folder and the tree never opened.
-local function collect_buttons(w, acc)
-    acc = acc or {}
-    if type(w) == "table" then
-        if w.__name == "ui/widget/button" then acc[#acc + 1] = w end
-        for i = 1, #w do
-            if type(w[i]) == "table" then collect_buttons(w[i], acc) end
-        end
-    end
-    return acc
-end
+-- regress broke both taps to "just pick the folder" and the tree never
+-- opened. (collect_buttons lives at file scope.)
 inst:setFolder("CrossDropped Files")
 raw_ok(CLEAN_FILES_JSON)
 UIManager._shown = {}
@@ -1745,16 +1768,7 @@ dlg:pick("CrossDropped Files")
 -- the tree refreshes the dashboard's destination row; a subfolder created
 -- in the tree (pending, not yet on the reader) already shows on that row;
 -- the ▸ control is a real tap target, not a hairline glyph.
-local function collect_named(w, want, acc)
-    acc = acc or {}
-    if type(w) == "table" then
-        if w.__name == want then acc[#acc + 1] = w end
-        for i = 1, #w do
-            if type(w[i]) == "table" then collect_named(w[i], want, acc) end
-        end
-    end
-    return acc
-end
+-- (collect_named lives at file scope.)
 inst:setFolder("CrossDropped Files")
 raw_ok(CLEAN_FILES_JSON)
 UIManager._shown = {}
@@ -1823,6 +1837,11 @@ picker_tbars[1].left_icon_tap_callback()
 check("tapping the picker's back chevron returns to the dashboard",
     picker_dlg._closed == true, tostring(picker_dlg._closed))
 dlg:pick("CrossDropped Files")
+end -- do (14d-14h block)
+
+-- (do..end: sections 14i-14k keep their locals out of the main chunk's
+-- 200-local limit; they reference only earlier main-chunk locals.)
+do
 
 -- 14i. DELETE TAB (1.4.0): its OWN tab (never inside Send A Book), the same
 -- tree system but listing FILES too, a confirm popup before anything dies,
@@ -1980,6 +1999,93 @@ check("unreachable reader: the delete tree shows only the device message",
     derr_flat)
 FAKE.fail = false
 inst:setFolder("CrossDropped Files")
+
+-- 14j. NON-EMPTY FOLDER PURGE (device-verified 409): the reader's DELETE
+-- does NOT recurse — a folder with things inside answers 409. "Delete
+-- folder and its contents" therefore purges depth-first (children listed
+-- FRESH from the reader, files deleted, folders recursed) and only then
+-- the folder itself.
+local PURGE_FILES_JSON = '[{"name":"Novel.epub","size":99,"isDirectory":false,"isEpub":true}]'
+inst:setFolder("CrossDropped Files")
+raw_ok(ENTRIES_JSON)
+UIManager._shown = {}
+home:openDeleteTree()
+dtree = UIManager._shown[#UIManager._shown]
+raw_ok(PURGE_FILES_JSON) -- consumed by the purge's own fresh listing
+FAKE.delete_409_once = { ["http://10.1.2.3:80/Books"] = true }
+UIManager._shown = {}
+FAKE.delete_urls = {}
+dtree:showDeletePopup(dtree:findNode("Books"))
+dpop = UIManager._shown[#UIManager._shown]
+dpop:onConfirm()
+check("a non-empty folder (409) is purged: contents first, folder last",
+    #FAKE.delete_urls == 3
+        and FAKE.delete_urls[2]:find("Novel.epub", 1, true) ~= nil
+        and FAKE.delete_urls[3]:find("/Books", 1, true) ~= nil,
+    table.concat(FAKE.delete_urls, " | "))
+check("the purged folder leaves the tree",
+    dtree:findNode("Books") == nil,
+    tostring(dtree:findNode("Books")))
+FAKE.delete_409_once = nil
+
+-- 14k. PAGING: long trees slice into pages (the picker's device-proven
+-- recipe), and a deletion that shortens the list clamps the page and
+-- repaints the whole (shortened) tree — nothing missing, nothing stale.
+local function many_folders_json(n)
+    local parts = {}
+    for i = 1, n do
+        parts[#parts + 1] = string.format(
+            '{"name":"Folder%02d","size":0,"isDirectory":true,"isEpub":false}', i)
+    end
+    return "[" .. table.concat(parts, ",") .. "]"
+end
+raw_ok(many_folders_json(21))
+UIManager._shown = {}
+home:openDeleteTree()
+local ptree = UIManager._shown[#UIManager._shown]
+local pflat = table.concat(flatten_texts(ptree.frame))
+check("long lists page: page 1 slices the rows and offers Next",
+    pflat:find("Page 1 of 2", 1, true) ~= nil
+        and pflat:find("Next page", 1, true) ~= nil
+        and pflat:find("Folder01", 1, true) ~= nil
+        and pflat:find("Folder21", 1, true) == nil,
+    pflat)
+ptree:gotoPage(2)
+local pflat2 = table.concat(flatten_texts(ptree.frame))
+check("page 2 shows the tail with Previous and no Next",
+    pflat2:find("Page 2 of 2", 1, true) ~= nil
+        and pflat2:find("Previous page", 1, true) ~= nil
+        and pflat2:find("Folder21", 1, true) ~= nil
+        and pflat2:find("Next page", 1, true) == nil,
+    pflat2)
+UIManager._shown = {}
+FAKE.delete_urls = {}
+ptree:showDeletePopup(ptree:findNode("Folder21"))
+dpop = UIManager._shown[#UIManager._shown]
+dpop:onConfirm()
+local pflat3 = table.concat(flatten_texts(ptree.frame))
+check("a deletion that shortens the list clamps the page and repaints it",
+    ptree:findNode("Folder21") == nil
+        and ptree.page == 1
+        and pflat3:find("Folder21", 1, true) == nil
+        and pflat3:find("Folder01", 1, true) ~= nil
+        and pflat3:find("Folder20", 1, true) ~= nil
+        and pflat3:find("Next page", 1, true) == nil,
+    pflat3)
+-- The destination tree pages the same way; its Default row stays visible.
+inst:setFolder("CrossDropped Files")
+raw_ok(many_folders_json(21))
+UIManager._shown = {}
+home:chooseDestination()
+local dtree2 = UIManager._shown[#UIManager._shown]
+local dflat2 = table.concat(flatten_texts(dtree2.frame))
+check("the destination tree pages too (Default stays visible)",
+    dflat2:find("Page 1 of 2", 1, true) ~= nil
+        and dflat2:find("Next page", 1, true) ~= nil
+        and dflat2:find("back to the default", 1, true) ~= nil,
+    dflat2)
+dtree2:pick("CrossDropped Files")
+end -- do (14i/14j/14k block)
 
 -- 15. IP PERSISTENCE: the WiFi IP lives in KOReader's global settings; in
 -- this plugin it is only ever written by the Set WiFi IP dialog.

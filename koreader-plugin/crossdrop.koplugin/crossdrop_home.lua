@@ -245,8 +245,14 @@ function HomeDialog:buildTabBar(content_w)
     local tabs = {
         { key = "connections", label = _("Connections") },
         { key = "send", label = _("Send A Book") },
-        { key = "delete", label = _("Delete Folders/Files") },
+        { key = "delete", label = _("Delete Files") },
     }
+    -- Fixed equal widths: the bar EXACTLY fills the row no matter how many
+    -- tabs or how long the labels (a third long tab pushed the bar off
+    -- screen when buttons auto-sized to their text).
+    local gaps = sc(6) * (#tabs - 1)
+    local frame_w = math.floor((content_w - gaps) / #tabs)
+    local btn_w = frame_w - sc(8) * 2
     local tabs_widgets = {}
     for i, t in ipairs(tabs) do
         if i > 1 then
@@ -257,6 +263,8 @@ function HomeDialog:buildTabBar(content_w)
             text = t.label,
             menu_style = true,
             bold = active,
+            width = btn_w,
+            avoid_text_truncation = false,
             callback = function()
                 self:showTab(t.key)
             end,
@@ -265,7 +273,7 @@ function HomeDialog:buildTabBar(content_w)
         if active then
             underline = LineWidget:new{
                 background = Blitbuffer.COLOR_BLACK,
-                dimen = Geom:new{ w = math.max(sc(24), btn:getSize().w), h = sc(3) },
+                dimen = Geom:new{ w = btn_w, h = sc(3) },
             }
         else
             underline = VerticalSpan:new{ width = sc(3) }
@@ -529,6 +537,8 @@ local DestinationDialog = InputContainer:extend{
     nodes = nil,      -- root folder tree (a new_node list)
     list_err = nil,   -- reader unreachable → message-only body
     selected = nil,   -- chosen destination (relative path; nil == default)
+    page = nil,       -- current page of the (possibly long) visible tree
+    rows_per_page = nil,
 }
 
 -- Find a node by its path (depth-first search over the whole tree).
@@ -687,6 +697,10 @@ function DestinationDialog:init()
     local pad = Size.padding.default
     local inner_w = sw - pad * 2
     self.row_w = inner_w
+    -- Rows per page from the panel height. The allowance is larger than the
+    -- delete tree's: this page also carries the destination line, section
+    -- headers, and the Default row.
+    self.rows_per_page = math.max(8, math.floor((sh - sc(280)) / sc(32)))
 
     -- Back chevron top-left returns to the dashboard. There is NO ✕ here:
     -- the dashboard is still behind this page, and X is reserved for leaving
@@ -716,7 +730,9 @@ function DestinationDialog:init()
         table.insert(vg, self:foldersHeader(_("Folders on the reader")))
         local nodes = self.nodes or {}
         if #nodes > 0 then
-            self:appendNodes(vg, nodes, 0)
+            -- Long trees slice into pages (the picker's recipe); the page
+            -- clamps when the tree shortens. Default stays visible below.
+            self:appendPaged(vg)
         else
             table.insert(vg, TextBoxWidget:new{
                 text = _("No folders on the reader."),
@@ -750,32 +766,80 @@ function DestinationDialog:init()
     end
 end
 
--- Render a folder list into `vg`, one indented BOXLESS row per node (bare
--- text, like the picker's book rows). Open nodes recurse into their children
--- one level deeper; an open folder with no children shows the
--- "No subfolders found in /X" note in its place.
-function DestinationDialog:appendNodes(vg, nodes, depth)
-    local sc = function(v) return Device.screen:scaleBySize(v) end
-    local indent = math.min(depth * sc(TREE_INDENT), sc(140))
-    for i = 1, #nodes do
-        local node = nodes[i]
-        self:treeRowInto(vg, node, indent)
-        if node.expanded then
-            local kids = node.children or {}
-            if #kids > 0 then
-                self:appendNodes(vg, kids, depth + 1)
-            else
-                table.insert(vg, HorizontalGroup:new{
-                    HorizontalSpan:new{ width = indent + sc(TREE_ARROW_W) + sc(6) },
-                    TextBoxWidget:new{
-                        text = string.format(_("No subfolders found in /%s"), node.path),
-                        face = Font:getFace("smallinfofont"),
-                        width = math.max(self.row_w - indent - sc(TREE_ARROW_W) - sc(6), 1),
-                    },
-                })
+-- The visible tree flattened into display-order rows: folder rows, plus
+-- the "No subfolders found in /X" note rows of empty expanded folders.
+function DestinationDialog:visibleRows()
+    local rows = {}
+    local function walk(nodes, depth)
+        for i = 1, #nodes do
+            local n = nodes[i]
+            rows[#rows + 1] = { node = n, depth = depth }
+            if n.expanded then
+                local kids = n.children or {}
+                if #kids > 0 then
+                    walk(kids, depth + 1)
+                else
+                    rows[#rows + 1] = { note = n, depth = depth }
+                end
             end
         end
     end
+    walk(self.nodes or {}, 0)
+    return rows
+end
+
+-- Paged rendering (the picker's device-proven recipe): long trees slice
+-- into pages with Previous/Next rows; the page clamps when the tree
+-- shortens. The Default section always stays visible under the tree.
+function DestinationDialog:appendPaged(vg)
+    local sc = function(v) return Device.screen:scaleBySize(v) end
+    local rows = self:visibleRows()
+    local rpp = self.rows_per_page
+    local max_page = math.max(1, math.ceil(#rows / rpp))
+    if (self.page or 1) > max_page then self.page = max_page end
+    self.page = math.max(1, self.page or 1)
+    local lo = (self.page - 1) * rpp + 1
+    local hi = math.min(#rows, self.page * rpp)
+    for i = lo, hi do
+        local r = rows[i]
+        local indent = math.min(r.depth * sc(TREE_INDENT), sc(140))
+        if r.note then
+            table.insert(vg, HorizontalGroup:new{
+                HorizontalSpan:new{ width = indent + sc(TREE_ARROW_W) + sc(6) },
+                TextBoxWidget:new{
+                    text = string.format(_("No subfolders found in /%s"), r.note.path),
+                    face = Font:getFace("smallinfofont"),
+                    width = math.max(self.row_w - indent - sc(TREE_ARROW_W) - sc(6), 1),
+                },
+            })
+        else
+            self:treeRowInto(vg, r.node, indent)
+        end
+    end
+    -- Page navigation: the caption plus only the buttons that apply.
+    if #rows > rpp then
+        table.insert(vg, VerticalSpan:new{ width = sc(10) })
+        table.insert(vg, TextBoxWidget:new{
+            text = string.format(_("Page %d of %d"), self.page, max_page),
+            face = Font:getFace("xx_smallinfofont"),
+            width = self.row_w,
+        })
+        if self.page > 1 then
+            table.insert(vg, self:plainRow(_("Previous page"),
+                function() self:gotoPage(self.page - 1) end))
+        end
+        if hi < #rows then
+            table.insert(vg, self:plainRow(_("Next page"),
+                function() self:gotoPage(self.page + 1) end))
+        end
+    end
+end
+
+function DestinationDialog:gotoPage(n)
+    self.page = math.max(1, n)
+    self:init()
+    UIManager:setDirty(self, "ui")
+    UIManager:forceRePaint()
 end
 -- One tree row: the ▸/▾ expand control and the folder name are SEPARATE
 -- buttons (separate tap targets), placed after the indentation. Tapping
@@ -1111,6 +1175,8 @@ DeleteDialog = InputContainer:extend{
     home = nil,       -- the HomeDialog to return to
     nodes = nil,      -- root tree (new_node list; file rows carry is_file)
     list_err = nil,   -- reader unreachable → message-only body
+    page = nil,       -- current page of the (possibly long) visible tree
+    rows_per_page = nil,
 }
 
 function DeleteDialog:findNode(path)
@@ -1215,9 +1281,34 @@ function DeleteDialog:expandNode(node)
     self:rebuild()
 end
 
--- The confirmed delete: one WebDAV DELETE, a popup reporting the result, and
--- the tree refreshing in place. If the deleted folder WAS the destination,
--- the destination falls back to the CrossDropped Files default so a later
+-- The reader's DELETE does NOT recurse (a non-empty folder answers 409 —
+-- device-verified), so "Delete folder and its contents" purges depth-first:
+-- every child is listed FRESH from the reader (never the stale cache),
+-- files deleted, folders purged recursively, then the folder itself.
+function DeleteDialog:purgeFolder(target, path)
+    local ok, entries = self.plugin:listEntries(target, path)
+    if not ok then
+        return nil, string.format(_("could not list /%s"), tostring(path))
+    end
+    for _, e in ipairs(entries) do
+        local child = path .. "/" .. e.name
+        if e.is_dir then
+            local pok, perr = self:purgeFolder(target, child)
+            if not pok then return nil, perr end
+        else
+            local fok, ferr = self.plugin:deleteEntry(target, child)
+            if not fok then return nil, ferr end
+        end
+    end
+    return self.plugin:deleteEntry(target, path)
+end
+
+-- The confirmed delete: files go with one DELETE; folders try the fast
+-- path first (an EMPTY folder dies in one call) and purge depth-first when
+-- the reader answers 409 "not empty". Then the tree updates in place — a
+-- flashless "ui" repaint of the shortened list, never a full-screen sweep —
+-- and a popup reports the result. If the deleted folder WAS the
+-- destination, it falls back to the CrossDropped Files default so a later
 -- send cannot target a deleted folder.
 function DeleteDialog:deleteNode(node)
     local target = self.plugin:resolveTarget()
@@ -1225,7 +1316,16 @@ function DeleteDialog:deleteNode(node)
         UIManager:show(Notification:new{ text = _("Set the WiFi IP on the Connections tab first."), timeout = 4 })
         return
     end
-    local ok, err = self.plugin:deleteEntry(target, node.path)
+    local ok, err, code
+    if node.is_file then
+        ok, err = self.plugin:deleteEntry(target, node.path)
+    else
+        ok, err, code = self.plugin:deleteEntry(target, node.path)
+        if not ok and code == 409 then
+            -- Folder still has things inside: purge them, then the folder.
+            ok, err = self:purgeFolder(target, node.path)
+        end
+    end
     if not ok then
         UIManager:show(Notification:new{
             text = _("Could not delete /" .. tostring(node.path) .. ":\n") .. tostring(err or "unknown error"),
@@ -1262,28 +1362,81 @@ function DeleteDialog:showDeletePopup(node)
     UIManager:forceRePaint()
 end
 
-function DeleteDialog:appendNodes(vg, nodes, depth)
-    local sc = function(v) return Device.screen:scaleBySize(v) end
-    local indent = math.min(depth * sc(TREE_INDENT), sc(140))
-    for i = 1, #nodes do
-        local node = nodes[i]
-        self:treeRowInto(vg, node, indent)
-        if node.expanded then
-            local kids = node.children or {}
-            if #kids > 0 then
-                self:appendNodes(vg, kids, depth + 1)
-            else
-                table.insert(vg, HorizontalGroup:new{
-                    HorizontalSpan:new{ width = indent + sc(TREE_ARROW_W) + sc(6) },
-                    TextBoxWidget:new{
-                        text = string.format(_("Nothing else in /%s"), node.path),
-                        face = Font:getFace("smallinfofont"),
-                        width = math.max(self.row_w - indent - sc(TREE_ARROW_W) - sc(6), 1),
-                    },
-                })
+-- The visible tree flattened into display-order rows: folder/file rows,
+-- plus the "Nothing else" note rows of empty expanded folders.
+function DeleteDialog:visibleRows()
+    local rows = {}
+    local function walk(nodes, depth)
+        for i = 1, #nodes do
+            local n = nodes[i]
+            rows[#rows + 1] = { node = n, depth = depth }
+            if n.expanded then
+                local kids = n.children or {}
+                if #kids > 0 then
+                    walk(kids, depth + 1)
+                else
+                    rows[#rows + 1] = { note = n, depth = depth }
+                end
             end
         end
     end
+    walk(self.nodes or {}, 0)
+    return rows
+end
+
+-- Paged rendering (the picker's device-proven recipe): long lists slice
+-- into pages with Previous/Next rows, and the page CLAMPS to the last page
+-- whenever the list shortens (a deletion) — the whole tree repaints with
+-- nothing missing and nothing stale.
+function DeleteDialog:appendPaged(vg)
+    local sc = function(v) return Device.screen:scaleBySize(v) end
+    local rows = self:visibleRows()
+    local rpp = self.rows_per_page
+    local max_page = math.max(1, math.ceil(#rows / rpp))
+    if (self.page or 1) > max_page then self.page = max_page end
+    self.page = math.max(1, self.page or 1)
+    local lo = (self.page - 1) * rpp + 1
+    local hi = math.min(#rows, self.page * rpp)
+    for i = lo, hi do
+        local r = rows[i]
+        local indent = math.min(r.depth * sc(TREE_INDENT), sc(140))
+        if r.note then
+            table.insert(vg, HorizontalGroup:new{
+                HorizontalSpan:new{ width = indent + sc(TREE_ARROW_W) + sc(6) },
+                TextBoxWidget:new{
+                    text = string.format(_("Nothing else in /%s"), r.note.path),
+                    face = Font:getFace("smallinfofont"),
+                    width = math.max(self.row_w - indent - sc(TREE_ARROW_W) - sc(6), 1),
+                },
+            })
+        else
+            self:treeRowInto(vg, r.node, indent)
+        end
+    end
+    -- Page navigation: the caption plus only the buttons that apply.
+    if #rows > rpp then
+        table.insert(vg, VerticalSpan:new{ width = sc(10) })
+        table.insert(vg, TextBoxWidget:new{
+            text = string.format(_("Page %d of %d"), self.page, max_page),
+            face = Font:getFace("xx_smallinfofont"),
+            width = self.row_w,
+        })
+        if self.page > 1 then
+            table.insert(vg, self:plainRow(_("Previous page"),
+                function() self:gotoPage(self.page - 1) end))
+        end
+        if hi < #rows then
+            table.insert(vg, self:plainRow(_("Next page"),
+                function() self:gotoPage(self.page + 1) end))
+        end
+    end
+end
+
+function DeleteDialog:gotoPage(n)
+    self.page = math.max(1, n)
+    self:init()
+    UIManager:setDirty(self, "ui")
+    UIManager:forceRePaint()
 end
 
 -- One tree row: folders carry the ▸/▾ control, files just a spacer in its
@@ -1346,6 +1499,9 @@ function DeleteDialog:init()
     local pad = Size.padding.default
     local inner_w = sw - pad * 2
     self.row_w = inner_w
+    -- Rows per page from the panel height (one row ≈ sc(32) real px; the
+    -- allowance covers the title bar and the page-nav rows below).
+    self.rows_per_page = math.max(8, math.floor((sh - sc(150)) / sc(32)))
 
     local title_bar = TitleBar:new{
         width = inner_w,
@@ -1367,7 +1523,9 @@ function DeleteDialog:init()
     else
         local nodes = self.nodes or {}
         if #nodes > 0 then
-            self:appendNodes(vg, nodes, 0)
+            -- Long lists slice into pages (the picker's recipe); the page
+            -- clamps when a deletion shortens the tree.
+            self:appendPaged(vg)
         else
             table.insert(vg, TextBoxWidget:new{
                 text = _("Nothing on the reader."),

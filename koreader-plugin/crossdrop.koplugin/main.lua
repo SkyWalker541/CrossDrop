@@ -490,26 +490,28 @@ function CROSSDROP:listEntries(target, path)
     return true, entries
 end
 
--- Delete one file or folder (a folder deletes everything inside it) over
--- WebDAV: DELETE http://<ip>:<port>/<path> — the reader answers 204.
+-- Delete one file or folder over WebDAV: DELETE http://<ip>:<port>/<path>.
+-- NOTE (device-verified): this reader's DELETE does NOT recurse — a
+-- non-empty folder answers 409. Returns (true, nil, code) or (nil, err, code)
+-- so callers can branch on 409 and purge the folder's contents first.
 function CROSSDROP:deleteEntry(target, path)
     if not target or not target.ip or target.ip == "" then
-        return nil, _("WiFi IP not set (see the Connections tab)")
+        return nil, _("WiFi IP not set (see the Connections tab)"), nil
     end
     local p = tostring(path or ""):gsub("^/+", ""):gsub("/+$", "")
     if p == "" then
-        return nil, "nothing to delete"
+        return nil, "nothing to delete", nil
     end
     local ok, code, errbody = self:req("DELETE", base_url(target) .. encode_path("/" .. p))
     if ok then
         logger.info("crossdrop: deleted /", p)
-        return true
+        return true, nil, code
     end
     local err = (type(code) == "number")
         and string.format("device replied %s (%s)", tostring(code), tostring(errbody or ""))
         or tostring(code or errbody or "unknown error")
     logger.info("crossdrop: delete failed (", target.ip, "): ", err)
-    return nil, err
+    return nil, err, code
 end
 
 -- Make sure the destination folder exists. A nested destination (Books/x)
