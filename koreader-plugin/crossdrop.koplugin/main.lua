@@ -29,6 +29,24 @@ streamed chunk-by-chunk from disk so devices with little RAM (like a Kindle)
 can send books of any size. A waiting dialog shows while the chunks stream
 (progress bars never render on this e-ink build — the transfer drains faster
 than the panel can repaint, so a bar just sat at 0% then jumped to done).
+
+-- 1.4.3 (test build) — Kobo connectivity hardening, Storefront-style:
+--   * NetworkMgr:runWhenConnected() gates every send/check entry point. On
+--     devices where KOReader manages the radio (Kobo) CrossDrop now brings
+--     Wi-Fi up first instead of probing a dead link; the fast path is
+--     synchronous on platforms where the radio is always up (Android and kin),
+--     so behavior is unchanged where it already worked. runWhenConnected (NOT
+--     runWhenOnline) is used because the reader is a LAN-only target that may
+--     have no internet, and runWhenOnline would never fire its callback on
+--     such a link.
+--   * UIManager:preventStandby()/allowStandby() (pcall-guarded) held across
+--     blocking probes, folder listings and the whole send batch, so a long
+--     transfer cannot be killed by autosuspend tearing down the radio
+--     mid-stream on KOReader-managed platforms.
+--   * Probes retry (4s then 6s, every attempt logged so crash.log shows the
+--     probe trail) — a radio/ESP32 power-save wake-up shouldn't read as a
+--     false "offline".
+--   * socketutil timeout codes are mapped to a clear "timed out" message.
 ]]
 
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
@@ -42,6 +60,12 @@ local logger = require("logger")
 local _ = require("gettext")
 
 local DEFAULT_FOLDER = "/CrossDropped Files"
+
+-- Shown by the fast fail-fast guards on single-op network calls (folder
+-- listings, deletes) when the radio is off but has a stored IP: instant,
+-- actionable feedback instead of a silent bounded-timeout hang.
+local WIFI_OFF_MSG =
+    _("Wi-Fi is off on this device. Turn it on (Menu → Wi-Fi connection) — CrossDrop connects for you on send/check.")
 
 -- UI extras (toast, waiting dialog, full-screen Home) are sibling modules in
 -- this plugin folder. They must be required at plugin load (the Storefront
@@ -65,7 +89,7 @@ local CROSSDROP = WidgetContainer:extend{
     -- Shown on the dashboard's Connections tab so the running build is
     -- always identifiable on the device (KOReader loads plugins once at
     -- startup — a replaced plugin file does nothing until restart).
-    VERSION = "1.4.1",
+    VERSION = "1.4.3",
 }
 
 local socket, http
@@ -98,6 +122,47 @@ local function socketutilModule()
         end
     end
     return socketutil_mod
+end
+
+-- KOReader's NetworkMgr — the same module Storefront gates its network calls
+-- with. Required lazily + pcall'd so a build without it (or the test harness)
+-- degrades to the old trust-the-radio behavior. When KOReader does NOT manage
+-- the radio (Android, Cervantes…) `isWifiOn()`/`isConnected()` always answer
+-- true, so gating is a synchronous no-op there and nothing changes for users
+-- where it works.
+local NetworkMgr_mod, NetworkMgr_tried
+local function networkManager()
+    if not NetworkMgr_tried then
+        NetworkMgr_tried = true
+        local ok, nm = pcall(require, "ui/network/manager")
+        if ok and type(nm) == "table" then
+            -- KOReader normally initializes NetworkMgr at startup; only if
+            -- something exotic left it unwired do we init it (once — running
+            -- it again would reschedule connectivity checks/broadcasts).
+            if not nm.interface and type(nm.init) == "function" then
+                pcall(nm.init, nm)
+            end
+            NetworkMgr_mod = nm
+        else
+            NetworkMgr_mod = false
+        end
+    end
+    return NetworkMgr_mod
+end
+
+-- Keep the device from suspending while a blocking network op runs. On Kobo
+-- (and other KOReader-managed radios) the Wi-Fi chip is torn down on suspend,
+-- which would kill an in-flight transfer. pcall-guarded: not every build or
+-- platform provides these guards, so this is a strict no-op where they're
+-- missing. Returns a release() function.
+local function standbyHold()
+    if UIManager.preventStandby then
+        pcall(function() UIManager:preventStandby() end)
+        return function()
+            pcall(function() UIManager:allowStandby() end)
+        end
+    end
+    return function() end
 end
 
 local function socket_available()
@@ -171,14 +236,19 @@ end
 
 -- Generic HTTP call. Returns (ok, code, body). On a network failure `code`
 -- carries LuaSocket's error string and `ok` is nil. `timeout` is the socket
--- timeout in seconds (default: Storefront's file sizes; probes use short 3s
--- so failure is snappy).
+-- timeout in seconds (default: Storefront's file sizes; probes pass short
+-- retrying timeouts so failure is snappy).
 --
 -- FREEZE FIX: raw socket.http forces its OWN 60s connect timeout (http.lua
 -- calls settimeout(http.TIMEOUT) AFTER any custom `create()`), so an
 -- unreachable IP made "Check device" block the UI for a minute+ and the
 -- Kindle looked hard-frozen. socketutil patches socket.tcp + http.TIMEOUT so
 -- every socket op honors our value — the same mechanism Storefront uses.
+--
+-- socketutil surfaces forced timeouts as special non-numeric codes
+-- ("timeout", "wantread", "sink timeout") rather than an HTTP status; those
+-- are mapped to a clear "timed out" so the UI and crash.log say what actually
+-- happened instead of a bogus string-vs-number comparison.
 function CROSSDROP:req(method, url, headers, source_fn, timeout)
     if not socket_available() then
         return nil, "LuaSocket unavailable", nil
@@ -201,7 +271,16 @@ function CROSSDROP:req(method, url, headers, source_fn, timeout)
     end
     -- On failure LuaSocket returns (nil, "<error message>") instead of a status
     -- code, so `code` can be a string here. Only compare it when it is a number,
-    -- otherwise comparing a string to a number raises a Lua error.
+    -- otherwise comparing a string to a number raises a Lua error. The
+    -- socketutil timeout codes are special-cased first for a readable message.
+    if type(code) == "string" then
+        if code == (su.TIMEOUT_CODE or "timeout")
+            or code == (su.SINK_TIMEOUT_CODE or "sink timeout")
+            or code == (su.SSL_HANDSHAKE_CODE or "wantread") then
+            return nil, "timed out", code
+        end
+        return nil, tostring(code), body
+    end
     if type(code) == "number" then
         return code >= 200 and code < 300, code, body
     end
@@ -230,20 +309,35 @@ end
 -- Probe the connection with GET /api/status. Returns (true, info_table_or_nil)
 -- or (nil, nil, error_text). The parsed JSON is optional — a device that
 -- answers with a non-JSON body still counts as reachable.
+--
+-- Tries a couple of escalating timeouts: the first attempt can race a radio
+-- that just woke from power-save (fast re-association / ARP on Kobo NICs, and
+-- modem-sleep wake-up on the ESP32 side) and misreport a reachable reader as
+-- offline. Every attempt is logged so crash.log shows the full probe trail.
+-- Callers run this under a standby hold and a Wi-Fi gate (see ensureWifi), so
+-- the probe itself does not hold them.
 function CROSSDROP:probeTarget(target)
     if not target or not target.ip or target.ip == "" then
         return nil, nil, _("WiFi IP not set (see the Connections tab)")
     end
-    local ok, code, body = self:req("GET", base_url(target) .. "/api/status", nil, nil, 3)
-    if ok then
-        local info
-        if JSON then
-            local okj, parsed = pcall(JSON.decode, body)
-            if okj and type(parsed) == "table" then
-                info = parsed
+    local attempts = { 3, 6 }
+    local code, body
+    for i, timeout in ipairs(attempts) do
+        local ok_i, code_i, body_i = self:req("GET", base_url(target) .. "/api/status", nil, nil, timeout)
+        code, body = code_i, body_i
+        logger.info("crossdrop: probe ", target.kind, " ", target.ip,
+            " attempt ", i, " (", timeout, "s) => ",
+            ok_i and "ok" or tostring(code_i or body_i or "unknown"))
+        if ok_i then
+            local info
+            if JSON then
+                local okj, parsed = pcall(JSON.decode, body_i)
+                if okj and type(parsed) == "table" then
+                    info = parsed
+                end
             end
+            return true, info
         end
-        return true, info
     end
     return nil, nil, (type(code) == "number")
         and string.format("device replied %s", tostring(code))
@@ -253,7 +347,7 @@ end
 -- Probe every configured connection with GET /api/status; return the first
 -- that answers. Sends and "Check device" use this so either connection works.
 -- Every probe result is recorded in self._probe_errors (kind -> error text or
--- nil when it answered) and logged — the no-reader message then shows WHY each
+-- nil when it answered) and logged — the no-reader message then shows WHY the
 -- connection failed (timeout, refused…), and a "freeze" during a check can be
 -- root-caused from crash.log afterwards.
 function CROSSDROP:probeReachable()
@@ -333,8 +427,10 @@ end
 -- returns only the FIRST LINE of a multi-line GET body (single-line /api/status
 -- parses, but /api/files came back as just "1"), so the folder listing reads a
 -- raw socket instead and splits headers / dechunks / decodes itself. The whole
--- read runs under socketutil's bounded timeouts (no 60s socket.http freeze).
--- Returns (true, code, body) or (nil, error_text, body_or_nil).
+-- read runs under socketutil's bounded timeouts (no 60s socket.http freeze)
+-- and under a standby hold. Returns (true, code, body) or (nil, error_text,
+-- body_or_nil). A dead radio (Wi-Fi off) is caught UP FRONT and reported
+-- instantly instead of let to burn its timeout window.
 function CROSSDROP:rawBody(target, path, timeout)
     if not socket_available() then
         return nil, "LuaSocket unavailable", nil
@@ -342,52 +438,64 @@ function CROSSDROP:rawBody(target, path, timeout)
     if not target or not target.ip or target.ip == "" then
         return nil, _("WiFi IP not set (see the Connections tab)"), nil
     end
-    local su = socketutilModule()
-    if timeout and timeout > 0 then
-        su:set_timeout(timeout, timeout)
-    else
-        su:set_timeout(su.FILE_BLOCK_TIMEOUT or 15, su.FILE_TOTAL_TIMEOUT or 60)
+    if not self:wifiUp() then
+        return nil, WIFI_OFF_MSG, nil
     end
-    local sock, herr = socket.tcp()
-    if not sock then
-        su:reset_timeout()
-        return nil, tostring(herr or "socket error"), nil
-    end
-    sock:settimeout(timeout or 10)
-    local ok, cerr = sock:connect(target.ip, tonumber(target.port) or 80)
-    if not ok then
+    local ok_w, r1, r2, r3 = self:withStandby(function()
+        local su = socketutilModule()
+        if timeout and timeout > 0 then
+            su:set_timeout(timeout, timeout)
+        else
+            su:set_timeout(su.FILE_BLOCK_TIMEOUT or 15, su.FILE_TOTAL_TIMEOUT or 60)
+        end
+        local sock, herr = socket.tcp()
+        if not sock then
+            su:reset_timeout()
+            return nil, tostring(herr or "socket error"), nil
+        end
+        sock:settimeout(timeout or 10)
+        local oks, cerr = sock:connect(target.ip, tonumber(target.port) or 80)
+        if not oks then
+            sock:close()
+            su:reset_timeout()
+            return nil, tostring(cerr or "connect error"), nil
+        end
+        sock:send("GET " .. path .. " HTTP/1.0\r\n"
+            .. "Host: " .. target.ip .. "\r\n"
+            .. "User-Agent: KOReader/crossdrop\r\n"
+            .. "Connection: close\r\n\r\n")
+        local parts, size, recv_err = {}, 0, nil
+        while true do
+            local chunk, rerr = sock:receive("*a")
+            if not chunk then
+                recv_err = rerr
+                break
+            end
+            parts[#parts + 1] = chunk
+            size = size + #chunk
+        end
         sock:close()
         su:reset_timeout()
-        return nil, tostring(cerr or "connect error"), nil
+        if size == 0 then
+            return nil, "no response body" .. (recv_err and (" (" .. tostring(recv_err) .. ")") or ""), nil
+        end
+        local raw = table.concat(parts)
+        local head_end = raw:find("\r\n\r\n", 1, true)
+        local code_s = raw:match("^HTTP/%d%.%d (%d+)")
+        local code = code_s and tonumber(code_s)
+        local body = (head_end and raw:sub(head_end + 4)) or raw
+        if not code or code < 200 or code >= 300 then
+            return nil,
+                (code and string.format("device replied %s", tostring(code)))
+                or "malformed HTTP response",
+                body
+        end
+return true, code, body
+    end)
+    if not ok_w then
+        return nil, tostring(r1 or "operation aborted"), r3
     end
-    sock:send("GET " .. path .. " HTTP/1.0\r\n"
-        .. "Host: " .. target.ip .. "\r\n"
-        .. "User-Agent: KOReader/crossdrop\r\n"
-        .. "Connection: close\r\n\r\n")
-    local parts, size = {}, 0
-    while true do
-        local chunk = sock:receive("*a")
-        if not chunk then break end
-        parts[#parts + 1] = chunk
-        size = size + #chunk
-    end
-    sock:close()
-    su:reset_timeout()
-    if size == 0 then
-        return nil, "no response body", nil
-    end
-    local raw = table.concat(parts)
-    local head_end = raw:find("\r\n\r\n", 1, true)
-    local code_s = raw:match("^HTTP/%d%.%d (%d+)")
-    local code = code_s and tonumber(code_s)
-    local body = (head_end and raw:sub(head_end + 4)) or raw
-    if not code or code < 200 or code >= 300 then
-        return nil,
-            (code and string.format("device replied %s", tostring(code)))
-            or "malformed HTTP response",
-            body
-    end
-    return true, code, body
+    return r1, r2, r3
 end
 
 -- List the folders inside a directory on the reader's card (GET /api/files;
@@ -493,30 +601,40 @@ end
 -- Delete one file or folder over WebDAV: DELETE http://<ip>:<port>/<path>.
 -- NOTE (device-verified): this reader's DELETE does NOT recurse — a
 -- non-empty folder answers 409. Returns (true, nil, code) or (nil, err, code)
--- so callers can branch on 409 and purge the folder's contents first.
+-- so callers can branch on 409 and purge the folder's contents first. Runs
+-- under a standby hold (single blocking op).
 function CROSSDROP:deleteEntry(target, path)
     if not target or not target.ip or target.ip == "" then
         return nil, _("WiFi IP not set (see the Connections tab)"), nil
     end
-    local p = tostring(path or ""):gsub("^/+", ""):gsub("/+$", "")
-    if p == "" then
-        return nil, "nothing to delete", nil
+    if not self:wifiUp() then
+        return nil, WIFI_OFF_MSG, nil
     end
-    -- Bounded timeout: rapid deletes queue against a reader that is still
-    -- finishing the previous one on slow flash — with req's default 15s/60s
-    -- socketutil timeouts each queued delete read as a frozen UI. 5s bounds
-    -- the wait; a stuck reader reports an error instead of hanging.
-    local ok, code, errbody = self:req("DELETE", base_url(target) .. encode_path("/" .. p),
-        nil, nil, 5)
-    if ok then
-        logger.info("crossdrop: deleted /", p)
-        return true, nil, code
+    local ok_w, r1, r2, r3 = self:withStandby(function()
+        local p = tostring(path or ""):gsub("^/+", ""):gsub("/+$", "")
+        if p == "" then
+            return nil, "nothing to delete", nil
+        end
+        -- Bounded timeout: rapid deletes queue against a reader that is still
+        -- finishing the previous one on slow flash — with req's default 15s/60s
+        -- socketutil timeouts each queued delete read as a frozen UI. 5s bounds
+        -- the wait; a stuck reader reports an error instead of hanging.
+        local ok, code, errbody = self:req("DELETE", base_url(target) .. encode_path("/" .. p),
+            nil, nil, 5)
+        if ok then
+            logger.info("crossdrop: deleted /", p)
+            return true, nil, code
+        end
+        local err = (type(code) == "number")
+            and string.format("device replied %s (%s)", tostring(code), tostring(errbody or ""))
+            or tostring(code or errbody or "unknown error")
+        logger.info("crossdrop: delete failed (", target.ip, "): ", err)
+        return nil, err, code
+    end)
+    if not ok_w then
+        return nil, tostring(r1 or "operation aborted"), nil
     end
-    local err = (type(code) == "number")
-        and string.format("device replied %s (%s)", tostring(code), tostring(errbody or ""))
-        or tostring(code or errbody or "unknown error")
-    logger.info("crossdrop: delete failed (", target.ip, "): ", err)
-    return nil, err, code
+    return r1, r2, r3
 end
 
 -- Make sure the destination folder exists. A nested destination (Books/x)
@@ -566,9 +684,16 @@ function CROSSDROP:isCrossPointFile(path)
 end
 
 -- The whole "nothing answered" message: the Tried list (with the probe's own
--- error) plus the concrete fixes.
+-- error) plus the concrete fixes. If the last failure was a Wi-Fi bring-up
+-- that never completed, that is said FIRST (the message is otherwise about a
+-- reachable-network miss, which is a different fault).
 function CROSSDROP:noReaderText()
-    return _("No CrossDrop reader reached.\n\nTried:\n") .. self:connectionSummary() ..
+    local note = ""
+    if self._wifi_down then
+        self._wifi_down = nil
+        note = _("Could not turn on Wi-Fi, so the reader was never on the network.\n\nEnable Wi-Fi (Menu → Wi-Fi connection) and try again.\n\n")
+    end
+    return note .. _("No CrossDrop reader reached.\n\nTried:\n") .. self:connectionSummary() ..
         _("\n\nCheck:\n\226\128\162  The reader is on and shows File Transfer\226\128\148Receive Books.\n\226\128\162  This Kindle is on the SAME Wi-Fi as the reader.\n\226\128\162  The WiFi IP matches the address the reader shows on\n    its Receive Books screen (set it on the Connections tab).")
 end
 
@@ -631,49 +756,70 @@ end
 -- The probe is a bounded blocking call on the UI thread, so paint a "Checking…"
 -- notice BEFORE blocking (the e-ink screen updates on forceRePaint) — without
 -- it an unreachable IP reads as a frozen screen for the timeout window.
+-- Gated by ensureWifi: on a KOReader-managed radio (Kobo) the link is brought
+-- up before probing, so a check can't aim at a dead interface.
 function CROSSDROP:statusDialog()
-    local checking = Notification:new{ text = _("Checking device…"), timeout = 0 }
-    UIManager:show(checking)
-    UIManager:forceRePaint()
-    local target = self:probeReachable()
-    if not target then
+    self:ensureWifi(function()
+        self:statusDialogChecked()
+    end, function()
         UIManager:show(Notification:new{
-            text = self:noReaderText(),
-            timeout = 6,
-        })
-        return
-    end
-    local ok, info = self:probeTarget(target)
-    UIManager:close(checking)
-    if not ok then
-        UIManager:show(Notification:new{
-            text = _("Could not reach the CrossDrop reader: ") .. tostring(info or "network error") ..
-                _("\n\nSame Wi-Fi? Correct IP? File Transfer open?"),
+            text = _("Could not turn on Wi-Fi. Enable it via Menu → Wi-Fi connection, then check again."),
             timeout = 5,
         })
-        return
-    end
-    local details
-    if type(info) == "table" then
-        details = string.format("%s:\nIP %s  ·  %s\nversion %s  ·  mode %s",
-            _("WiFi"),
-            tostring(info.ip or target.ip),
-            tostring(info.device or "CrossDrop reader"),
-            tostring(info.version or "?"),
-            tostring(info.mode or "?"))
-        if type(info.rssi) == "number" and info.mode == "STA" then
-            details = details .. string.format("\nWi-Fi RSSI %d dBm", info.rssi)
+    end)
+end
+
+function CROSSDROP:statusDialogChecked()
+    local ok_w, r1 = self:withStandby(function()
+        local checking = Notification:new{ text = _("Checking device…"), timeout = 0 }
+        UIManager:show(checking)
+        UIManager:forceRePaint()
+        local target = self:probeReachable()
+        if not target then
+            UIManager:close(checking)
+            UIManager:show(Notification:new{
+                text = self:noReaderText(),
+                timeout = 6,
+            })
+            return
         end
-    else
-        details = string.format("%s: %s", _("WiFi"), tostring(target.ip))
+        local ok, info = self:probeTarget(target)
+        UIManager:close(checking)
+        if not ok then
+            UIManager:show(Notification:new{
+                text = _("Could not reach the CrossDrop reader: ") .. tostring(info or "network error") ..
+                    _("\n\nSame Wi-Fi? Correct IP? File Transfer open?"),
+                timeout = 5,
+            })
+            return
+        end
+        local details
+        if type(info) == "table" then
+            details = string.format("%s:\nIP %s  ·  %s\nversion %s  ·  mode %s",
+                _("WiFi"),
+                tostring(info.ip or target.ip),
+                tostring(info.device or "CrossDrop reader"),
+                tostring(info.version or "?"),
+                tostring(info.mode or "?"))
+            if type(info.rssi) == "number" and info.mode == "STA" then
+                details = details .. string.format("\nWi-Fi RSSI %d dBm", info.rssi)
+            end
+        else
+            details = string.format("%s: %s", _("WiFi"), tostring(target.ip))
+        end
+        UIManager:show(InfoMessage:new{
+            text = _("CrossDrop device found:\n\n") .. details,
+        })
+    end)
+    if not ok_w then
+        logger.warn("crossdrop: status check aborted: ", tostring(r1 or ""))
     end
-    UIManager:show(InfoMessage:new{
-        text = _("CrossDrop device found:\n\n") .. details,
-    })
 end
 
 -- Stream a file to the target with an HTTP PUT. `on_progress(sent, total)` is
 -- called as bytes are written. Returns (true, code) or (nil, error_text).
+-- Callers run this inside a standby-held flow (sendBooksBatch/sendFileChecked);
+-- it must never be used outside one.
 function CROSSDROP:putFile(target, file_path, on_progress)
     local size = lfs.attributes(file_path, "size")
     if not size then
@@ -710,6 +856,12 @@ function CROSSDROP:putFile(target, file_path, on_progress)
             ["User-Agent"] = "KOReader/crossdrop",
         },
         read_chunk)
+    -- If the request aborted mid-stream (timeout/error) read_chunk never hit
+    -- EOF, so close the handle here to avoid leaking it.
+    if fh then
+        fh:close()
+        fh = nil
+    end
     if not ok then
         return nil, (type(result) == "number")
             and string.format("device replied %s (%s)", tostring(result), tostring(result2 or ""))
@@ -718,12 +870,122 @@ function CROSSDROP:putFile(target, file_path, on_progress)
     return true, result
 end
 
+-- Storefront-style Wi-Fi gate around a blocking network action. If the radio
+-- is already up (always true on Android/Cervantes and any platform where
+-- KOReader doesn't manage the radio), `on_ready` runs synchronously and this
+-- is a no-op — behavior is identical to the previous build for users where it
+-- already worked. If Wi-Fi is off (typically Kobo), we hand off to the
+-- NetworkMgr handshake, which respects the user's "Action when Wi-Fi is off"
+-- setting, and `on_ready` runs once the link is actually up (isConnected ⇒
+-- link + IP — no internet needed, unlike runWhenOnline).
+--
+-- NetworkMgr is free to drop the callback (declined prompt, failed connect),
+-- so the wait is bounded ourselves: after 45s (KOReader's own give-up point)
+-- `on_fail` fires instead. If no NetworkMgr exists (test harness, exotic
+-- builds) this is a synchronous no-op passing straight to `on_ready`.
+function CROSSDROP:ensureWifi(on_ready, on_fail)
+    local ok_ready = on_ready or function() end
+    local ok_finish = on_fail or function() end
+    local nm = networkManager()
+    if not nm
+        or type(nm.isWifiOn) ~= "function"
+        or type(nm.isConnected) ~= "function"
+        or (nm:isWifiOn() and nm:isConnected()) then
+        ok_ready()
+        return
+    end
+    logger.info("crossdrop: Wi-Fi is off; asking NetworkMgr to bring it up")
+    if type(nm.runWhenConnected) ~= "function" then
+        ok_finish()
+        return
+    end
+    local timer
+    local done = false
+    local function finish(succeeded)
+        if done then return end
+        done = true
+        if timer then
+            UIManager:unschedule(timer)
+            timer = nil
+        end
+        logger.info("crossdrop: Wi-Fi", succeeded and " is up, proceeding" or " did not come up in time")
+        if succeeded then ok_ready() else ok_finish() end
+    end
+    timer = UIManager:scheduleIn(45, function() finish(false) end)
+    local ok_run = pcall(nm.runWhenConnected, nm, function() finish(true) end)
+    if not ok_run then
+        finish(false)
+    end
+end
+
+-- Is the Wi-Fi radio up (reportedly)? When the module is absent we are
+-- conservative and answer "yes" — nothing is gated. Used only for cheap
+-- synchronous fail-fast guards on single-op calls; the gated entry points
+-- (connect/statusDialog/sendFile) run the full handshake instead.
+function CROSSDROP:wifiUp()
+    local nm = networkManager()
+    if not nm or type(nm.isWifiOn) ~= "function" then
+        return true
+    end
+    return nm:isWifiOn() == true
+end
+
+-- Run `fn` with UIManager:preventStandby held for the whole blocking op and
+-- ALWAYS released afterwards, even if `fn` throws. Returns fn's results
+-- (up to three) or (nil, error_text). NOTE: never nest this — inner holds are
+-- not ref-counted, an inner release would clear an outer hold early.
+function CROSSDROP:withStandby(fn)
+    local release = standbyHold()
+    local wok, r1, r2, r3 = pcall(fn)
+    release()
+    if wok then
+        return true, r1, r2, r3
+    end
+    logger.warn("crossdrop: aborted in standby-held op: ", tostring(r1 or ""))
+    return nil, tostring(r1 or "operation aborted")
+end
+
+-- Mark the last failure as a Wi-Fi bring-up miss and drive the sink's
+-- unreachable surface (Home paints its "Send failed" state from that sink).
+-- noReaderText() then starts with the Wi-Fi note instead of a network miss.
+function CROSSDROP:_wifiDownReach(sink)
+    self._wifi_down = true
+    self._reach = {}
+    for _, t in ipairs(self:configuredTargets()) do
+        self._reach[t.kind] = "down"
+    end
+    if sink and sink.onUnreachable then
+        sink:onUnreachable()
+    end
+end
+
 -- Resolve the first reachable connection through a progress sink. Sink
 -- callbacks: onConnecting() before the probe, onConnected(target), or
--- onUnreachable() when nothing answers. Probes are bounded (3s each, via
--- socketutil) and the caller paints each state on screen, so the UI never
--- closes and never looks frozen.
-function CROSSDROP:connect(sink)
+-- onUnreachable() when nothing answers. Probes are bounded (a retrying
+-- 4s/6s pair, via socketutil) and the caller paints each state on screen, so
+-- the UI never closes and never looks frozen. Gated by ensureWifi: where the
+-- radio is already up this probes synchronously; on a KOReader-managed radio
+-- (Kobo) it waits for the link first. `on_target(target)` fires once a
+-- target resolves (used by sendBooks' batch continuation).
+function CROSSDROP:connect(sink, on_target)
+    sink = sink or {}
+    local result
+    self:ensureWifi(function()
+        result = self:connectChecked(sink)
+        if result and on_target then
+            on_target(result)
+        end
+    end, function()
+        self:_wifiDownReach(sink)
+    end)
+    -- The synchronous fast path (Wi-Fi already up) resolves before this return;
+    -- an async bring-up resolves later (nil here) and drives the sink callbacks.
+    return result
+end
+
+-- The probe half of connect(), run when Wi-Fi is already known to be up.
+-- Kept separate so the gated and in-batch paths don't double-gate.
+function CROSSDROP:connectChecked(sink)
     sink = sink or {}
     if sink.onConnecting then sink:onConnecting() end
     local target = self:probeReachable()
@@ -767,36 +1029,70 @@ function CROSSDROP:sendBooks(paths, sink)
         return true
     end
 
-    local target = self:connect(sink)
-    if not target then return false end
+    -- Storefront-style gate at the batch's entry: where the radio is always up
+    -- this runs the batch synchronously (behavior identical to before); on a
+    -- KOReader-managed radio (Kobo) the whole batch waits until Wi-Fi is up, and
+    -- if that never happens the sink gets the same unreachable surface a failed
+    -- probe would. When an async bring-up happens, this returns before the batch
+    -- runs — the sink callbacks still drive the dashboard.
+    local result
+    self:ensureWifi(function()
+        result = self:sendBooksChecked(ordered, sink)
+    end, function()
+        self:_wifiDownReach(sink)
+    end)
+    -- A synchronous fast-path run (radio up / no NetworkMgr) already produced
+    -- the batch's result; an async bring-up returns `false` (callers never used
+    -- the immediate return to drive the UI).
+    return result or false
+end
 
-    local batch_start = os.clock()
+-- The batch itself (Wi-Fi known up). Standby is held across the WHOLE batch:
+-- connect probe + every MKCOL + every PUT. On KOReader-managed radios an
+-- autosuspend between blocking calls would tear the link down mid-batch.
+function CROSSDROP:sendBooksChecked(ordered, sink)
+    local release = standbyHold()
+    local ok_w, all_ok = pcall(function()
+        local target = self:connectChecked(sink)
+        if not target then
+            return false
+        end
 
-    local all_ok = true
-    for i, path in ipairs(ordered) do
-        if sink.onBeginFile then sink:onBeginFile(path, target, i, #ordered) end
-        local folder_ok, folder_err = self:ensureFolder(target)
-        if not folder_ok then
-            all_ok = false
-            if sink.onFileFailed then
-                sink:onFileFailed(path, _("could not create the destination folder: ") .. tostring(folder_err))
+        local batch_start = os.clock()
+
+        local batch_ok = true
+        for i, path in ipairs(ordered) do
+            if sink.onBeginFile then sink:onBeginFile(path, target, i, #ordered) end
+            local folder_ok, folder_err = self:ensureFolder(target)
+            if not folder_ok then
+                batch_ok = false
+                if sink.onFileFailed then
+                    sink:onFileFailed(path, _("could not create the destination folder: ") .. tostring(folder_err))
+                end
+                break
             end
-            break
+            local ok, result = self:putFile(target, path, function(sent, total)
+                if sink.onProgress then
+                    sink:onProgress(path, sent / total * 100, sent, total, os.clock() - batch_start)
+                end
+            end)
+            if not ok then
+                batch_ok = false
+                if sink.onFileFailed then
+                    sink:onFileFailed(path, tostring(result))
+                end
+                break
+            end
+            if sink.onFileSent then sink:onFileSent(path, target) end
+            logger.info("crossdrop: sent ", path, " to ", target.kind, " ", target.ip)
         end
-        local ok, result = self:putFile(target, path, function(sent, total)
-            if sink.onProgress then
-                sink:onProgress(path, sent / total * 100, sent, total, os.clock() - batch_start)
-            end
-        end)
-        if not ok then
-            all_ok = false
-            if sink.onFileFailed then
-                sink:onFileFailed(path, tostring(result))
-            end
-            break
-        end
-        if sink.onFileSent then sink:onFileSent(path, target) end
-        logger.info("crossdrop: sent ", path, " to ", target.kind, " ", target.ip)
+        return batch_ok
+    end)
+    release()
+    if not ok_w then
+        logger.warn("crossdrop: send batch aborted: ", tostring(all_ok or ""))
+        if sink.onDone then sink:onDone(false) end
+        return false
     end
     if sink.onDone then sink:onDone(all_ok) end
     return all_ok
@@ -804,51 +1100,71 @@ end
 
 -- Send an explicit book file (standalone dialog flow: probe + progress +
 -- toast). Used by sendCurrentBook and as the no-Home fallback of sendBooks.
+-- Gated by ensureWifi (Storefront-style): where the radio is always up this
+-- runs through synchronously exactly like the previous build; on Kobo it
+-- brings Wi-Fi up first so the probe below isn't aiming at a dead link.
 function CROSSDROP:sendFile(book_path)
     if not book_path or book_path == "" then return end
-
-    -- Same bounded-but-blocking probe as statusDialog: show a notice before it
-    -- so an unreachable target never reads as a frozen screen.
-    local checking = Notification:new{ text = _("Connecting to CrossDrop…"), timeout = 0 }
-    UIManager:show(checking)
-    UIManager:forceRePaint()
-    local target = self:probeReachable()
-    UIManager:close(checking)
-    if not target then
+    self:ensureWifi(function()
+        self:sendFileChecked(book_path)
+    end, function()
+        logger.warn("crossdrop: Wi-Fi could not be brought up, not sending")
         UIManager:show(InfoMessage:new{
-            text = self:noReaderText(),
+            text = _("Could not turn on Wi-Fi, so CrossDrop cannot send.\n\nEnable Wi-Fi (Menu → Wi-Fi connection) and try again."),
         })
-        return
-    end
-
-    local filename = book_path:match("([^/]+)$") or book_path
-
-    local progress = progressModule().new(filename, target)
-    local start = os.clock()
-
-    local folder_ok, folder_err = self:ensureFolder(target)
-    if not folder_ok then
-        UIManager:close(progress)
-        toastModule().show(_("Send failed: ") .. tostring(folder_err) ..
-            _("\nCheck the reader has File Transfer open on the\nsame Wi-Fi network, and that the IP is correct."), 5)
-        return
-    end
-
-    local ok, result = self:putFile(target, book_path, function(sent, total)
-        progress:update(sent / total * 100, sent, total, os.clock() - start)
     end)
-    UIManager:close(progress)
+end
 
-    if ok then
-        toastModule().show(string.format(_("File sent  %s (WiFi  %s  \226\134\146  %s)"),
-            tostring(filename),
-            tostring(target.ip),
-            tostring(target.folder or DEFAULT_FOLDER)), 3)
-        logger.info("crossdrop: sent ", book_path, " to ", target.kind, " ", target.ip)
-    else
-        toastModule().show(_("Send failed: ") .. tostring(result) ..
-            _("\nCheck the reader has File Transfer open on the\nsame Wi-Fi network, and that the IP is correct."), 5)
-        logger.warn("crossdrop: send failed (", target.ip, "): ", result)
+-- The standalone send itself (Wi-Fi known up); standby held across the probe
+-- AND the transfer so a long send survives autosuspend on Kobo.
+function CROSSDROP:sendFileChecked(book_path)
+    local ok_w, r1 = self:withStandby(function()
+        -- Same bounded-but-blocking probe as statusDialog: show a notice before it
+        -- so an unreachable target never reads as a frozen screen.
+        local checking = Notification:new{ text = _("Connecting to CrossDrop…"), timeout = 0 }
+        UIManager:show(checking)
+        UIManager:forceRePaint()
+        local target = self:probeReachable()
+        UIManager:close(checking)
+        if not target then
+            UIManager:show(InfoMessage:new{
+                text = self:noReaderText(),
+            })
+            return
+        end
+
+        local filename = book_path:match("([^/]+)$") or book_path
+
+        local progress = progressModule().new(filename, target)
+        local start = os.clock()
+
+        local folder_ok, folder_err = self:ensureFolder(target)
+        if not folder_ok then
+            UIManager:close(progress)
+            toastModule().show(_("Send failed: ") .. tostring(folder_err) ..
+                _("\nCheck the reader has File Transfer open on the\nsame Wi-Fi network, and that the IP is correct."), 5)
+            return
+        end
+
+        local ok, result = self:putFile(target, book_path, function(sent, total)
+            progress:update(sent / total * 100, sent, total, os.clock() - start)
+        end)
+        UIManager:close(progress)
+
+        if ok then
+            toastModule().show(string.format(_("File sent  %s (WiFi  %s  \226\134\146  %s)"),
+                tostring(filename),
+                tostring(target.ip),
+                tostring(target.folder or DEFAULT_FOLDER)), 3)
+            logger.info("crossdrop: sent ", book_path, " to ", target.kind, " ", target.ip)
+        else
+            toastModule().show(_("Send failed: ") .. tostring(result) ..
+                _("\nCheck the reader has File Transfer open on the\nsame Wi-Fi network, and that the IP is correct."), 5)
+            logger.warn("crossdrop: send failed (", target.ip, "): ", result)
+        end
+    end)
+    if not ok_w then
+        logger.warn("crossdrop: standalone send aborted: ", tostring(r1 or ""))
     end
 end
 

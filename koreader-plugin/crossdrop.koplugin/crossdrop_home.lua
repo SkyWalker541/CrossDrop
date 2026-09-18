@@ -358,19 +358,44 @@ function HomeDialog:targetFor(kind)
     return nil
 end
 
+-- Tap-to-check the WiFi row, gated by ensureWifi (Storefront-style). Where
+-- the radio is already up (Android, Cervantes, non-KOReader-managed) ensureWifi
+-- is a synchronous fast path and this behaves exactly like the old build; on
+-- a KOReader-managed radio (Kobo) the link is brought up BEFORE probing, so a
+-- probe can't aim at a dead interface and read a false "Offline".
 function HomeDialog:check(kind)
     local target = self:targetFor(kind)
     if not target then return end
-    -- The probe is a bounded blocking call on the UI thread (3s, see main:req);
-    -- paint a notice first so the tap never looks like a freeze.
+    self.plugin:ensureWifi(function()
+        self:probeAndShow(kind)
+    end, function()
+        self:showCheckFailure(kind, _("Wi-Fi could not be turned on"))
+    end)
+end
+
+-- The probe itself, run with standby held for the whole blocking call
+-- (UIManager:preventStandby, pcall-guarded, released afterward): on
+-- KOReader-managed radios a power-save suspend would tear the link down
+-- mid-probe and read as a false "Offline". The probe retries (3s then 6s)
+-- inside main.lua, so this tap still paints a notice first and never looks
+-- frozen if the reader answers on a late attempt.
+function HomeDialog:probeAndShow(kind)
+    local target = self:targetFor(kind)
+    if not target then return end
     local checking = Notification:new{
         text = _("Checking WiFi\226\128\166"),
         timeout = 0,
     }
     UIManager:show(checking)
     UIManager:forceRePaint()
-    local ok, info, err = self.plugin:probeTarget(target)
+    local run_ok, ok, info, err = self.plugin:withStandby(function()
+        return self.plugin:probeTarget(self:targetFor(kind))
+    end)
     UIManager:close(checking)
+    if not run_ok then
+        self:showCheckFailure(kind, tostring(ok or "probe aborted"))
+        return
+    end
     local reach = self.plugin._reach or {}
     reach[kind] = ok and "ok" or "down"
     self.plugin._reach = reach
@@ -381,11 +406,26 @@ function HomeDialog:check(kind)
             .. who .. (ver ~= "" and ("  v" .. ver) or "")
         UIManager:show(Notification:new{ text = text, timeout = 4 })
     else
-        local text = _("Could not reach WiFi: ")
-            .. tostring(err or "network error")
-        UIManager:show(Notification:new{ text = text, timeout = 5 })
+        self:showCheckFailure(kind, tostring(err or "network error"))
     end
-    -- "ui": flashless, never promoted to a flashing full (partials are).
+    self:repaintCheck()
+end
+
+-- Shared failure path: same message/popup/repaint as the old inline "down"
+-- branch, so a failed check (probe, or Wi-Fi that never came up) updates the
+-- status dot and the screen consistently.
+function HomeDialog:showCheckFailure(kind, why)
+    local text = _("Could not reach WiFi: ") .. why
+    UIManager:show(Notification:new{ text = text, timeout = 5 })
+    local reach = self.plugin._reach or {}
+    reach[kind] = "down"
+    self.plugin._reach = reach
+    self:repaintCheck()
+end
+
+-- Repaint the dashboard in place after a check: "ui" refresh — flashless,
+-- never promoted to a flashing full (partials are).
+function HomeDialog:repaintCheck()
     UIManager:setDirty(self, "ui")
     self:init()
 end
@@ -442,7 +482,8 @@ function HomeDialog:renderConnections()
             .. _("3. On that screen, the device's IP address is below the QR code.\n")
             .. _("4. Tap \"Set WiFi IP\" to enter that address.\n")
             .. _("5. Then tap the connection row above to check \226\128\148 it should read \"Reachable\" when connected.\n")
-            .. _("6. Send from the Send A File tab: pick files from the list, or send the currently open file. Pick the destination folder there too \226\128\148 it defaults to CrossDropped Files on the reader."),
+            .. _("6. Send from the Send A File tab: pick files from the list, or send the currently open file. Pick the destination folder there too \226\128\148 it defaults to CrossDropped Files on the reader.\n")
+            .. _("7. Wi-Fi routers can hand the reader a new address from time to time. If you run into any connection issue, it may be because the IP has changed \226\128\148 check it on the reader's Join Network screen and update it with \"Set WiFi IP\"."),
         face = Font:getFace("xx_smallinfofont"),
         width = self.row_w,
     })
