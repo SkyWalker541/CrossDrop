@@ -127,6 +127,12 @@ local PickerDialog = InputContainer:extend{
     page = 1,
     rows_per_page = 10,
     scan_root = nil,   -- override for tests
+    -- The whole-card duplicate scan of the reader (see scanReaderForDuplicates):
+    -- name_lower -> { {folder,name,size}, ... } for every file on the reader's
+    -- card, or nil when the reader was not reached / not configured. Filled ONCE
+    -- per dialog (it is a network walk), before the first row paints.
+    reader_index = nil,
+    reader_scan_done = nil, -- true after the one-shot scan (or skip)
 }
 
 -- EPUBs get real titles (metadata tiers); every other supported type
@@ -556,14 +562,171 @@ end
 
 -- ────────────────────── interactions ─────────────────────────────
 
+-- Filename key for the duplicate check. "Same file, re-typed": a book the
+-- user renamed on one side only — underscores/hyphens become spaces and case
+-- collapses, so "The_Name_of_the_Wind.epub" and "The Name of the Wind.EPUB"
+-- key alike. Separators are COLLAPSED, never dropped ("my.book.epub" stays
+-- distinct from "mybook.epub"), and non-ASCII letters are left untouched.
+-- This only softens HOW the name is compared — the size gate below still
+-- decides whether it IS the same bytes.
+local function sameFileKey(s)
+    s = tostring(s or ""):lower()
+    s = s:gsub("[%._%-]+", " ")
+    s = s:gsub("%s+", " ")
+    return (s:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+-- The reader-side entry in a whole-card index matching a `name`+`size`, or
+-- nil. The index is keyed by lowercase filename; a NAME hit alone is not
+-- enough (two unrelated books can share a name), so identity = same file key
+-- AND size. A size mismatch (an updated/edited copy) is NOT a duplicate — it
+-- is what the user re-sends on purpose. Same name+size in several folders
+-- still counts: it IS on the card. When the exact-name bucket misses, the key
+-- is re-applied across the whole index so a differently-typed but
+-- byte-identical file (the same book renamed on one side) still flags.
+-- Static so the quick-send guard (guardDuplicates) shares the picker's exact
+-- identity rule instead of a second copy.
+function PickerDialog.matchReaderIndex(index, name, size)
+    if not index or not name then return nil end
+    local bucket = index[name:lower()]
+    if not bucket then
+        local want = sameFileKey(name)
+        for key, b in pairs(index) do
+            if sameFileKey(key) == want then
+                bucket = b
+                break
+            end
+        end
+    end
+    if not bucket then return nil end
+    for _, entry in ipairs(bucket) do
+        if (entry.size or 0) == (size or 0) then
+            return entry
+        end
+    end
+    return nil
+end
+
+-- The reader-side entry matching a local book, or nil (see matchReaderIndex).
+function PickerDialog:readerEntryFor(book)
+    if not book then return nil end
+    return PickerDialog.matchReaderIndex(self.reader_index, book.name, book.size)
+end
+
+function PickerDialog:bookByPath(path)
+    for _, b in ipairs(self.books or {}) do
+        if b.path == path then return b end
+    end
+    return nil
+end
+
+-- The "already on the reader" prompt when a duplicate is picked. THIS is the
+-- flag the picker is for — unpickable to walk past, unlike a toast — so it is
+-- the same core ConfirmBox the send action already proves on this device
+-- (ok/cancel buttons; nothing custom, nothing that needs its own region).
+-- Tapping the row does NOT pick the book yet; only "Send anyway" picks it
+-- (re-sending a just-fixed copy is a legitimate ask), "Don't send" leaves the
+-- tick off, and the row text already says "tap to pick anyway".
+function PickerDialog:confirmDuplicatePick(book, entry, path)
+    local title = (book and (book.title or book.name)) or ""
+    local where = (entry.folder and entry.folder ~= "")
+        and ("/" .. entry.folder) or ("/")
+    where = where .. "/" .. tostring(entry.name or (book and book.name) or "")
+    local picker = self
+    local confirm
+    confirm = ConfirmBox:new{
+        text = string.format(_("%s \226\128\148 already on the reader\n(%s)\n\nSend it to the reader again?"),
+            tostring(title), where),
+        ok_text = _("Send anyway"),
+        cancel_text = _("Don't send"),
+        ok_callback = function()
+            UIManager:close(confirm)
+            picker.picked = picker.picked or {}
+            picker.picked[path] = true
+            picker:init()
+            UIManager:setDirty(picker, "ui")
+        end,
+        cancel_callback = function()
+            UIManager:close(confirm)
+        end,
+    }
+    logger.info("crossdrop: pick flagged a duplicate: ",
+        book and book.path or "?", " matches ", where)
+    UIManager:show(confirm)
+end
+
+-- The reader half of the open-hold: after the LOCAL book scan finishes, walk
+-- the reader's ENTIRE card (every folder, via plugin:listAllFiles) and keep
+-- the result on self.reader_index. The picker holds the "Scanning for
+-- files…" notice across BOTH scans, so every duplicate is known before the
+-- first row paints. When the reader is unreachable (or no WiFi IP is set)
+-- the list still opens — the check is an aid, never a gate — and a notice
+-- explains the miss when an IP WAS set (a silent "not checked" reads as a
+-- missed duplicate later).
+function PickerDialog:scanReaderForDuplicates(scanning)
+    if self.reader_scan_done then return end
+    self.reader_scan_done = true
+    local plugin = self.plugin
+    local target = plugin and plugin:resolveTarget()
+    if not target or not target.ip or target.ip == "" then
+        self.reader_index = nil
+        return
+    end
+    if scanning and scanning.setText then
+        scanning:setText(_("Scanning the reader\226\128\166"))
+        UIManager:setDirty(scanning, "ui")
+        UIManager:forceRePaint()
+    end
+    local ok, index = plugin:listAllFiles(target, function(folders)
+        -- one repaint per folder listed so the hold reads as progress, not a
+        -- freeze (the paint-before-block rule; setText is pcall-safe inside).
+        if scanning and scanning.setText then
+            scanning:setText(string.format(_("Scanning the reader\226\128\166 %d folder(s)"), folders))
+        end
+        UIManager:setDirty(scanning, "ui")
+        UIManager:forceRePaint()
+    end)
+    if not ok then
+        self.reader_index = nil
+        logger.info("crossdrop: duplicate scan skipped (reader not reached): ", tostring(index))
+        UIManager:show(Notification:new{
+            text = _("Reader unreachable \226\128\148 couldn't check for duplicates."),
+            timeout = 4,
+        })
+        return
+    end
+    self.reader_index = index
+    local files = 0
+    for _, bucket in pairs(index) do files = files + #bucket end
+    logger.info("crossdrop: duplicate scan indexed ", files, " reader file(s)")
+end
+
+-- How many local books are ALREADY on the reader card (the subtitle readout).
+function PickerDialog:onReaderCount()
+    local n = 0
+    for _, b in ipairs(self.books or {}) do
+        if self:readerEntryFor(b) then n = n + 1 end
+    end
+    return n
+end
+
 -- Toggle one book in the picked set and repaint in place. A flashless PARTIAL
 -- update: the tap only changes a tick on the row (the scanning cache on self
 -- means this never rescans), so a full-screen e-ink wipe is pure strobing.
+-- Picking a book the reader ALREADY holds never silently swallows it: the
+-- pick pauses on the confirmDuplicatePick prompt (confirm, or stay unpicked)
+-- so the duplication is impossible to walk past.
 function PickerDialog:toggle(path)
     self.picked = self.picked or {}
     if self.picked[path] then
         self.picked[path] = nil
     else
+        local book = self:bookByPath(path)
+        local entry = self:readerEntryFor(book)
+        if entry then
+            self:confirmDuplicatePick(book, entry, path)
+            return
+        end
         self.picked[path] = true
     end
     self:init()
@@ -696,11 +859,17 @@ function PickerDialog:buildContent()
     for i = lo, hi do
         local e = books[i]
         local picked = self.picked[e.path] == true
+        local on_reader = self:readerEntryFor(e) ~= nil
         local size_str = string.format("%.1f MB", (e.size or 0) / 1048576)
-        local text = e.title .. "\n" ..
-            size_str .. (picked and _("  \226\128\148 picked, tap to un-pick")
-                or _("  \226\128\148 tap to pick"))
-        table.insert(vg, self:row(text, {
+        -- The reader-state lede ("On reader ·") sits BEFORE the size: the row
+        -- text truncates from the tail, so long book names can never cut the
+        -- duplicate mark — worst case it clips the trailing "tap to pick…".
+        local meta = (on_reader and (_("On reader") .. " \194\183 ") or "")
+            .. size_str
+            .. (picked and _("  \226\128\148 picked, tap to un-pick")
+                or (on_reader and _("  \226\128\148 tap to pick anyway")
+                    or _("  \226\128\148 tap to pick")))
+        table.insert(vg, self:row(e.title .. "\n" .. meta, {
             bordersize = 0,
             background = picked and Blitbuffer.COLOR_LIGHT_GRAY or nil,
             callback = function() self:toggle(e.path) end,
@@ -760,7 +929,10 @@ function PickerDialog:init()
     -- Scan ONCE per dialog lifetime (the walk is a real directory read on
     -- slow device storage): paint a notice first so it never reads as a
     -- freeze (the dashboard's check() recipe), then cache the result —
-    -- toggles and pages re-init from the cache, never from disk.
+    -- toggles and pages re-init from the cache, never from disk. The SAME
+    -- notice is held across BOTH scans: the local walk AND the reader's
+    -- whole-card duplicate scan, so the list opens already knowing what the
+    -- reader holds.
     if not self.books then
         local scanning = Notification:new{
             text = _("Scanning for files\226\128\166"),
@@ -769,6 +941,7 @@ function PickerDialog:init()
         UIManager:show(scanning)
         UIManager:forceRePaint()
         self.books = self:scanAllBooks()
+        self:scanReaderForDuplicates(scanning)
         UIManager:close(scanning)
         logger.info("crossdrop: device scan found ", #self.books, " file(s)")
     end
@@ -793,8 +966,10 @@ function PickerDialog:init()
     local title_bar = TitleBar:new{
         width = inner_w,
         title = _("Send A File"),
-        subtitle = string.format(_("%d file(s) on this device \226\128\148 tap to pick; the top row sends"),
-            #self.books),
+        subtitle = string.format(_("%d file(s) on this device \226\128\148 tap to pick; the top row sends%s"),
+            #self.books,
+            self:onReaderCount() > 0 and string.format(_("; %d already on the reader"),
+                self:onReaderCount()) or ""),
         fullscreen = false,
         with_bottom_line = true,
         left_icon = "chevron.left",

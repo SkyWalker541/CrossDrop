@@ -519,7 +519,13 @@ function HomeDialog:renderSendIdle()
         table.insert(vg,self:row(
             string.format("\226\151\128  %s\n%s  \226\128\164  tap to send", name,
                 (size > 0 and string.format(_("%.1f MB"), size / 1048576) or "ebook")), {
-            callback = function() self:beginSendBatch({ book }) end,
+            callback = function()
+                -- one-tap send (no picker, so no whole-card index): guard the
+                -- duplicate before the stream starts
+                self.plugin:guardDuplicates({ book }, function()
+                    self:beginSendBatch({ book })
+                end)
+            end,
         }))
     end
 

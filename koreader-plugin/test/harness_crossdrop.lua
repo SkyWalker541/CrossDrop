@@ -1,6 +1,9 @@
 -- Stub harness: load crossdrop.koplugin/main.lua and exercise the pure logic
 -- (req/ensureFolder/putFile/sendCurrentBook/statusDialog + Home dashboard)
 -- against a FAKE device, including the LuaSocket string-error case that used to crash.
+-- v1.5.0: also covers the picker's whole-card reader duplicate scan
+-- (listAllFiles walk, "On reader" row marks, the Send-anyway confirm on pick,
+-- the fuzzy same-file key, and the one-tap quick-send duplicate guard).
 
 -- Resolve the plugin root relative to this harness file so it runs from any
 -- checkout (and in CI): arg[0] is "koreader-plugin/test/harness_crossdrop.lua".
@@ -387,6 +390,9 @@ local FAKE = {
     delete_urls = {},       -- every DELETE url answered (the delete tab's tree)
     delete_returns = nil,   -- optional { [url] = status } to force per-URL replies
     delete_409_once = nil,  -- optional { [url] = true }: first DELETE -> 409 (not empty), then 204
+    files_tree = nil,       -- optional { [decoded path] = JSON listing }: the whole-card
+                            -- duplicate scan serves EACH folder's listing from this map
+                            -- (path "" = card root) instead of one-shot TCP_RESP.
 }
 
 -- Real wire capture from the Xteink reader (nc at 192.168.7.45:80): it streams
@@ -474,20 +480,42 @@ local last_raw_request = "" -- the GET line the raw socket was asked to send
 local function raw_ok(payload)
     TCP_RESP = "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n" .. payload
 end
+-- Decode the ?path= argument of a raw GET request line into the plain folder
+-- name the fixture is keyed by ("CrossDropped Files" from %20); "" = card root.
+local function raw_request_path(request)
+    local p = tostring(request or ""):match("path=([^ ]*)")
+    if not p or p == "" then return "" end
+    p = p:gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end)
+    return p
+end
 -- Monotonic fake clock for putFile pacing (socket.gettime/socket.sleep). The
 -- harness advances it so the live-progress pacing is exercised deterministically.
 local fake_clock = 0.0
 local sleep_calls = 0
 stubs["socket"] = {
     tcp = function()
+        local served = false -- one HTTP response per socket connection (see below)
         return {
             settimeout = function() end,
             connect = function() if FAKE.fail then return nil, "connection refused" end return 1 end,
             send = function(_, data) last_raw_request = tostring(data or "") return 1 end,
             receive = function()
-                local r = TCP_RESP
+                if served then return nil end -- rawBody reads "*a" until nil
+                local r = TCP_RESP -- one-shot response the TEST planted (raw_ok) wins
+                if r ~= nil then
+                    TCP_RESP = nil
+                elseif FAKE.files_tree then
+                    -- Whole-card duplicate scan (1.5.0-test1): serve each
+                    -- ?path= request from the folder fixture ("" = root), so a
+                    -- single scan can walk the whole card deterministically.
+                    local p = raw_request_path(last_raw_request)
+                    if FAKE.files_tree[p] ~= nil then
+                        r = "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
+                            .. FAKE.files_tree[p]
+                    end
+                end
                 if r == nil then return nil end
-                TCP_RESP = nil
+                served = true
                 return r
             end,
             close = function() end,
@@ -640,6 +668,37 @@ check("send success shows File sent", last_notif and type(last_notif.text) == "s
 -- always-visible "Send to Xteink" action row (sendRowText → confirmAndSend),
 -- paging, and exit that always lands back on the CrossDrop dashboard.
 
+-- The whole-card reader fixture (1.5.0-test1): the picker holds its open on
+-- a full-card scan before the first row paints. Fake reader card:
+--   ""                      Books/, MyBook.epub@123, sleep/, CrossDropped Files/
+--   Books/                  Fiction/, fakebook.epub@256000, The_Name_of_the_Wind.epub@5000
+--   Books/Fiction/          dune.epub@999
+--   sleep/                  (empty)
+--   CrossDropped Files/     GUIDE.ePub@256000 (case differs!), The_Name_of_the_Wind.epub@5000
+-- so fakebook.epub (256000) and Guide.EPUB (256000) are duplicates, bold.epub
+-- is NOT (no reader twin), and The_Name_of_the_Wind.epub appears in TWO
+-- folders. Arming this also keeps every later picker open (sections 12c/14h)
+-- deterministic. raw_ok() one-shots still win (they're planted per-test).
+FAKE.files_tree = {
+    [""] = '[{"name":"Books","size":0,"isDirectory":true,"isEpub":false},'
+        .. '{"name":"MyBook.epub","size":123,"isDirectory":false,"isEpub":true},'
+        .. '{"name":"Catch-22.epub","size":777,"isDirectory":false,"isEpub":true},'
+        .. '{"name":"Caf\195\169.epub","size":999,"isDirectory":false,"isEpub":true},'
+        .. '{"name":"sleep","size":0,"isDirectory":true,"isEpub":false},'
+        .. '{"name":"CrossDropped Files","size":0,"isDirectory":true,"isEpub":false}]',
+    ["Books"] = '[{"name":"Fiction","size":0,"isDirectory":true,"isEpub":false},'
+        .. '{"name":"fakebook.epub","size":256000,"isDirectory":false,"isEpub":true},'
+        .. '{"name":"The_Name_of_the_Wind.epub","size":5000,"isDirectory":false,"isEpub":true}]',
+    ["Books/Fiction"] = '[{"name":"dune.epub","size":999,"isDirectory":false,"isEpub":true}]',
+    ["sleep"] = "[]",
+    ["CrossDropped Files"] = '[{"name":"GUIDE.ePub","size":256000,"isDirectory":false,"isEpub":true},'
+        .. '{"name":"The_Name_of_the_Wind.epub","size":5000,"isDirectory":false,"isEpub":true}]',
+}
+
+-- The fixture above must serve the whole-card scan's root read: TCP_RESP is
+-- initialized to CLEAN_FILES_JSON (the old root) and only cleared once
+-- consumed, so blank it before the open or root misses the new files.
+TCP_RESP = nil
 UIManager._shown = {}
 inst:chooseAndSend()
 local picker = UIManager._shown[#UIManager._shown]
@@ -888,6 +947,244 @@ check("search caption singularises one result",
         and cap_one:find("results", 1, true) == nil, tostring(cap_one))
 picker.query = nil
 
+-- 5d-dupes. THE WHOLE-CARD DUPLICATE SCAN (1.5.0-test1): the picker indexed
+-- every folder of the reader's card at open (before the first row painted),
+-- matched local books by filename AND size (case-insensitive), notated the
+-- duplicate rows, and pauses the pick on a Send-anyway confirm box so the
+-- duplication cannot be walked past.
+do
+
+check("whole-card scan ran at open (index built once)",
+    picker.reader_index ~= nil and picker.reader_scan_done == true,
+    type(picker.reader_index))
+check("scan indexed the card root files",
+    picker.reader_index["mybook.epub"] ~= nil
+        and picker.reader_index["mybook.epub"][1].size == 123
+        and picker.reader_index["mybook.epub"][1].folder == "",
+    picker.reader_index["mybook.epub"] and picker.reader_index["mybook.epub"][1].size or "no mybook")
+check("scan indexed a file shown in TWO folders",
+    picker.reader_index["the_name_of_the_wind.epub"] ~= nil
+        and #picker.reader_index["the_name_of_the_wind.epub"] == 2,
+    picker.reader_index["the_name_of_the_wind.epub"] and #picker.reader_index["the_name_of_the_wind.epub"] or "no bucket")
+check("scan indexed a nested folder's file with its full path",
+    picker.reader_index["dune.epub"] ~= nil
+        and picker.reader_index["dune.epub"][1].folder == "Books/Fiction"
+        and picker.reader_index["dune.epub"][1].size == 999,
+    picker.reader_index["dune.epub"] and picker.reader_index["dune.epub"][1].folder or "no dune")
+
+-- readerEntryFor: filename AND size, case-insensitive.
+check("duplicate matched by name+size (fakebook)",
+    picker:readerEntryFor({ name = "fakebook.epub", size = 256000 }) ~= nil,
+    "no match")
+check("reader match is case-insensitive (local Guide.EPUB ↔ reader GUIDE.ePub)",
+    picker:readerEntryFor({ name = "Guide.EPUB", size = 256000 }) ~= nil,
+    "no match")
+check("a name match with a DIFFERENT size is not a duplicate",
+    picker:readerEntryFor({ name = "The_Name_of_the_Wind.epub", size = 123 }) == nil)
+check("no reader twin -> no match",
+    picker:readerEntryFor({ name = "nothere.epub", size = 999 }) == nil)
+
+-- Fuzzy name (re-typed) matching: SAME BYTES via identical size, name only
+-- differing in case/separators. The size gate never loosens.
+check("a re-typed name with identical size matches (uses vs spaces)",
+    picker:readerEntryFor({ name = "The Name of the Wind.epub", size = 5000 }) ~= nil,
+    "no match")
+check("hyphens collapse to spaces (Catch-22 vs Catch 22)",
+    picker:readerEntryFor({ name = "Catch 22.epub", size = 777 }) ~= nil,
+    "no match")
+check("the fuzzy match still requires identical size",
+    picker:readerEntryFor({ name = "Catch 22.epub", size = 1 }) == nil,
+    "size-mismatch matched")
+check("separators COLLAPSE, never drop ('my.book' stays distinct from 'mybook')",
+    picker:readerEntryFor({ name = "my.book.epub", size = 123 }) == nil)
+check("an accented filename is not conflated with its unaccented twin",
+    picker:readerEntryFor({ name = "Cafe.epub", size = 999 }) == nil,
+    "Caf\195\169/epub conflated")
+check("the accented file still matches ITS OWN name (case-folded)",
+    picker:readerEntryFor({ name = "caf\195\169.EPUB", size = 999 }) ~= nil,
+    "no match")
+
+-- The real scanned books: exactly the reader twins read as On reader.
+check("exactly 2 local books count as already on the reader",
+    picker:onReaderCount() == 2, tostring(picker:onReaderCount()))
+
+-- toggle a duplicate: the pick PAUSES on the Send-anyway confirm box — the
+-- flag is impossible to walk past, unlike a toast.
+UIManager._shown = {}
+picker.picked = {}
+picker:toggle("/mnt/us/Books/fakebook.epub")
+local dup_confirm = UIManager._shown[#UIManager._shown]
+check("picking a duplicate opens the send-anyway confirm box",
+    dup_confirm ~= nil and dup_confirm.ok_text == "Send anyway"
+        and type(dup_confirm.text) == "string",
+    dup_confirm and dup_confirm.ok_text or "no confirm")
+check("the confirm names WHERE on the reader it is",
+    dup_confirm and type(dup_confirm.text) == "string"
+        and dup_confirm.text:find("already on the reader", 1, true)
+        and dup_confirm.text:find("/Books/fakebook.epub", 1, true),
+    dup_confirm and dup_confirm.text)
+check("the duplicate is NOT picked until confirmed",
+    picker.picked["/mnt/us/Books/fakebook.epub"] == nil)
+dup_confirm.ok_callback()
+check("Send-anyway picks the duplicate (re-send allowed)",
+    picker.picked["/mnt/us/Books/fakebook.epub"] == true)
+local dup_repaint = UIManager.last_dirty
+check("confirm-OK repaints flashless too (ui)",
+    dup_repaint == "ui", tostring(dup_repaint))
+picker:toggle("/mnt/us/Books/fakebook.epub") -- unpick: no prompt on un-pick
+check("unpicking a duplicate opens no prompt",
+    picker.picked["/mnt/us/Books/fakebook.epub"] == nil)
+
+-- Don't-send path: the row stays unpicked.
+UIManager._shown = {}
+picker:toggle("/mnt/us/Books/fakebook.epub")
+local dup_deny = UIManager._shown[#UIManager._shown]
+check("Don't-send shows the same confirm",
+    dup_deny ~= nil and dup_deny.cancel_text == "Don't send",
+    dup_deny and dup_deny.cancel_text or "no confirm")
+dup_deny.cancel_callback()
+check("Don't-send leaves the duplicate unpicked",
+    picker.picked["/mnt/us/Books/fakebook.epub"] == nil)
+picker.picked = {}
+
+-- toggle a fresh book: no prompt at all.
+UIManager._shown = {}
+picker.picked = {}
+picker:toggle("/mnt/us/Boldonic Books/bold.epub")
+check("picking a fresh book opens no prompt",
+    #UIManager._shown == 0, tostring(#UIManager._shown))
+check("the fresh book is picked normally",
+    picker.picked["/mnt/us/Boldonic Books/bold.epub"] == true)
+picker.picked = {}
+
+-- the rendered rows: exactly TWO carry the On reader mark; a row whose
+-- reader twin has a different size carries none.
+local content = picker:buildContent()
+local row_btns, _ = find_row_buttons(content)
+local on_reader_rows = 0
+local fakebook_row_marked, bold_row_marked = false, false
+for _, btn in ipairs(row_btns or {}) do
+    local t = tostring(btn.text or "")
+    if t:find("On reader", 1, true) then on_reader_rows = on_reader_rows + 1 end
+    if t:match("^The Real Fake Book\n") and t:find("On reader", 1, true) then fakebook_row_marked = true end
+    if t:match("^fakebook\n") and t:find("On reader", 1, true) then fakebook_row_marked = true end
+    if t:match("^bold\n") then bold_row_marked = (t:find("On reader", 1, true) == nil) end
+end
+check("exactly 2 rendered rows are marked On reader",
+    on_reader_rows == 2, tostring(on_reader_rows))
+check("the duplicate row reads 'tap to pick anyway'",
+    fakebook_row_marked, "not found")
+check("a size-mismatched row carries NO On reader mark",
+    bold_row_marked, "bold row marked")
+
+-- unreachable reader: list still opens, index nil, warn toast.
+FAKE.fail = true
+UIManager._shown = {}
+inst:chooseAndSend()
+local unreach = UIManager._shown[#UIManager._shown]
+local warn_toast = UIManager._shown[#UIManager._shown - 1]
+check("unreachable reader: picker still opens, no duplicate index",
+    unreach ~= nil and unreach.reader_scan_done == true and unreach.reader_index == nil)
+check("unreachable reader warns the miss (no silent 'not checked')",
+    warn_toast and type(warn_toast.text) == "string"
+        and warn_toast.text:find("couldn't check for duplicates", 1, true),
+    warn_toast and warn_toast.text)
+check("unreachable reader scan paints no On reader rows",
+    unreach and unreach:onReaderCount() == 0, unreach and unreach:onReaderCount())
+FAKE.fail = false
+
+-- unset IP: scan skipped silently, no warn (it isn't a miss — nothing was configured).
+G_reader_settings:saveSetting("crossdrop_wifi_ip", nil)
+UIManager._shown = {}
+inst:chooseAndSend()
+local noip = UIManager._shown[#UIManager._shown]
+local any_warn = false
+for _, w in ipairs(UIManager._shown) do
+    if type(w.text) == "string" and w.text:find("couldn't check", 1, true) then any_warn = true end
+end
+check("no IP set: scan skipped, index nil, NO warn",
+    noip ~= nil and noip.reader_scan_done == true and noip.reader_index == nil and not any_warn,
+    tostring(any_warn))
+G_reader_settings:saveSetting("crossdrop_wifi_ip", "192.168.1.50")
+
+-- restore the picked set 5b left behind (the send-action test counts on it).
+picker.picked = { ["/tmp/fakebook.epub"] = true, ["/tmp/fakebook2.epub"] = true }
+end -- do (5d-dupes)
+
+-- 5e-quicksend. THE ONE-TAP DUPLICATE GUARD (1.5.0-test1): the picker scans at
+-- open, but the "Currently open" row and sendCurrentBook bypass the picker, so
+-- guardDuplicates rescans the reader card at the point of sending and pauses
+-- on the same Send-anyway/Don't-send confirm the picker shows. A duplicate
+-- cannot be sent on ANY route out of the dashboard.
+do
+local gflag = false
+local function gok() gflag = true end
+local function gshown()
+    local s = UIManager._shown[#UIManager._shown]
+    return s
+end
+
+UIManager._shown = {}
+gflag = false
+inst:guardDuplicates({ "/mnt/us/Books/fakebook.epub" }, gok)
+local gdlg = gshown()
+check("quick-send flag rescans and catches the duplicate",
+    gdlg ~= nil and gdlg.ok_text == "Send anyway"
+        and tostring(gdlg.text):find("/Books/fakebook.epub", 1, true),
+    gdlg and (gdlg.ok_text or "") .. " / " .. tostring(gdlg.text or ""))
+check("quick-send does NOT proceed until confirmed",
+    gflag == false, tostring(gflag))
+check("quick-send confirm names the SAME identity rule (name+size)",
+    tostring(gdlg.text):find("fakebook.epub", 1, true) ~= nil
+        and tostring(gdlg.text):find("already on the reader", 1, true) ~= nil)
+gdlg.ok_callback()
+check("Send-anyway proceeds with the send",
+    gflag == true, tostring(gflag))
+
+UIManager._shown = {}
+gflag = false
+inst:guardDuplicates({ "/mnt/us/Books/fakebook.epub" }, gok)
+local gdeny = gshown()
+gdeny.cancel_callback()
+check("Don't-send aborts the quick-send (nothing proceeded)",
+    gflag == false, tostring(gflag))
+
+-- a batch containing a duplicate: ONE confirm, and ok passes the batch whole.
+UIManager._shown = {}
+gflag = false
+inst:guardDuplicates({ "/mnt/us/Boldonic Books/bold.epub", "/mnt/us/Books/fakebook.epub" }, function(batch)
+    gflag = (#batch == 2)
+end)
+local gbatch = gshown()
+gbatch.ok_callback()
+check("a duplicate anywhere in the batch pauses the whole batch",
+    gflag == true, tostring(gflag))
+
+-- no reader duplicate -> straight through, no prompt.
+UIManager._shown = {}
+gflag = false
+inst:guardDuplicates({ "/mnt/us/Boldonic Books/bold.epub" }, gok)
+local gfresh = gshown()
+check("a fresh book quick-sends with no prompt",
+    gflag == true and not (gfresh and gfresh.ok_text), gflag and "no-prompt" or "prompted")
+
+-- no IP and unreachable reader: both proceed (the send's own probe reports).
+UIManager._shown = {}
+gflag = false
+G_reader_settings:saveSetting("crossdrop_wifi_ip", nil)
+inst:guardDuplicates({ "/mnt/us/Books/fakebook.epub" }, gok)
+G_reader_settings:saveSetting("crossdrop_wifi_ip", "192.168.1.50")
+check("no IP set: quick-send proceeds without a scan",
+    gflag == true, tostring(gflag))
+UIManager._shown = {}
+gflag = false
+FAKE.fail = true
+inst:guardDuplicates({ "/mnt/us/Books/fakebook.epub" }, gok)
+FAKE.fail = false
+check("unreachable reader: quick-send proceeds (probe reports later)",
+    gflag == true, tostring(gflag))
+end -- do (5e-quicksend)
+
 -- the send action: confirm dialog whose OK button is the labeled
 -- "Send to Xteink" button, then the whole batch runs IN the dashboard
 -- (a fake Home sink records the flow; the real Home is exercised in
@@ -974,6 +1271,10 @@ FAKE.fail_put = true
 UIManager._shown = {}
 inst:sendCurrentBook()   -- must NOT raise on the string error from putFile
 local fput = UIManager._shown[#UIManager._shown]
+if fput and fput.ok_text == "Send anyway" then
+    fput.ok_callback() -- the quick-send guard confirmed the duplicate: proceed
+    fput = UIManager._shown[#UIManager._shown]
+end
 check("transfer-drop path does not crash", true)
 check("transfer-drop shows Send failed", fput and type(fput.text) == "string" and fput.text:match("Send failed"), fput and fput.text)
 FAKE.fail_put = false

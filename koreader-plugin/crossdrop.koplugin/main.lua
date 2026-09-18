@@ -30,6 +30,22 @@ can send books of any size. A waiting dialog shows while the chunks stream
 (progress bars never render on this e-ink build — the transfer drains faster
 than the panel can repaint, so a bar just sat at 0% then jumped to done).
 
+-- 1.5.0 — duplicate detection (books already on the reader):
+--   * Each Send A File open scans the reader's ENTIRE card before the first
+--     row paints and marks every already-there book ("On reader · size"),
+--     so a duplicate is visible before anything is picked. The scan reruns on
+--     every open (never cached between opens), so a book sent moments ago is
+--     flagged the moment Send More reopens the picker.
+--   * Picking a duplicate pauses on a "Send anyway / Don't send" confirm —
+--     the flag is impossible to walk past, yet re-sending a just-fixed copy
+--     stays one tap away.
+--   * "Same book" = same byte size AND a name that keys alike (case and
+--     separators collapse, so "The_Name_of_the_Wind.epub" and "The Name of
+--     the Wind.EPUB" match); an edited/updated copy (size changed) is not
+--     flagged, because that is exactly what users re-send on purpose.
+--   * The one-tap "Currently open" send guards the duplicate too — no send
+--     route out of the dashboard can silently re-upload.
+
 -- 1.4.3 (test build) — Kobo connectivity hardening, Storefront-style:
 --   * NetworkMgr:runWhenConnected() gates every send/check entry point. On
 --     devices where KOReader manages the radio (Kobo) CrossDrop now brings
@@ -89,7 +105,7 @@ local CROSSDROP = WidgetContainer:extend{
     -- Shown on the dashboard's Connections tab so the running build is
     -- always identifiable on the device (KOReader loads plugins once at
     -- startup — a replaced plugin file does nothing until restart).
-    VERSION = "1.4.3",
+    VERSION = "1.5.0",
 }
 
 local socket, http
@@ -596,6 +612,72 @@ function CROSSDROP:listEntries(target, path)
     end)
     logger.info("crossdrop: listEntries (", target.ip, ") -> ", #entries, " entries")
     return true, entries
+end
+
+-- Whole-card duplicate scan: recursively list EVERY folder on the reader's
+-- card (the delete tab's purge pattern, but listing files too) and index what
+-- is there by lowercase filename. Name alone is not enough for identity — two
+-- unrelated books can share a name — so the size is kept too; the picker
+-- treats a filename AND size match as "the same file is already on the card".
+-- The folder each file lives in is kept so a duplicate notice can say where.
+-- Bounded three ways so a pathological or dying reader can never wedge the
+-- picker's scanning hold: depth-capped, folder-capped and wall-clock-capped
+-- (a mid-scan hard failure discards the partial index — a partial answer
+-- could MISS a duplicate, which is worse than none). Returns (true, index)
+-- or (nil, err). index is name_lower -> { { folder, name, size }, ... }.
+-- `on_progress(folders)` fires after each folder listing (the picker repaints
+-- its "Scanning the reader…" notice on every one — the paint-before-block
+-- rule).
+local MAX_SCAN_DEPTH = 16
+local MAX_SCAN_FOLDERS = 256
+local MAX_SCAN_SECONDS = 90
+
+function CROSSDROP:listAllFiles(target, on_progress)
+    if not target or not target.ip or target.ip == "" then
+        return nil, _("WiFi IP not set (see the Connections tab)")
+    end
+    local start = os.clock()
+    local index = {}
+    local listed = {}
+    local pending = { { path = "", depth = 0 } }
+    local folders, names = 0, 0
+    while #pending > 0 and folders < MAX_SCAN_FOLDERS do
+        if os.clock() - start > MAX_SCAN_SECONDS then
+            logger.warn("crossdrop: whole-card scan hit the ", MAX_SCAN_SECONDS, "s budget; index is partial")
+            break
+        end
+        local dir = table.remove(pending, 1)
+        if not listed[dir.path] then
+            listed[dir.path] = true
+            local ok, entries = self:listEntries(target, dir.path)
+            if not ok then
+                logger.info("crossdrop: whole-card scan aborted at '", dir.path, "': ", tostring(entries))
+                return nil, tostring(entries)
+            end
+            local prefix = (dir.path == "" and "") or (dir.path .. "/")
+            for _, e in ipairs(entries) do
+                if e.is_dir then
+                    if dir.depth + 1 <= MAX_SCAN_DEPTH then
+                        pending[#pending + 1] = { path = prefix .. e.name, depth = dir.depth + 1 }
+                    end
+                elseif e.name ~= "" then
+                    local bucket = index[e.name:lower()]
+                    if not bucket then
+                        bucket = {}
+                        index[e.name:lower()] = bucket
+                    end
+                    bucket[#bucket + 1] = { folder = dir.path, name = e.name, size = e.size or 0 }
+                    names = names + 1
+                end
+            end
+            folders = folders + 1
+            if on_progress then
+                pcall(on_progress, folders)
+            end
+        end
+    end
+    logger.info("crossdrop: whole-card scan listed ", folders, " folder(s), ", names, " file(s)")
+    return true, index
 end
 
 -- Delete one file or folder over WebDAV: DELETE http://<ip>:<port>/<path>.
@@ -1178,7 +1260,70 @@ function CROSSDROP:sendCurrentBook()
         })
         return
     end
-    self:sendFile(book_path)
+    self:guardDuplicates({ book_path }, function()
+        self:sendFile(book_path)
+    end)
+end
+
+-- The one-tap send paths ("Currently open" row, sendCurrentBook) bypass the
+-- picker, so they never build a whole-card index. Rescan the reader here and
+-- pause on the picker's exact Send-anyway/Don't-send confirm when the book is
+-- ALREADY on the card — the duplication cannot be walked past on any route out
+-- of the dashboard. on_ok always receives the ORIGINAL batch; confirming one
+-- duplicate never drops siblings. A failed/unreachable scan just proceeds: the
+-- send's own probe reports an unreachable reader.
+function CROSSDROP:guardDuplicates(paths, on_ok)
+    local ConfirmBox = require("ui/widget/confirmbox")
+    local target = self:resolveTarget()
+    if not target or not target.ip or target.ip == "" then
+        on_ok(paths)
+        return
+    end
+    local checking = Notification:new{ text = _("Scanning the reader\226\128\166"), timeout = 0 }
+    UIManager:show(checking)
+    UIManager:forceRePaint()
+    local ok, index = self:listAllFiles(target)
+    UIManager:close(checking)
+    UIManager:forceRePaint()
+    if not ok or not index then
+        on_ok(paths)
+        return
+    end
+    local entry, path
+    for _, p in ipairs(paths or {}) do
+        local name = tostring(p):match("([^/]+)$") or tostring(p)
+        local size = lfs.attributes(p, "size") or 0
+        local e = pickerModule().matchReaderIndex(index, name, size)
+        if e then
+            entry, path = e, p
+            break
+        end
+    end
+    if not entry then
+        on_ok(paths)
+        return
+    end
+    local title = tostring(path):match("([^/]+)$") or tostring(path)
+    local where = (entry.folder and entry.folder ~= "")
+        and ("/" .. entry.folder) or ("/")
+    where = where .. "/" .. tostring(entry.name or title)
+    local confirm
+    confirm = ConfirmBox:new{
+        text = string.format(_("%s \226\128\148 already on the reader\n(%s)\n\nSend it to the reader again?"),
+            tostring(title), where),
+        ok_text = _("Send anyway"),
+        cancel_text = _("Don't send"),
+        ok_callback = function()
+            UIManager:close(confirm)
+            on_ok(paths)
+        end,
+        cancel_callback = function()
+            UIManager:close(confirm)
+        end,
+    }
+    logger.info("crossdrop: quick-send flagged a duplicate: ",
+        tostring(path), " matches ", where)
+    UIManager:show(confirm)
 end
 
 -- "Send A File": open the CrossDrop file picker (crossdrop_picker.lua) —
