@@ -31,6 +31,20 @@ Wi-Fi — no cable, no cloud.
   There's deliberately no progress bar: the transfer drains faster than
   e-ink can repaint.
 
+## Screenshots
+
+The three tabs of the dashboard:
+
+| **Connections** — set the reader's IP, check it reads Reachable | **Send A File** — pick files and the destination folder | **Delete Files** — its own screen, away from the send controls |
+|:---:|:---:|:---:|
+| <img src="screenshots/connections-tab.png" width="280" alt="The Connections tab: WiFi row, Set WiFi IP, first-run setup guide" /> | <img src="screenshots/send-a-file-tab.png" width="280" alt="The Send A File tab: Click Here To Select File(s) and the Destination folder row" /> | <img src="screenshots/delete-files-tab.png" width="280" alt="The Delete Files tab: browse the reader and pick things to delete" /> |
+
+The two browsers, one visual language:
+
+| **Send A File** — only files the reader can open, searchable and paged | **Delete Folders/Files** — the same folder tree, with a confirmation before anything dies |
+|:---:|:---:|
+| <img src="screenshots/file-picker.png" width="360" alt="The file picker: 36 files listed, Search files, Page 1 of 4 with Next page" /> | <img src="screenshots/delete-tree.png" width="360" alt="The delete tree: folders and files inline under Books, Page 1 of 2 with Next page" /> |
+
 ## Setup
 
 1. On the reader: open **File Transfer → Join Network** — it shows its IP
