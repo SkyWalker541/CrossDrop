@@ -632,7 +632,7 @@ inst:saveTarget({ ip = "192.168.1.50", port = 80 })
 UIManager._shown = {}
 inst:sendCurrentBook()
 local last_notif = UIManager._shown[#UIManager._shown]
-check("send success shows Book sent", last_notif and type(last_notif.text) == "string" and last_notif.text:match("Book sent"), last_notif and last_notif.text)
+check("send success shows File sent", last_notif and type(last_notif.text) == "string" and last_notif.text:match("File sent"), last_notif and last_notif.text)
 
 -- 5b. "Send A File" opens the CROSSDROP PICKER (crossdrop_picker.lua) — a
 -- device-wide book scan (the bookshelf.koplugin walk pattern) rendered on
@@ -690,7 +690,7 @@ check("scan never lists files the reader cannot open (azw/azw3)",
 check("picker scanned at open (files cached on the dialog)",
     picker.books ~= nil and #picker.books == 6, picker.books and #picker.books)
 
--- 5d. 1.3.18 real titles + search: rows show title-like names, not raw
+-- 5d. real titles + search: rows show title-like names, not raw
 -- filenames, and a case-insensitive keyword search filters the pageable list.
 
 -- Plain .txt joins FAKE_FS: the Xteink OPENS plain text natively, so .txt
@@ -740,37 +740,6 @@ check("sanitizeTitle collapses repeated words (series packaging)",
     picker:sanitizeTitle("Dungeon Crawler Carl - 01 Anthology Anthology")
         == "Dungeon Crawler Carl - 01 Anthology",
     tostring(picker:sanitizeTitle("Dungeon Crawler Carl - 01 Anthology Anthology")))
-
--- mobiTitle: a hand-built record 0 (PalmDB header + BOOKMOBI + full name at
--- offset 120) — the 0x54/0x58 offsets are relative to RECORD 0, not the file.
-local function be32enc(v)
-    return string.char(math.floor(v / 16777216) % 256,
-        math.floor(v / 65536) % 256, math.floor(v / 256) % 256, v % 256)
-end
-local mobi_blob =
-    string.rep(" ", 32)            -- PalmDB 32-byte name field
-    .. string.rep("\0", 44)        -- …to byte 76
-    .. "\0\1"                      -- record count = 1
-    .. be32enc(82)                 -- record 0 data offset
-    .. "BOOKMOBI"                  -- record 0: MOBI header identifier
-    .. string.rep("\0", 8)
-    .. string.rep("\0", 84 - 16)   -- to 0x54 (full name offset, rec0-relative)
-    .. be32enc(120)
-    .. be32enc(11)                 -- full name length at 0x58
-    .. string.rep("\0", 120 - 92)
-    .. "My Test Mob"               -- the full name at record-0 offset 120
-local mobi_path = "/tmp/crossdrop_test.mobi"
-local mfh = assert(io.open(mobi_path, "wb")); mfh:write(mobi_blob); mfh:close()
-check("mobiTitle parses the record-0 full name",
-    picker:mobiTitle(mobi_path) == "My Test Mob", tostring(picker:mobiTitle(mobi_path)))
-
--- fb2Title: plain-XML <book-title>, entities decoded
-local fb2_path = "/tmp/crossdrop_test.fb2"
-local ffh = assert(io.open(fb2_path, "wb"))
-ffh:write('<?xml version="1.0"?><FictionBook><description><title-info><book-title>My Test &amp; Fancy Book</book-title></title-info></description></FictionBook>')
-ffh:close()
-check("fb2Title parses book-title", picker:fb2Title(fb2_path) == "My Test & Fancy Book",
-    tostring(picker:fb2Title(fb2_path)))
 
 -- the durable titles_cache.lua format round-trips
 picker.title_cache_file = "/tmp/crossdrop_titles_cache.lua"
@@ -854,10 +823,10 @@ picker:gotoPage(2)
 check("page turns repaint flashless (ui — never promoted)",
     UIManager.last_dirty == "ui", tostring(UIManager.last_dirty))
 
--- 1.3.18 follow-up: uniform font + a framed box on EVERY row (Button no
+-- uniform font + a framed box on EVERY row (Button no
 -- longer shrinks long titles into a smaller font), and the active-filter
 -- caption spelled as "Search \"X\" — N results".
--- 1.3.31 change: BOOK rows are borderless (bare text with hairline rules
+-- file rows are borderless (bare text with hairline rules
 -- between them — the picker is a list, not a stack of boxes); only the
 -- action rows (Send, Search, pages) keep their bordered-box look. Font
 -- stays locked at 22 via avoid_text_truncation=false.
@@ -1024,7 +993,7 @@ local ipw = UIManager._shown[#UIManager._shown]
 check("editIp(wifi) opens dialog", type(ipw) == "table")
 check("editIp(wifi) dialog is modal (paints above Home)", ipw ~= nil and ipw.modal == true, ipw and ipw.modal)
 
--- 8b. destination folder is user-facing since 1.3.25: crossdrop_folder is
+-- 8b. destination folder is user-facing: crossdrop_folder is
 -- honored; nothing chosen == the CrossDropped Files default.
 G_reader_settings:saveSetting("crossdrop_folder", nil)
 check("destination defaults to CrossDropped Files",
@@ -1119,7 +1088,7 @@ for _, tab in ipairs({ "connections", "send" }) do
     end
 end
 
--- 11c. Send-tab breathing room (1.3.31): content is pushed DOWN off the tab
+-- 11c. Send-tab breathing room: content is pushed DOWN off the tab
 -- bar by a sc(20) spacer, and the Send / "Currently open" / Destination
 -- folder sections of the idle view are separated by sc(18) spacers instead
 -- of being cramped together.
@@ -1184,7 +1153,7 @@ if home then
     -- off the bottom of the panel on the device).
     local conn_flat = table.concat(flatten_texts(home.frame))
     local v_pos = conn_flat:find("CrossDrop " .. tostring(inst.VERSION or ""), 1, true)
-    local g_pos = conn_flat:find("To receive books", 1, true)
+    local g_pos = conn_flat:find("To receive files", 1, true)
     check("connections shows the version above the setup guide",
         v_pos ~= nil and g_pos ~= nil and v_pos < g_pos,
         tostring(v_pos) .. "/" .. tostring(g_pos))
@@ -1308,7 +1277,7 @@ check("in-dashboard batch sends every book", ok_batch == true)
 check("home ends in the done state", home.send_state == "done", home.send_state)
 check("state change repaints with a flushing FULL refresh (e-ink)",
     UIManager.last_dirty == "full", tostring(UIManager.last_dirty))
--- 1.3.32: fewer flashes. "Connecting…" and MID-batch file starts repaint with
+-- fewer flashes: the "Connecting…" hint and MID-batch file starts repaint with
 -- a flash-free partial (the next full transition always catches up), so only
 -- the first file start and the final done/failed boundary flash.
 UIManager.last_dirty = nil

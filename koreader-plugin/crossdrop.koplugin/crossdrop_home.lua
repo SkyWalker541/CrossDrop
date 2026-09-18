@@ -436,7 +436,7 @@ function HomeDialog:renderConnections()
     })
     table.insert(vg, VerticalSpan:new{ width = sc(6) })
     table.insert(vg, TextBoxWidget:new{
-        text = _("To receive books, set up your Xteink device like this:\n")
+        text = _("To receive files, set up your Xteink device like this:\n")
             .. _("1. Put the Xteink and this Kindle on the same Wi-Fi network.\n")
             .. _("2. With CrossPoint running on the Xteink, open File Transfer and tap \"Join WiFi Network\".\n")
             .. _("3. On that screen, the device's IP address is below the QR code.\n")
@@ -975,7 +975,7 @@ function FolderMenuDialog:onCreate()
     name_dialog = InputDialog:new{
         title = _("New subfolder"),
         input = "",
-        input_hint = string.format(_("Under /%s \226\128\148 created on the reader when a book is sent"), tostring(menu.node.path)),
+        input_hint = string.format(_("Under /%s \226\128\148 created on the reader when a file is sent"), tostring(menu.node.path)),
         type = "text",
         modal = true,
         buttons = {
@@ -1738,7 +1738,7 @@ function HomeDialog:repaintNow()
     UIManager:forceRePaint()
 end
 
--- FLASH-FREE variant (1.3.32): rebuilds and repaints in place WITHOUT the
+-- FLASH-FREE variant: rebuilds and repaints in place WITHOUT the
 -- full-refresh flash. Used where the change is almost always followed a frame
 -- later by a real full transition: the "Connecting…" hint (reachable targets
 -- reply in milliseconds) and MID-batch file starts (the screen is already

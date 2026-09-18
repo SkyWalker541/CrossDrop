@@ -65,7 +65,7 @@ local CROSSDROP = WidgetContainer:extend{
     -- Shown on the dashboard's Connections tab so the running build is
     -- always identifiable on the device (KOReader loads plugins once at
     -- startup — a replaced plugin file does nothing until restart).
-    VERSION = "1.4.0",
+    VERSION = "1.4.1",
 }
 
 local socket, http
@@ -840,7 +840,7 @@ function CROSSDROP:sendFile(book_path)
     UIManager:close(progress)
 
     if ok then
-        toastModule().show(string.format(_("Book sent  %s (WiFi  %s  \226\134\146  %s)"),
+        toastModule().show(string.format(_("File sent  %s (WiFi  %s  \226\134\146  %s)"),
             tostring(filename),
             tostring(target.ip),
             tostring(target.folder or DEFAULT_FOLDER)), 3)
@@ -865,14 +865,15 @@ function CROSSDROP:sendCurrentBook()
     self:sendFile(book_path)
 end
 
--- "Send A File": open the CrossDrop book picker (crossdrop_picker.lua) —
--- a device-wide book scan (the bookshelf.koplugin walk pattern) rendered on
--- the dashboard's proven widgets (rows of Buttons on the full-screen card,
--- the dashboard's TitleBar with its ✕). The built-in file browser is not
--- involved at all: no FileChooser, no Menu, no custom title bars — every
--- attempt to ride those (1.3.9–1.3.14) rendered blank controls on this
--- device. The picker scans once per open (cached), keeps its own picked
--- set, and its first row is the always-visible "Send to Xteink" action.
+-- "Send A File": open the CrossDrop file picker (crossdrop_picker.lua) —
+-- a device-wide scan for CrossPoint-openable files rendered on the
+-- dashboard's proven widgets (rows of Buttons on the full-screen card,
+-- the dashboard's TitleBar with its back chevron). The built-in file
+-- browser is not involved at all: no FileChooser, no Menu, no custom
+-- title bars — every attempt to ride those rendered blank controls on
+-- this device. The picker scans once per open (cached), keeps its own
+-- picked set, and its first row is the always-visible "Send to Xteink"
+-- action.
 function CROSSDROP:chooseAndSend()
     local picker = pickerModule():new{ plugin = self }
     -- "ui" refresh type, exactly like openHome(): guarantees the picker is

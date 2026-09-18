@@ -50,7 +50,8 @@ The two browsers, one visual language:
 1. On the reader: open **File Transfer → Join Network** — it shows its IP
    address.
 2. On your device, copy `crossdrop.koplugin/` into KOReader's `plugins/`
-   folder and restart KOReader.
+   folder and restart KOReader — or install straight from **Storefront**
+   (search "CrossDrop").
 3. Open **Tools → CrossDrop → Connections → Set WiFi IP…** and enter the
    reader's IP. Tap the **WiFi** row to check it reads **Reachable**.
 4. Use the **Send A File** tab to pick files and choose a destination folder.

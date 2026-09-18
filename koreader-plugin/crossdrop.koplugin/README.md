@@ -47,7 +47,8 @@ network — no cable, no cloud. It talks to the reader's built-in web server
 
 ## Install
 
-Copy this folder into KOReader's plugins directory, then restart KOReader:
+Install from **Storefront** (search "CrossDrop") — or copy this folder into
+KOReader's plugins directory and restart KOReader:
 
 ```sh
 cp -r crossdrop.koplugin /path/to/koreader/plugins/

@@ -36,18 +36,18 @@
 -- the transfer then runs inside the open dashboard
 -- (plugin:sendBooks with plugin.home as the repaint sink).
 --
--- Rows show REAL book titles, not the (often horrendous) filenames that
+-- Rows show REAL titles for EPUBs, not the (often horrendous) filenames that
 -- side-loaders produce. Titles are resolved cheapest-first:
 --   1. KOReader's own metadata cache (coverbrowser's BookInfoManager,
---      bookinfo_cache.sqlite3) — one indexed sqlite query, covers every book
---      KOReader has ever browsed/extracted, EPUB titles included.
+--      bookinfo_cache.sqlite3) — one indexed sqlite query, covers every EPUB
+--      KOReader has ever browsed/extracted.
 --   2. our durable on-disk titles_cache.lua, filled by (4) in past sessions;
---   3. cheap raw reads at scan time: the MOBI/AZW/AZW3/PRC "full name" record
---      (record 0 of the PalmDB) and the FB2 <book-title> element;
---   4. lazy per-page upgrade via DocumentRegistry for EPUBs that failed 1-3
---      (one Document open per frame, so the UI keeps breathing);
---   5. a cleaned-up filename (underscores/hyphens to spaces, side-loader junk
---      tokens like "Anna's Archive" / isbn13 / 32-hex thumbprints dropped).
+--   3. a cleaned-up filename (underscores/hyphens to spaces, side-loader junk
+--      tokens like "Anna's Archive" / isbn13 / 32-hex thumbprints dropped);
+--   4. lazy per-page upgrade via DocumentRegistry for EPUBs that failed 1-2
+--      (one Document open per frame, so the UI keeps breathing).
+-- The other supported types (XTC/XTCH/TXT/BMP) have no metadata sources on
+-- KOReader — they are named by their cleaned filename (3).
 -- The search below matches the DISPLAYED title as well as the raw filename.
 
 local Blitbuffer = require("ffi/blitbuffer")
@@ -129,11 +129,9 @@ local PickerDialog = InputContainer:extend{
     scan_root = nil,   -- override for tests
 }
 
--- Extension groups: names a book by raw reads (cheap), and EPUBs that need
--- the Document provider for a real title (done lazily, page by page).
-local MOBI_EXTS = { mobi = true, azw = true, azw3 = true, prc = true }
-local FB2_EXTS = { fb2 = true, fb3 = true }
-local EPUB_EXTS = { epub = true, epub3 = true }
+-- EPUBs get real titles (metadata tiers); every other supported type
+-- (xtc/xtch/txt/bmp) is named by its cleaned filename.
+local EPUB_EXTS = { epub = true }
 
 -- ─────────────────── pure, testable logic ──────────────────────
 
@@ -260,59 +258,6 @@ function PickerDialog:sanitizeTitle(t)
     return t
 end
 
--- First raw bytes of a file: used by the cheap binary/XML parsers below,
--- and only there (this is a couple of small reads per mobi/fb2 — nothing
--- like opening a book).
-function PickerDialog:readFirstBytes(path, n)
-    local f = io.open(path, "rb")
-    if not f then return nil end
-    local ok, data = pcall(f.read, f, n)
-    f:close()
-    if ok and data then return data end
-    return nil
-end
-
-local function be32(s, i) -- uint32, big-endian, at 1-based byte index i
-    return s:byte(i) * 16777216
-        + s:byte(i + 1) * 65536
-        + s:byte(i + 2) * 256
-        + s:byte(i + 3)
-end
-
--- Palm Database identifiers that carry the MOBI header in record 0.
-local MOBI_MAGICS = { BOOKMOBI = true, ["TEXtREAd"] = true, ["TEXtOReB"] = true, ["TEXtRTF"] = true }
-
--- The MOBI/PalmDoc "full name": record 0 of the PalmDB holds the MOBI header
--- whose 0x54/0x58 fields are the offset/length (relative to record 0, NOT
--- the file) of the clean book title. The MobileRead-verified layout:
---   76(2) record count, 78(4) record 0 data offset,
---   84(4) full name offset, 88(4) full name length.
-function PickerDialog:mobiTitle(path)
-    local data = self:readFirstBytes(path, 8192)
-    if not data or #data < 96 then return nil end
-    local rec0 = be32(data, 79)
-    if not rec0 or rec0 < 24 or rec0 + 120 > #data then return nil end
-    if not MOBI_MAGICS[data:sub(rec0 + 1, rec0 + 8)] then return nil end
-    local fn_off = be32(data, rec0 + 85)
-    local fn_len = be32(data, rec0 + 89)
-    if fn_len == 0 or fn_len > 2048 then return nil end
-    if rec0 + fn_off + fn_len > #data + 1 then return nil end
-    return self:sanitizeTitle(data:sub(rec0 + fn_off + 1, rec0 + fn_off + fn_len))
-end
-
--- FB2/FB3 are plain XML (at least as a single .fb2/.fb3 file): the title is
--- the <book-title> element. Namespace/entities handled loosely.
-function PickerDialog:fb2Title(path)
-    local data = self:readFirstBytes(path, 65536)
-    if not data then return nil end
-    local t = data:match("<book%-title[^>]*>(.-)</book%-title>")
-    if not t then return nil end
-    t = t:gsub("<[^>]+>", " ")
-    t = t:gsub("&amp;", "&"):gsub("&lt;", "<"):gsub("&gt;", ">")
-        :gsub("&quot;", '"'):gsub("&apos;", "'"):gsub("&#39;", "'")
-    return self:sanitizeTitle(t)
-end
-
 -- Tier 1: KOReader's own metadata cache. coverbrowser's BookInfoManager
 -- maintains bookinfo_cache.sqlite3 (real titles for every book KOReader has
 -- browsed/extracted — EPUB titles included). One indexed prepared query,
@@ -342,13 +287,7 @@ end
 function PickerDialog:titleFor(b)
     local ext = b.ext
     local title, real
-    if not ext then
-        -- no extension: filename is all we have
-    elseif MOBI_EXTS[ext] then
-        title, real = self:mobiTitle(b.path), true
-    elseif FB2_EXTS[ext] then
-        title, real = self:fb2Title(b.path), true
-    elseif EPUB_EXTS[ext] then
+    if ext and EPUB_EXTS[ext] then
         -- bind first since it is free and instant
         title = self.title_cache[b.path] or self:koreaderMetaTitle(b.path)
         real = title and true or nil
@@ -824,7 +763,7 @@ function PickerDialog:init()
     -- toggles and pages re-init from the cache, never from disk.
     if not self.books then
         local scanning = Notification:new{
-            text = _("Scanning for books\226\128\166"),
+            text = _("Scanning for files\226\128\166"),
             timeout = 0,
         }
         UIManager:show(scanning)
