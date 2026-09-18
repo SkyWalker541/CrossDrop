@@ -59,7 +59,7 @@ The two browsers, one visual language:
 ## Build & test
 
 ```sh
-./scripts/build-zips.sh            # → releases/CrossDrop-Plugin.zip
+./scripts/build-zip.sh             # → releases/CrossDrop-Plugin.zip
 luajit koreader-plugin/test/harness_crossdrop.lua
 ```
 

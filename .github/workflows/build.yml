@@ -21,10 +21,10 @@ jobs:
           luajit koreader-plugin/test/harness_crossdrop.lua
 
       - name: Build release zip
-        run: ./scripts/build-zips.sh
+        run: ./scripts/build-zip.sh
 
       - uses: actions/upload-artifact@v4
         with:
-          name: CrossDrop-Releases
+          name: CrossDrop-Plugin
           path: releases/*.zip
           if-no-files-found: error

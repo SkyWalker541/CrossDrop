@@ -12,7 +12,7 @@ image.
 - `koreader-plugin/test/harness_crossdrop.lua` — pure-Lua smoke test
   (harness against stubs — no device needed).
 - `screenshots/` — on-device screenshots shown in the README.
-- `scripts/build-zips.sh` — builds `releases/CrossDrop-Plugin.zip`.
+- `scripts/build-zip.sh` — builds `releases/CrossDrop-Plugin.zip`.
 - `.github/workflows/build.yml` — `luajit -bl` each Lua file, run the harness,
   build the zip on every push/PR.
 
@@ -25,7 +25,7 @@ image.
   The harness guards this.
 - **Releases are ADDITIVE** (the Storefront way): ship each version as a NEW
   GitHub release with `CrossDrop-Plugin.zip` attached (built by
-  `scripts/build-zips.sh`; the zip carries `crossdrop.koplugin/` at its root
+  `scripts/build-zip.sh`; the zip carries `crossdrop.koplugin/` at its root
   with `_meta.lua`). Never delete old releases — Storefront's Versions tab
   shows the full release history, its update tracking compares the
   installed version against the latest release, and the catalog builder
