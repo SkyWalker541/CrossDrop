@@ -30,22 +30,6 @@ can send books of any size. A waiting dialog shows while the chunks stream
 (progress bars never render on this e-ink build — the transfer drains faster
 than the panel can repaint, so a bar just sat at 0% then jumped to done).
 
--- 1.5.0 — duplicate detection (books already on the reader):
---   * Each Send A File open scans the reader's ENTIRE card before the first
---     row paints and marks every already-there book ("On reader · size"),
---     so a duplicate is visible before anything is picked. The scan reruns on
---     every open (never cached between opens), so a book sent moments ago is
---     flagged the moment Send More reopens the picker.
---   * Picking a duplicate pauses on a "Send anyway / Don't send" confirm —
---     the flag is impossible to walk past, yet re-sending a just-fixed copy
---     stays one tap away.
---   * "Same book" = same byte size AND a name that keys alike (case and
---     separators collapse, so "The_Name_of_the_Wind.epub" and "The Name of
---     the Wind.EPUB" match); an edited/updated copy (size changed) is not
---     flagged, because that is exactly what users re-send on purpose.
---   * The one-tap "Currently open" send guards the duplicate too — no send
---     route out of the dashboard can silently re-upload.
-
 -- 1.4.3 (test build) — Kobo connectivity hardening, Storefront-style:
 --   * NetworkMgr:runWhenConnected() gates every send/check entry point. On
 --     devices where KOReader manages the radio (Kobo) CrossDrop now brings
@@ -105,7 +89,7 @@ local CROSSDROP = WidgetContainer:extend{
     -- Shown on the dashboard's Connections tab so the running build is
     -- always identifiable on the device (KOReader loads plugins once at
     -- startup — a replaced plugin file does nothing until restart).
-    VERSION = "1.5.0",
+    VERSION = "1.6.0",
 }
 
 local socket, http
@@ -1327,31 +1311,30 @@ function CROSSDROP:guardDuplicates(paths, on_ok)
 end
 
 -- "Send A File": open the CrossDrop file picker (crossdrop_picker.lua) —
--- a device-wide scan for CrossPoint-openable files rendered on the
--- dashboard's proven widgets (rows of Buttons on the full-screen card,
--- the dashboard's TitleBar with its back chevron). The built-in file
--- browser is not involved at all: no FileChooser, no Menu, no custom
--- title bars — every attempt to ride those rendered blank controls on
--- this device. The picker scans once per open (cached), keeps its own
--- picked set, and its first row is the always-visible "Send to Xteink"
+-- a device-wide scan for CrossPoint-openable files rendered INSIDE the
+-- dashboard's Send tab (the brand header + tab bar stay on screen; the
+-- picker paints below them — see HomeDialog's renderFilesBrowser). The
+-- built-in file browser is not involved at all: no FileChooser, no Menu, no
+-- custom title bars — every attempt to ride those rendered blank controls on
+-- this device. The picker scans once per Home lifetime (cached), keeps its
+-- own picked set, and its first row is the always-visible "Send to Xteink"
 -- action.
 function CROSSDROP:chooseAndSend()
-    local picker = pickerModule():new{ plugin = self }
-    -- "ui" refresh type, exactly like openHome(): guarantees the picker is
-    -- enqueued for painting (a bare show() leaves the refresh to chance when
-    -- a full-screen modal is already up — which read as "opened behind").
-    UIManager:show(picker, "ui")
-    UIManager:forceRePaint()
-    -- Diagnostics: if the picker ever misbehaves on the device again,
-    -- crash.log says what was on screen (books found, modal flag, and the
-    -- picker's position in the UIManager window stack).
-    local stack = UIManager._window_stack or {}
-    local pos, total = 0, #stack
-    for i, w in ipairs(stack) do
-        if w and w.widget == picker then pos = i end
+    local home = self.home
+    if not home then
+        self:openHome()
+        home = self.home
     end
-    logger.info("crossdrop: picker shown (books=", picker.books and #picker.books or 0,
-        " modal=", tostring(picker.modal), " stackpos=", pos, "/", total, ")")
+    if home and type(home.openFilesBrowser) == "function" then
+        home:openFilesBrowser()
+    end
+    -- Diagnostics: if the picker ever misbehaves on the device again,
+    -- crash.log says what was on screen (books found and the browser's place
+    -- in the dashboard).
+    local picker = home and home.send_picker
+    logger.info("crossdrop: picker open in Send tab (books=",
+        picker and picker.books and #picker.books or 0,
+        " screen=", home and home.send_screen or "nil", ")")
 end
 
 -- Open the full-screen CrossDrop dashboard. Shown with a "ui" refresh (the

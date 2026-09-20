@@ -1,15 +1,16 @@
--- Stub harness: load crossdrop.koplugin/main.lua and exercise the pure logic
+-- Stub harness: load main.lua and exercise the pure logic
 -- (req/ensureFolder/putFile/sendCurrentBook/statusDialog + Home dashboard)
 -- against a FAKE device, including the LuaSocket string-error case that used to crash.
--- v1.5.0: also covers the picker's whole-card reader duplicate scan
--- (listAllFiles walk, "On reader" row marks, the Send-anyway confirm on pick,
--- the fuzzy same-file key, and the one-tap quick-send duplicate guard).
+-- 1.5.0-test1: also covers the picker's whole-card reader duplicate scan
+-- (listAllFiles walk, "On reader" row marks, already-on-reader toast).
 
 -- Resolve the plugin root relative to this harness file so it runs from any
--- checkout (and in CI): arg[0] is "koreader-plugin/test/harness_crossdrop.lua".
-local HARNESS_DIR = (arg and arg[0] and arg[0]:gsub("(.*/)[^/]+$", "%1")) or "koreader-plugin/test/"
+-- checkout (and in CI): arg[0] is "test/harness_crossdrop.lua"; the plugin
+-- lives in the sibling crossdrop.koplugin/ directory (first on the path so
+-- any stale flat copies at the repo root can never shadow it).
+local HARNESS_DIR = (arg and arg[0] and arg[0]:gsub("(.*/)[^/]+$", "%1")) or "test/"
 local PLUGIN_ROOT = HARNESS_DIR .. "../"
-package.path = PLUGIN_ROOT .. "/?.lua;" .. PLUGIN_ROOT .. "/crossdrop.koplugin/?.lua;" .. package.path
+package.path = PLUGIN_ROOT .. "/crossdrop.koplugin/?.lua;" .. PLUGIN_ROOT .. "/?.lua;" .. package.path
 
 local json_mod = {}
 
@@ -309,14 +310,14 @@ local stubs = {
     ["logger"] = { warn = function() end, info = function() end },
     ["gettext"] = function(s) return s end,
     ["ffi/util"] = { template = function(s) return s end },
-    ["ffi/blitbuffer"] = { COLOR_WHITE = "white", COLOR_BLACK = "black", COLOR_DARK_GRAY = "dgray", COLOR_LIGHT_GRAY = "lgray" },
+    ["ffi/blitbuffer"] = { COLOR_WHITE = "white", COLOR_BLACK = "black", COLOR_DARK_GRAY = "dgray", COLOR_LIGHT_GRAY = "lgray", Color8 = function(v) return "gray" .. tostring(v) end },
     ["ui/device"] = DeviceStub,
     ["device"] = DeviceStub,
     ["ui/font"] = FontStub,
     ["ui/geometry"] = { new = function(_, o) return o or {} end },
     ["ui/gesturerange"] = { new = function(o) return o or {} end },
     ["ui/size"] = {
-        radius = { window = scal(7) },
+        radius = { window = scal(7), button = scal(12) },
         padding = { default = scal(5), large = scal(10) },
         span = { horizontal_default = scal(10) },
         border = { window = scal(1.5), button = scal(1.5) },
@@ -352,6 +353,7 @@ UIManager = {
     -- device, and the harness must not provide one either, or Home's tab
     -- switch and check() would be tested against an API that doesn't exist).
     _shown = {},
+    _shown_log = {},          -- every show() call, even if close() later pops it
     last_dirty = nil,
     last_show_mode = nil,
     last_show_region = nil,
@@ -361,10 +363,16 @@ UIManager = {
         UIManager.last_show_mode = mode
         UIManager.last_show_region = region
         table.insert(UIManager._shown, w)
+        table.insert(UIManager._shown_log, w)
     end,
     close = function(_, w, mode, region)
         UIManager.last_close_mode = mode
         UIManager.last_close_region = region
+        for i = #UIManager._shown, 1, -1 do
+            if UIManager._shown[i] == w then
+                table.remove(UIManager._shown, i)
+            end
+        end
     end,
     setDirty = function(_, _, mode, region)
         UIManager.last_dirty = mode
@@ -699,13 +707,33 @@ FAKE.files_tree = {
 -- initialized to CLEAN_FILES_JSON (the old root) and only cleared once
 -- consumed, so blank it before the open or root misses the new files.
 TCP_RESP = nil
+-- Everything below the tabs: choosing files opens the picker INSIDE the
+-- already-open dashboard (the brand header + tab bar stay on screen; the
+-- list paints below them, see renderFilesBrowser). No full-screen dialog is
+-- stacked over the dashboard any more.
 UIManager._shown = {}
 inst:chooseAndSend()
-local picker = UIManager._shown[#UIManager._shown]
-check("chooseAndSend opens the picker", type(picker) == "table")
-check("picker is modal (paints above Home)", picker ~= nil and picker.modal == true, picker and picker.modal)
-check("picker covers the full screen (storefront browser flag)",
-    picker ~= nil and picker.covers_fullscreen == true, picker and picker.covers_fullscreen)
+local picker = inst.home and inst.home.send_picker
+check("chooseAndSend opens the file picker INSIDE the dashboard (home on-screen)",
+    type(picker) == "table" and inst.home ~= nil, picker and "picker" or "no picker")
+check("no full-screen screen is stacked (the one widget is Home)",
+    #UIManager._shown == 1 and UIManager._shown[1] == inst.home,
+    tostring(#UIManager._shown))
+-- the SAME frame carries the tabs AND the picker list: the browser paints
+-- below the never-leaving header + tab bar.
+local frame_tab_seen = false
+local function walk_frame(t)
+    if type(t) == "table" then
+        if type(t.text) == "string" and t.text:find("Delete Files", 1, true) then
+            frame_tab_seen = true
+        end
+        for i = 1, #t do walk_frame(t[i]) end
+    end
+end
+walk_frame(inst.home and inst.home.frame)
+check("the browser is the Send tab's sub-screen (tabs still on the frame)",
+    inst.home ~= nil and inst.home.send_screen == "files" and frame_tab_seen,
+    inst.home and (inst.home.send_screen or "no screen") .. " / tabs=" .. tostring(frame_tab_seen))
 check("picker starts with an empty picked set",
     picker and type(picker.picked) == "table" and next(picker.picked) == nil)
 check("picker uses a picked set (never FocusManager's selected)",
@@ -932,6 +960,14 @@ check("book rows are borderless (no box around each book)", book_borderless,
     tostring(book_rows) .. " borderless book rows")
 check("action rows keep their framed boxes (Send, Search, pages)",
     action_framed, tostring(row_btns[1] and row_btns[1].bordersize))
+local rows_radiused = #row_btns > 0
+for _, btn in ipairs(row_btns) do
+    -- -1 off Size.radius.button: core's unhighlight mistakes an exact match
+    -- for flash residue and nils it (button stays square after first tap).
+    if btn.radius ~= require("ui/size").radius.button - 1 then rows_radiused = false end
+end
+check("rows carry an explicit radius (tap highlight fills the whole box)",
+    rows_radiused, tostring(row_btns[1] and row_btns[1].radius))
 local hairline = find_widgets(content, function(w)
     return w.dimen ~= nil and w.dimen.h == require("ui/size").line.thick
 end)
@@ -1077,12 +1113,15 @@ check("the duplicate row reads 'tap to pick anyway'",
 check("a size-mismatched row carries NO On reader mark",
     bold_row_marked, "bold row marked")
 
--- unreachable reader: list still opens, index nil, warn toast.
+-- unreachable reader: list still opens, index nil, warn toast. A FRESH
+-- browser (send_picker dropped) so the reader rescan actually runs —
+-- openers reuse the parked picker and its scan cache.
 FAKE.fail = true
 UIManager._shown = {}
+inst.home.send_picker = nil
 inst:chooseAndSend()
-local unreach = UIManager._shown[#UIManager._shown]
-local warn_toast = UIManager._shown[#UIManager._shown - 1]
+local unreach = inst.home and inst.home.send_picker
+local warn_toast = UIManager._shown[#UIManager._shown]
 check("unreachable reader: picker still opens, no duplicate index",
     unreach ~= nil and unreach.reader_scan_done == true and unreach.reader_index == nil)
 check("unreachable reader warns the miss (no silent 'not checked')",
@@ -1096,8 +1135,9 @@ FAKE.fail = false
 -- unset IP: scan skipped silently, no warn (it isn't a miss — nothing was configured).
 G_reader_settings:saveSetting("crossdrop_wifi_ip", nil)
 UIManager._shown = {}
+inst.home.send_picker = nil
 inst:chooseAndSend()
-local noip = UIManager._shown[#UIManager._shown]
+local noip = inst.home and inst.home.send_picker
 local any_warn = false
 for _, w in ipairs(UIManager._shown) do
     if type(w.text) == "string" and w.text:find("couldn't check", 1, true) then any_warn = true end
@@ -1234,14 +1274,14 @@ local hint0 = UIManager._shown[#UIManager._shown]
 check("send action with no selection shows a hint",
     hint0 and type(hint0.text) == "string" and hint0.text:match("Tap files"), hint0 and hint0.text)
 
--- exiting the picker (its TitleBar ✕, the dashboard's own) ALWAYS lands back
--- on the CrossDrop dashboard: if Home is still open it is repainted; if it
--- was closed meanwhile, it is reopened
+-- exiting the picker (the dashboard's Back / the plugin's own control) NEVER
+-- leaves the CrossDrop dashboard: it returns to the Send tab's landing, with
+-- the picker's state cached on the parked browser for the next open.
 UIManager._shown = {}
-inst.home = nil
 picker:close()
-check("picker exit lands back on the CrossDrop dashboard (reopens Home if needed)",
-    inst.home ~= nil, inst.home)
+check("picker exit returns to the Send tab landing (dashboard stays open)",
+    picker._closed == true and picker.home ~= nil and picker.home.send_screen == nil,
+    tostring(picker._closed) .. "/" .. tostring(picker.home and picker.home.send_screen))
 inst.home = nil -- restore the pre-section state for the checks below
 
 -- 5c. sending with NO book open no longer crashes (the old on-device crash);
@@ -1399,7 +1439,7 @@ local h = UIManager._shown[#UIManager._shown]
 if h then
     if h.tab ~= "send" then h.tab = "send"; h:init() end
     local frame_vg = h.frame and h.frame[1]
-    local below_tab = frame_vg and frame_vg[6] and frame_vg[6].width
+    local below_tab = frame_vg and frame_vg[4] and frame_vg[4].width
     check("content sits below the tab bar (sc(20) spacer)",
         below_tab == scal(20), tostring(below_tab))
     local idle_vg = h:buildTabContent("send", h.row_w or 560)
@@ -1497,20 +1537,50 @@ check("IP save repaints the open dashboard", home.frame ~= nil and home[1] ~= ni
 check("IP save clears remembered reach (stale probe)",
     next(inst._reach or {}) == nil, inst._reach and next(inst._reach))
 
--- 12c. the picker has a visible way back: the dashboard's own TitleBar ✕
--- pattern (close_callback → PickerDialog:close) — closing the picker always
--- lands on the CrossDrop dashboard.
+-- 12c. the file browser has a visible way back — the dashboard's own Back
+-- never leaves CrossDrop: it returns to the Send tab's landing with the
+-- picker's state cached on the parked browser.
 UIManager._shown = {}
 inst:chooseAndSend()
-local picker2 = UIManager._shown[#UIManager._shown]
-local closed = false
-local save_close = UIManager.close
-UIManager.close = function(_, w) if w == picker2 then closed = true end end
-inst.home = nil
-picker2:close()
-UIManager.close = save_close
-check("picker close exits to the dashboard (Home reopened)",
-    closed and inst.home ~= nil, tostring(closed) .. " / " .. tostring(inst.home ~= nil))
+local picker2 = inst.home and inst.home.send_picker
+check("12c chooseAndSend opens the files browser inside the dashboard",
+    picker2 ~= nil and inst.home ~= nil and inst.home.send_screen == "files",
+    picker2 and inst.home.send_screen or "no browser")
+picker2.picked = { ["/tmp/fakebook.epub"] = true }
+check("back from the browser lands on the Send tab (picker state cached)",
+    inst.home:onBack() == true and inst.home.send_screen == nil and inst.home.tab == "send"
+        and picker2.picked["/tmp/fakebook.epub"] == true,
+    tostring(inst.home.send_screen))
+check("back from the landing closes the dashboard (Back at the top)",
+    inst.home:onBack() == true and inst.home:onBack() == true)
+
+-- 12d. re-tapping the ACTIVE tab backs out to that tab's landing (the same
+-- place the back chevron / hardware Back lands): browser state stays cached
+-- on the parked browser, the dashboard stays open, and a re-tap while
+-- already on a landing is a no-op.
+UIManager._shown = {}
+inst:chooseAndSend()
+local picker3 = inst.home and inst.home.send_picker
+picker3.picked = { ["/tmp/fakebook.epub"] = true }
+inst.home:showTab("send")
+check("re-tapping Send A File leaves the files browser for the Send landing",
+    inst.home.tab == "send" and inst.home.send_screen == nil
+        and picker3.picked["/tmp/fakebook.epub"] == true,
+    tostring(inst.home.send_screen))
+check("re-tapping the Send landing is a no-op (dashboard stays open)",
+    inst.home.tab == "send" and inst.home.send_screen == nil
+        and inst.home ~= nil and inst.home.frame ~= nil,
+    tostring(inst.home.send_screen))
+inst.home:showTab("delete")
+inst.home:openDeleteTree()
+check("delete tree opens on the Delete tab",
+    inst.home.tab == "delete" and inst.home.delete_screen == "tree",
+    tostring(inst.home.delete_screen))
+inst.home:showTab("delete")
+check("re-tapping Delete Files leaves the tree for the Delete landing",
+    inst.home.tab == "delete" and inst.home.delete_screen == nil
+        and inst.home ~= nil and inst.home.frame ~= nil,
+    tostring(inst.home.delete_screen))
 
 -- 13. THE FREEZE FIX: "Check device" / probes used raw socket.http, which
 -- forces its OWN 60s connect timeout regardless of any custom create() — an
@@ -1535,10 +1605,15 @@ check("every request restores the global timeout",
 -- 13b. "Check device" paints a "Checking…" notice BEFORE the blocking probe
 -- and the result after — an unreachable IP never reads as a frozen screen.
 UIManager._shown = {}
+UIManager._shown_log = {}     -- fresh log: only shows from this statusDialog()
 inst:statusDialog()
 local sd = UIManager._shown
+local checking_seen = false
+for _, w in ipairs(UIManager._shown_log) do
+    if w.text and w.text:match("Checking") then checking_seen = true end
+end
 check("statusDialog shows Checking… before the result",
-    sd[1] and sd[1].text and sd[1].text:match("Checking"), sd[1] and sd[1].text)
+    checking_seen, "not seen in log")
 check("statusDialog still reports the device",
     sd[#sd] and sd[#sd].text and sd[#sd].text:match("X4"), sd[#sd] and sd[#sd].text)
 
@@ -1557,9 +1632,9 @@ check("sibling modules eager-cached at load (home)",
 check("sibling modules eager-cached at load (picker)",
     type(package.loaded["crossdrop_picker"]) == "table")
 local saved_path = package.path
-package.path = string.gsub(package.path, PLUGIN_ROOT:gsub("%.", "%%.") .. "crossdrop%.koplugin/?.lua;", "")
+package.path = string.gsub(package.path, PLUGIN_ROOT:gsub("%.", "%%.") .. "?.lua;", "")
 check("plugin folder off package.path (PluginLoader restore simulated)",
-    not package.path:match("crossdrop%.koplugin/?.lua"), package.path)
+    not package.path:match(PLUGIN_ROOT:gsub("%.", "%%.") .. "?.lua"), package.path)
 UIManager._shown = {}
 inst:openHome()
 check("openHome resolves siblings after restore (no module-not-found crash)",
@@ -1682,6 +1757,16 @@ check("Send tab shows the destination folder row (default CrossDropped Files)",
     idle_joined:find("Destination folder", 1, true) ~= nil
         and idle_joined:find("CrossDropped Files", 1, true) ~= nil,
     idle_joined)
+-- Dashboard buttons carry the same explicit radius (tap highlight fills the
+-- whole box instead of a rounded blob that skips the corners).
+local idle_btns = find_widgets(home:buildTabContent("send", home.row_w),
+    function(w) return w.__name == "ui/widget/button" end)
+local idle_radiused = #idle_btns > 0
+for _, b in ipairs(idle_btns) do
+    if b.radius ~= require("ui/size").radius.button - 1 then idle_radiused = false end
+end
+check("dashboard buttons carry an explicit radius (full-box tap flash)",
+    idle_radiused, #idle_btns .. " buttons")
 check("Send tab carries no Check device section",
     not idle_joined:find("Check device", 1, true), idle_joined)
 check("Send tab carries no WiFi hint text",
@@ -1797,8 +1882,8 @@ raw_ok(CLEAN_FILES_JSON)
 UIManager._shown = {}
 inst:openHome()
 home = UIManager._shown[#UIManager._shown]
-home:chooseDestination()
-local dlg = UIManager._shown[#UIManager._shown]
+home:chooseDestination() -- inline: the tree paints below the tabs
+local dlg = home.dest_browser
 check("chooseDestination opens the folder tree",
     dlg ~= nil and type(dlg) == "table", dlg and tostring(dlg.__name))
 local root_names, root_list = {}, {}
@@ -1812,9 +1897,11 @@ check("folder tree lists the reader folders at the root",
     root_names["Books"] and root_names["CrossDropped Files"] and root_names["sleep"]
         and not root_names["MyBook.epub"],
     table.concat(root_list, ","))
-check("folder tree renders a full-screen card",
-    dlg and dlg.frame ~= nil and dlg.frame:getSize().w <= SCREEN_W,
-    dlg and dlg.frame and dlg.frame:getSize().w)
+check("the folder tree paints INTO the dashboard (no separate screen)",
+    type(dlg) == "table" and home.send_screen == "destination"
+        and #UIManager._shown == 1 and UIManager._shown[1] == home
+        and table.concat(flatten_texts(home.frame)):find("Folders on the reader", 1, true) ~= nil,
+    home.send_screen)
 dlg:pick("Books")
 check("picking a folder saves it",
     inst:configuredTargets()[1].folder == "/Books",
@@ -1827,10 +1914,10 @@ UIManager._shown = {}
 inst:openHome()
 home = UIManager._shown[#UIManager._shown]
 home:chooseDestination()
-dlg = UIManager._shown[#UIManager._shown]
+dlg = home.dest_browser
 check("unreachable reader opens the tree with no folders",
     dlg ~= nil and dlg.nodes == nil and dlg.list_err == true)
-local dlg_flat = table.concat(flatten_texts(dlg.frame), "\n")
+local dlg_flat = table.concat(flatten_texts(home.frame), "\n")
 check("unreachable reader shows ONLY the device-not-found message",
     dlg_flat:find("Device not found", 1, true) ~= nil
         and dlg_flat:find("check Xteink IP", 1, true) ~= nil
@@ -1900,8 +1987,8 @@ UIManager._shown = {}
 inst:openHome()
 home = UIManager._shown[#UIManager._shown]
 home:chooseDestination()
-dlg = UIManager._shown[#UIManager._shown]
-local flat_root = table.concat(flatten_texts(dlg.frame), "\n")
+dlg = home.dest_browser
+local flat_root = table.concat(flatten_texts(home.frame), "\n")
 check("root tree is boxless (no create/typed clutter)",
     flat_root:find("Folders on the reader", 1, true) ~= nil
         and flat_root:find("back to the default", 1, true) ~= nil
@@ -1914,7 +2001,7 @@ dlg:expandNode(books_node)
 check("expanding a folder fetches and lists its subfolders",
     dlg:findNode("Books/Fiction") ~= nil and dlg:findNode("Books/Non-Fiction") ~= nil,
     tostring(dlg:findNode("Books/Fiction") and dlg:findNode("Books/Fiction").path))
-local flat_open = table.concat(flatten_texts(dlg.frame), "\n")
+local flat_open = table.concat(flatten_texts(home.frame), "\n")
 check("open folder shows its subfolders with no empty note",
     flat_open:find("Fiction", 1, true) ~= nil
         and flat_open:find("No subfolders found", 1, true) == nil,
@@ -1922,7 +2009,7 @@ check("open folder shows its subfolders with no empty note",
 check("expanding repaints flashless (ui — never promoted)",
     UIManager.last_dirty == "ui", tostring(UIManager.last_dirty))
 dlg:toggleNode(books_node)
-local flat_collapsed = table.concat(flatten_texts(dlg.frame), "\n")
+local flat_collapsed = table.concat(flatten_texts(home.frame), "\n")
 check("collapsing hides the subfolders again",
     dlg:findNode("Books/Fiction") ~= nil -- structure kept, just not rendered
         and flat_collapsed:find("Fiction", 1, true) == nil,
@@ -1930,7 +2017,7 @@ check("collapsing hides the subfolders again",
 raw_ok("[]")
 local sleep_node = dlg:findNode("sleep")
 dlg:expandNode(sleep_node)
-local flat_empty = table.concat(flatten_texts(dlg.frame), "\n")
+local flat_empty = table.concat(flatten_texts(home.frame), "\n")
 check("an empty folder says only 'No subfolders found in /X'",
     dlg:findNode("sleep") ~= nil
         and dlg:findNode("sleep").children ~= nil
@@ -1957,7 +2044,7 @@ UIManager._shown = {}
 inst:openHome()
 home = UIManager._shown[#UIManager._shown]
 home:chooseDestination()
-dlg = UIManager._shown[#UIManager._shown]
+dlg = home.dest_browser
 dlg:showFolderMenu(dlg:findNode("Books"))
 menu = UIManager._shown[#UIManager._shown]
 menu:onCreate()
@@ -1979,7 +2066,7 @@ check("creating a subfolder adds it to the tree under its parent",
     created ~= nil and created.pending == true,
     created and created.path)
 dlg:expandNode(created) -- pending child: expands locally, no network call
-local flat_created = table.concat(flatten_texts(dlg.frame), "\n")
+local flat_created = table.concat(flatten_texts(home.frame), "\n")
 check("a just-created subfolder expands locally (no subfolders yet)",
     flat_created:find("No subfolders found in /Books/Sci-Fi", 1, true) ~= nil,
     flat_created)
@@ -2001,8 +2088,8 @@ UIManager._shown = {}
 inst:openHome()
 home = UIManager._shown[#UIManager._shown]
 home:chooseDestination()
-dlg = UIManager._shown[#UIManager._shown]
-local row_btns = collect_buttons(dlg.frame)
+dlg = home.dest_browser
+local row_btns = collect_buttons(home.frame)
 local books_arrow, books_name
 for _, b in ipairs(row_btns) do
     if books_arrow == nil and b.text == "\226\150\184" then books_arrow = b end -- first ▸ is Books
@@ -2017,7 +2104,7 @@ check("tapping ▸ expands the folder inline (no pick, no menu)",
     dlg:findNode("Books/Fiction") ~= nil
         and inst:configuredTargets()[1].folder ~= "/Books",
     inst:configuredTargets()[1].folder)
-local flat_after_arrow = table.concat(flatten_texts(dlg.frame), "\n")
+local flat_after_arrow = table.concat(flatten_texts(home.frame), "\n")
 check("▸ tap renders the subfolders indented under the mother folder",
     flat_after_arrow:find("Fiction", 1, true) ~= nil
         and flat_after_arrow:find("CrossDropped Files", 1, true) ~= nil,
@@ -2053,7 +2140,7 @@ check("popup Cancel leaves the destination alone",
     inst:configuredTargets()[1].folder ~= "/Books",
     inst:configuredTargets()[1].folder)
 books_arrow.callback() -- now ▾: collapses the tree back
-local flat_recollapsed = table.concat(flatten_texts(dlg.frame), "\n")
+local flat_recollapsed = table.concat(flatten_texts(home.frame), "\n")
 check("tapping ▾ collapses the tree back (root folders stay visible)",
     flat_recollapsed:find("Fiction", 1, true) == nil
         and flat_recollapsed:find("Books", 1, true) ~= nil
@@ -2061,11 +2148,12 @@ check("tapping ▾ collapses the tree back (root folders stay visible)",
     flat_recollapsed)
 dlg:pick("CrossDropped Files")
 
--- 14h. BACK CHEVRON + LIVE DASHBOARD + TAP TARGET: both pages carry a back
--- chevron top-left (dashboard-return, no "closing the app" reading); leaving
--- the tree refreshes the dashboard's destination row; a subfolder created
--- in the tree (pending, not yet on the reader) already shows on that row;
--- the ▸ control is a real tap target, not a hairline glyph.
+-- 14h. NO SUB-SCREEN CHROME + LIVE DASHBOARD + TAP TARGET: the browsers
+-- render INSIDE the dashboard, so they carry no chrome of their own — the
+-- dashboard header (logo + ✕) and the hardware Back are the only ways out,
+-- and leaving a browser refreshes the dashboard's destination row. A
+-- subfolder created in the tree (pending, not yet on the reader) already
+-- shows there, and the ▸ control is a real tap target, not a hairline glyph.
 -- (collect_named lives at file scope.)
 inst:setFolder("CrossDropped Files")
 raw_ok(CLEAN_FILES_JSON)
@@ -2075,19 +2163,23 @@ home = UIManager._shown[#UIManager._shown]
 home.tab = "send" -- the destination row lives on the Send tab
 home:init()
 home:chooseDestination()
-dlg = UIManager._shown[#UIManager._shown]
-local tree_tbars = collect_named(dlg.frame, "ui/widget/titlebar")
-check("the tree carries a back chevron and NO ✕ (home is behind it)",
-    #tree_tbars > 0 and tree_tbars[1].left_icon == "chevron.left"
-        and type(tree_tbars[1].left_icon_tap_callback) == "function"
-        and tree_tbars[1].close_callback == nil,
-    tree_tbars[1] and tostring(tree_tbars[1].left_icon))
-local home_tbars = collect_named(home.frame, "ui/widget/titlebar")
-check("the home dashboard keeps the ✕ (it alone leaves the plugin)",
-    #home_tbars > 0 and home_tbars[1].close_callback ~= nil
-        and home_tbars[1].left_icon == nil,
-    tostring(#home_tbars))
-row_btns = collect_buttons(dlg.frame)
+dlg = home.dest_browser
+check("the tree wears no chrome of its own (header + Back are the only exit)",
+    dlg ~= nil and dlg.home == home
+        and #collect_named(home.frame, "ui/widget/titlebar") == 0,
+    tostring(dlg ~= nil) .. "/" .. tostring(#collect_named(home.frame, "ui/widget/titlebar")))
+-- The dashboard header keeps its ✕ — the one control that leaves the plugin.
+local close_found = false
+local function find_close_icon(t)
+    if type(t) == "table" then
+        if t.icon == "close" then close_found = true end
+        for i = 1, #t do find_close_icon(t[i]) end
+    end
+end
+find_close_icon(home.frame)
+check("the dashboard header keeps the ✕ (it alone leaves the plugin)",
+    close_found, tostring(close_found))
+row_btns = collect_buttons(home.frame)
 local arrow_btn
 for _, b in ipairs(row_btns) do
     if arrow_btn == nil and b.text == "\226\150\184" then arrow_btn = b end
@@ -2120,20 +2212,20 @@ check("the back chevron leaves the tree and refreshes the dashboard",
         and table.concat(flatten_texts(home.frame)):find("Books/Sci-Fi", 1, true) ~= nil,
     inst:configuredTargets()[1].folder)
 
--- The picker carries the same back chevron, wired to its dashboard-return.
+-- The file browser is inline too: no chrome of its own, and the hardware
+-- Back returns to the Send tab landing.
 UIManager._shown = {}
-inst:chooseAndSend()
-local picker_dlg = UIManager._shown[#UIManager._shown]
+inst:chooseAndSend() -- home is still open: the parked dashboard is reused
+local picker_dlg = inst.home and inst.home.send_picker
 check("chooseAndSend opens the picker", type(picker_dlg) == "table" and picker_dlg.books ~= nil)
-local picker_tbars = collect_named(picker_dlg.frame, "ui/widget/titlebar")
-check("the picker carries the back chevron and NO ✕ (home is behind it)",
-    #picker_tbars > 0 and picker_tbars[1].left_icon == "chevron.left"
-        and type(picker_tbars[1].left_icon_tap_callback) == "function"
-        and picker_tbars[1].close_callback == nil,
-    picker_tbars[1] and tostring(picker_tbars[1].left_icon))
-picker_tbars[1].left_icon_tap_callback()
-check("tapping the picker's back chevron returns to the dashboard",
-    picker_dlg._closed == true, tostring(picker_dlg._closed))
+check("the picker adds no chrome of its own (the dashboard header is the back)",
+    picker_dlg ~= nil and picker_dlg.home == inst.home
+        and #collect_named(inst.home.frame, "ui/widget/titlebar") == 0,
+    tostring(#collect_named(inst.home.frame, "ui/widget/titlebar")))
+inst.home:onBack()
+check("back from the file browser returns to the Send tab landing",
+    picker_dlg._closed == true and inst.home.send_screen == nil,
+    tostring(picker_dlg._closed) .. "/" .. tostring(inst.home.send_screen))
 dlg:pick("CrossDropped Files")
 end -- do (14d-14h block)
 
@@ -2193,44 +2285,39 @@ check("Delete Folders/Files is its own tab with its own screen",
         and del_tab_flat:find("Browse the reader and pick things to delete", 1, true) ~= nil
         and del_tab_flat:find("Nothing is deleted until you confirm", 1, true) ~= nil,
     del_tab_flat)
-local tab_btns = {}
-for _, b in ipairs(collect_buttons(home.frame)) do
-    if b.text == "Connections" or b.text == "Send A File" or b.text == "Delete Files" then
-        tab_btns[#tab_btns + 1] = b
-    end
-end
+local tab_labels = find_widgets(home.frame, function(w)
+    return w.__name == "ui/widget/textwidget"
+        and (w.text == "Connections" or w.text == "Send A File" or w.text == "Delete Files")
+end)
 check("tab labels are centered (menu_style's forced left is bypassed)",
-    #tab_btns == 3 and tab_btns[1].align == "center"
-        and tab_btns[2].align == "center" and tab_btns[3].align == "center",
-    #tab_btns)
+    #tab_labels == 3, #tab_labels)
 check("the active tab is the bold one",
     home.tab == "delete"
-        and tab_btns[3].text_font_bold == true
-        and tab_btns[1].text_font_bold == false,
-    tostring(tab_btns[3] and tab_btns[3].text_font_bold))
+        and tab_labels[3] ~= nil and tab_labels[3].bold == true
+        and tab_labels[1] ~= nil and tab_labels[1].bold == false,
+    tostring(tab_labels[3] and tab_labels[3].bold))
 UIManager._shown = {}
-home:openDeleteTree()
-local dtree = UIManager._shown[#UIManager._shown]
+home:openDeleteTree() -- inline: paints below the Delete tab's tabs
+local dtree = home.delete_browser
 check("openDeleteTree opens the delete tree (folders AND files at the root)",
-    type(dtree) == "table" and dtree.modal == true and dtree.nodes ~= nil
+    type(dtree) == "table" and home.delete_screen == "tree" and home.tab == "delete"
+        and dtree.nodes ~= nil
         and dtree:findNode("Books") ~= nil and dtree:findNode("MyBook.epub") ~= nil,
     tostring(dtree and dtree.nodes and #dtree.nodes))
-local dtree_flat = table.concat(flatten_texts(dtree.frame))
+local dtree_flat = table.concat(flatten_texts(home.frame))
 check("the delete tree renders folder and file rows",
     dtree_flat:find("Books", 1, true) ~= nil
         and dtree_flat:find("MyBook.epub", 1, true) ~= nil,
     dtree_flat)
-local del_tbars = collect_named(dtree.frame, "ui/widget/titlebar")
-check("the delete browser wears the picker's look (title + subtitle)",
-    #del_tbars > 0 and type(del_tbars[1].subtitle) == "string"
-        and del_tbars[1].subtitle:find("tap a name to delete", 1, true) ~= nil,
-    del_tbars[1] and tostring(del_tbars[1].subtitle))
-local del_hairlines = find_widgets(dtree.frame, function(w)
+check("the delete browser leads with 'N item(s) at the root — tap a name to delete'",
+    table.concat(flatten_texts(home.frame)):find("tap a name to delete", 1, true) ~= nil,
+    "caption")
+local del_hairlines = find_widgets(home.frame, function(w)
     return w.dimen ~= nil and w.dimen.h == require("ui/size").line.thick
 end)
 check("delete rows are separated by hairlines like the picker's",
     #del_hairlines >= 2, #del_hairlines)
-local del_btns = collect_buttons(dtree.frame)
+local del_btns = collect_buttons(home.frame)
 local del_arrow_count = 0
 for _, b in ipairs(del_btns) do
     if b.text == "\226\150\184" then del_arrow_count = del_arrow_count + 1 end
@@ -2239,7 +2326,7 @@ check("only folders carry the ▸ control — files have none",
     del_arrow_count == 2, tostring(del_arrow_count))
 raw_ok(SUBDIR_ENTRIES_JSON)
 dtree:expandNode(dtree:findNode("Books"))
-local dopen_flat = table.concat(flatten_texts(dtree.frame))
+local dopen_flat = table.concat(flatten_texts(home.frame))
 check("expanding shows the subfolder's files and folders inline",
     dopen_flat:find("Fiction", 1, true) ~= nil
         and dopen_flat:find("Artemis Fowl.epub", 1, true) ~= nil
@@ -2286,7 +2373,7 @@ check("confirm sends the DELETE and the node leaves the tree",
         and FAKE.delete_urls[1]:find("Books/Fiction", 1, true) ~= nil
         and dtree:findNode("Books/Fiction") == nil,
     table.concat(FAKE.delete_urls, " | "))
-local del_after_flat = table.concat(flatten_texts(dtree.frame))
+local del_after_flat = table.concat(flatten_texts(home.frame))
 check("the tree repaints without the deleted folder (live refresh)",
     del_after_flat:find("Fiction", 1, true) == nil
         and del_after_flat:find("Books", 1, true) ~= nil,
@@ -2301,7 +2388,7 @@ inst:setFolder("Books/Fiction")
 raw_ok(ENTRIES_JSON)
 UIManager._shown = {}
 home:openDeleteTree()
-dtree = UIManager._shown[#UIManager._shown]
+dtree = home.delete_browser
 UIManager._shown = {}
 FAKE.delete_urls = {}
 dtree:showDeletePopup(dtree:findNode("Books"))
@@ -2315,8 +2402,8 @@ check("deleting the destination's parent resets it to the default",
 FAKE.fail = true
 UIManager._shown = {}
 home:openDeleteTree()
-local derr_dlg = UIManager._shown[#UIManager._shown]
-local derr_flat = table.concat(flatten_texts(derr_dlg.frame))
+local derr_dlg = home.delete_browser
+local derr_flat = table.concat(flatten_texts(home.frame))
 check("unreachable reader: the delete tree shows only the device message",
     derr_dlg.list_err == true
         and derr_flat:find("Device not found", 1, true) ~= nil
@@ -2335,7 +2422,7 @@ inst:setFolder("CrossDropped Files")
 raw_ok(ENTRIES_JSON)
 UIManager._shown = {}
 home:openDeleteTree()
-dtree = UIManager._shown[#UIManager._shown]
+dtree = home.delete_browser
 raw_ok(PURGE_FILES_JSON) -- consumed by the purge's own fresh listing
 FAKE.delete_409_once = { ["http://10.1.2.3:80/Books"] = true }
 UIManager._shown = {}
@@ -2369,10 +2456,10 @@ end
 raw_ok(many_folders_json(21))
 UIManager._shown = {}
 home:openDeleteTree()
-local ptree = UIManager._shown[#UIManager._shown]
+local ptree = home.delete_browser
 ptree.rows_per_page = 10
-ptree:init()
-local pflat = table.concat(flatten_texts(ptree.frame))
+home:refresh() -- re-render the parked browser at the pinned page size
+local pflat = table.concat(flatten_texts(home.frame))
 check("long lists page: page 1 slices the rows and offers Next",
     pflat:find("Page 1 of 3", 1, true) ~= nil
         and pflat:find("Next page", 1, true) ~= nil
@@ -2380,7 +2467,7 @@ check("long lists page: page 1 slices the rows and offers Next",
         and pflat:find("Folder11", 1, true) == nil,
     pflat)
 ptree:gotoPage(3)
-local pflat2 = table.concat(flatten_texts(ptree.frame))
+local pflat2 = table.concat(flatten_texts(home.frame))
 check("the last page shows the tail with Previous and no Next",
     pflat2:find("Page 3 of 3", 1, true) ~= nil
         and pflat2:find("Previous page", 1, true) ~= nil
@@ -2392,7 +2479,7 @@ FAKE.delete_urls = {}
 ptree:showDeletePopup(ptree:findNode("Folder21"))
 dpop = UIManager._shown[#UIManager._shown]
 dpop:onConfirm()
-local pflat3 = table.concat(flatten_texts(ptree.frame))
+local pflat3 = table.concat(flatten_texts(home.frame))
 check("a deletion that shortens the list clamps the page and repaints it",
     ptree:findNode("Folder21") == nil
         and ptree.page == 2
@@ -2406,10 +2493,10 @@ inst:setFolder("CrossDropped Files")
 raw_ok(many_folders_json(21))
 UIManager._shown = {}
 home:chooseDestination()
-local dtree2 = UIManager._shown[#UIManager._shown]
+local dtree2 = home.dest_browser
 dtree2.rows_per_page = 10
-dtree2:init()
-local dflat2 = table.concat(flatten_texts(dtree2.frame))
+home:refresh()
+local dflat2 = table.concat(flatten_texts(home.frame))
 check("the destination tree pages too (Default stays visible)",
     dflat2:find("Page 1 of 3", 1, true) ~= nil
         and dflat2:find("Next page", 1, true) ~= nil

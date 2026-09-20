@@ -26,8 +26,7 @@
 --   book title                          (no box — hairlines only)
 --   ───────────── book title ───────────── …
 --   ─────────────
---   Page X of Y                       (caption, not a control)
---   [Previous page] [Next page]        (only the ones that apply)
+--   ⟨Page X of Y⟩              (Storefront footer pager: chevrons + jump)
 --
 -- Picked books get a light-gray row background plus a "picked" hint line
 -- (no reliance on icon glyphs, which never rendered here). The picked set
@@ -52,11 +51,14 @@
 
 local Blitbuffer = require("ffi/blitbuffer")
 local Button = require("ui/widget/button")
+local CenterContainer = require("ui/widget/container/centercontainer")
 local ConfirmBox = require("ui/widget/confirmbox")
 local Device = require("device")
 local Font = require("ui/font")
 local FrameContainer = require("ui/widget/container/framecontainer")
 local Geom = require("ui/geometry")
+local HorizontalGroup = require("ui/widget/horizontalgroup")
+local HorizontalSpan = require("ui/widget/horizontalspan")
 local InputContainer = require("ui/widget/container/inputcontainer")
 local LineWidget = require("ui/widget/linewidget")
 local Notification = require("ui/widget/notification")
@@ -107,6 +109,17 @@ local EXCLUDED_DIRS = {
     proc = true, sys = true, dev = true, run = true, tmp = true,
     ["lost+found"] = true,
 }
+
+-- Grey out (or restore) a pager chevron via Button:enableDisable — guarded
+-- so the harness stub (which has no enableDisable) keeps a plain disabled
+-- flag and never crashes a page build.
+local function setButtonEnabled(btn, enabled)
+    if btn and btn.enableDisable then
+        btn:enableDisable(enabled)
+    elseif btn then
+        btn.disabled = not enabled
+    end
+end
 
 local PickerDialog = InputContainer:extend{
     modal = true,
@@ -467,8 +480,7 @@ function PickerDialog:showSearchDialog()
                         picker.query = (q == "") and nil or q
                         picker.page = 1
                         UIManager:close(search_dialog)
-                        picker:init()
-                        UIManager:setDirty(picker, "ui")
+                        picker:repaint()
                     end,
                 },
             },
@@ -488,8 +500,7 @@ end
 function PickerDialog:clearSearch()
     self.query = nil
     self.page = 1
-    self:init()
-    UIManager:setDirty(self, "ui")
+    self:repaint()
 end
 
 -- The action row text: the send button the user asked for, always visible,
@@ -537,7 +548,12 @@ function PickerDialog:confirmAndSend()
         ok_text = _("Send to Xteink"),
         ok_callback = function()
             UIManager:close(confirm)
-            UIManager:close(picker, "ui")
+            -- Inline: the picker lives INSIDE the dashboard's Send tab, so the
+            -- transfer takes over the same region — the send-state machine
+            -- (connecting/sending/done/failed) renders in place from here on,
+            -- with the brand header and tabs still on screen.
+            local home = plugin and plugin.home
+            if home then home.send_screen = nil end
             local paths_now = {}
             for _, p in ipairs(paths) do paths_now[#paths_now + 1] = p end
             UIManager:nextTick(function()
@@ -546,9 +562,9 @@ function PickerDialog:confirmAndSend()
                 -- the dashboard ends in (done/failed) must be truly ON the screen.
                 -- sendBooks' own full refreshes cover this, but belt-and-braces:
                 -- dirty Home for one flashing FULL refresh after the batch.
-                local home = plugin and plugin.home
-                if home and home.frame then
-                    UIManager:setDirty(home, "full")
+                local h2 = plugin and plugin.home
+                if h2 and h2.frame then
+                    UIManager:setDirty(h2, "full")
                     UIManager:forceRePaint()
                 end
             end)
@@ -643,8 +659,7 @@ function PickerDialog:confirmDuplicatePick(book, entry, path)
             UIManager:close(confirm)
             picker.picked = picker.picked or {}
             picker.picked[path] = true
-            picker:init()
-            UIManager:setDirty(picker, "ui")
+            picker:repaint()
         end,
         cancel_callback = function()
             UIManager:close(confirm)
@@ -729,21 +744,106 @@ function PickerDialog:toggle(path)
         end
         self.picked[path] = true
     end
-    self:init()
-    UIManager:setDirty(self, "ui")
+    self:repaint()
 end
 
 function PickerDialog:gotoPage(n)
     self.page = math.max(1, n)
-    self:init()
-    UIManager:setDirty(self, "ui")
+    self:repaint()
 end
 
--- Exiting (the TitleBar ✕, the one the user already uses on the dashboard)
--- always lands back on the CrossDrop dashboard: if Home is still open it is
--- repainted; if it was closed meanwhile, it is reopened.
+-- The Storefront footer pager: a centered strip of two bare chevron buttons
+-- around a Page-N-of-M readout, always rendered when there are books. The
+-- chevrons are the same icon-only Buttons as the dashboard chrome (48x48 tap
+-- targets, 24px glyphs, no border/background); they grey out — never
+-- disappear — at the ends via Button:enableDisable. The page readout is its
+-- own Button that jumps to a number via the core SpinWidget.
+function PickerDialog:buildPager(max_page)
+    local sc = function(v) return Device.screen:scaleBySize(v) end
+    local prev_btn = Button:new{
+        icon = "chevron.left",
+        icon_width = sc(24),
+        icon_height = sc(24),
+        width = sc(48),
+        height = sc(48),
+        bordersize = 0,
+        background = nil,
+        allow_flash = false,
+        show_parent = self,
+        callback = function() self:gotoPage(self.page - 1) end,
+    }
+    setButtonEnabled(prev_btn, self.page > 1)
+    local page_btn = Button:new{
+        text = string.format(_("Page %d of %d"), self.page, math.max(1, max_page)),
+        width = sc(140),
+        height = sc(48),
+        bordersize = 0,
+        radius = Size.radius.button - 1, -- -1: core's unhighlight resets radius == Size.radius.button to nil, squaring the button after first tap
+        background = nil,
+        align = "center",
+        text_font_face = "smallinfofont",
+        text_font_size = 18,
+        allow_flash = false,
+        show_parent = self,
+        callback = function() self:showGotoPage(max_page) end,
+    }
+    local next_btn = Button:new{
+        icon = "chevron.right",
+        icon_width = sc(24),
+        icon_height = sc(24),
+        width = sc(48),
+        height = sc(48),
+        bordersize = 0,
+        background = nil,
+        allow_flash = false,
+        show_parent = self,
+        callback = function() self:gotoPage(self.page + 1) end,
+    }
+    setButtonEnabled(next_btn, self.page < max_page)
+    return CenterContainer:new{
+        dimen = Geom:new{ w = self.row_w, h = sc(48) },
+        HorizontalGroup:new{
+            prev_btn,
+            HorizontalSpan:new{ width = sc(24) },
+            page_btn,
+            HorizontalSpan:new{ width = sc(24) },
+            next_btn,
+        },
+    }
+end
+
+-- The page readout runs the core SpinWidget (loaded on demand, so opening
+-- the picker never pulls spinwidget in). No-op on a one-page list.
+function PickerDialog:showGotoPage(max_page)
+    if not max_page or max_page <= 1 then return end
+    local ok, SpinWidget = pcall(require, "ui/widget/spinwidget")
+    if not ok or not SpinWidget then return end
+    UIManager:show(SpinWidget:new{
+        title_text = _("Go to page"),
+        value = self.page,
+        value_min = 1,
+        value_max = max_page,
+        ok_text = _("Go"),
+        callback = function(spin)
+            if spin and spin.value and spin.value ~= self.page then
+                self:gotoPage(spin.value)
+            end
+        end,
+    })
+end
+
+-- Leaving the picker (Back, or the send flow moving on) always lands back on
+-- the CrossDrop dashboard: inline this is the Send tab's landing, with the
+-- picked set / page / search filter cached on self for the next open. A
+-- picker built without a home (a standalone fallback) keeps the old
+-- dialog-close behaviour: repaint the open dashboard, or reopen it.
 function PickerDialog:close()
     self._closed = true
+    local home = self.home
+    if home and type(home.leaveFilesBrowser) == "function" then
+        home:leaveFilesBrowser()
+        return
+    end
     UIManager:close(self, "ui")
     local plugin = self.plugin
     if plugin then
@@ -754,6 +854,23 @@ function PickerDialog:close()
             plugin:openHome()
         end
     end
+end
+
+function PickerDialog:leave()
+    self:close()
+end
+
+-- Every in-place repaint goes through the dashboard's refresh (flashless
+-- "ui", brand header + tab bar stay painted — the picker has no frame of its
+-- own when it renders inline). Standalone usage (no home) falls back to the
+-- old init + setDirty path.
+function PickerDialog:repaint()
+    if self.home and type(self.home.refresh) == "function" then
+        self.home:refresh()
+        return
+    end
+    self:init()
+    UIManager:setDirty(self, "ui")
 end
 
 -- ────────────────────── rendering ─────────────────────────────
@@ -774,6 +891,7 @@ function PickerDialog:row(text, opts)
         width = self.row_w,
         align = "left",
         bordersize = opts.bordersize or Size.border.button,
+        radius = Size.radius.button - 1, -- -1: core's unhighlight resets radius == Size.radius.button to nil, squaring the button after first tap
         avoid_text_truncation = false,
         padding_h = Size.padding.large,
         text_font_face = "smallinfofont",
@@ -812,39 +930,65 @@ function PickerDialog:buildContent()
     local vg = VerticalGroup:new{ align = "left" }
     local books = self:visibleBooks()
     local sc = function(v) return Device.screen:scaleBySize(v) end
+    local h_of = function(w)
+        local s = w.getSize and w:getSize()
+        return (s and s.h) or 0
+    end
 
     -- THE send button: always the first row of every page, dark and bold so
     -- it reads as THE primary control (storefront's ok-button styling).
-    table.insert(vg, self:row(self:sendRowText(), {
+    local send_row = self:row(self:sendRowText(), {
         bold = true,
         background = Blitbuffer.COLOR_DARK_GRAY,
         text_color = Blitbuffer.COLOR_WHITE,
         callback = function() self:confirmAndSend() end,
-    }))
+    })
+    -- Search: the button is always there; the active filter is spelled out in
+    -- a caption ("the field that shows the current search filter") with a
+    -- Clear button right under it.
+    local search_row = self:row(_("Search files\226\128\166"), {
+        callback = function() self:showSearchDialog() end,
+    })
+    local query_rows = {}
+    if self.query then
+        local results = #books
+        local label = (results == 1) and _("result") or _("results")
+        query_rows[#query_rows + 1] = self:separator()
+        query_rows[#query_rows + 1] = self:caption(string.format(
+            _("Search \226\128\156%s\226\128\157 \226\128\148 %d %s"),
+            self.query, results, label))
+        query_rows[#query_rows + 1] = self:row(_("Clear search"), {
+            callback = function() self:clearSearch() end,
+        })
+    end
 
-    local rpp = self.rows_per_page
+    -- Rows per page MEASURED, not chosen: the frame's inner height minus the
+    -- title bar (self.content_h), minus the fixed controls above the list,
+    -- minus the pager strip below it, divided by one REAL book row (the same
+    -- probe the delete tree uses). The page once shipped a fixed
+    -- rows_per_page = 10 that underused the screen.
+    local top_h = h_of(send_row) + h_of(self:separator()) + h_of(search_row)
+    for _, w in ipairs(query_rows) do
+        top_h = top_h + h_of(w)
+    end
+    top_h = top_h + h_of(self:separator())
+    local row_h = h_of(self:row("probe\nprobe", { bordersize = 0 }))
+    local sep_h = h_of(self:separator())
+    local pager_h = h_of(self:buildPager(1))
+    local content_h = self.content_h or math.floor(Device.screen:getHeight() - Size.padding.default * 2)
+    local avail = math.max(0, content_h - top_h - sep_h - pager_h)
+    local rpp = math.max(1, math.floor((avail + sep_h) / math.max(row_h + sep_h, 1)))
+    self.rows_per_page = rpp
     local max_page = math.max(1, math.ceil(#books / rpp))
     if self.page > max_page then self.page = max_page end
     local lo = (self.page - 1) * rpp + 1
     local hi = math.min(#books, self.page * rpp)
 
+    table.insert(vg, send_row)
     table.insert(vg, self:separator())
-
-    -- Search: the button is always there; the active filter is spelled out in
-    -- a caption ("the field that shows the current search filter") with a
-    -- Clear button right under it.
-    table.insert(vg, self:row(_("Search files\226\128\166"), {
-        callback = function() self:showSearchDialog() end,
-    }))
-    if self.query then
-        table.insert(vg, self:separator())
-        local results = #books
-        local label = (results == 1) and _("result") or _("results")
-        table.insert(vg, self:caption(string.format(_("Search \226\128\156%s\226\128\157 \226\128\148 %d %s"),
-            self.query, results, label)))
-        table.insert(vg, self:row(_("Clear search"), {
-            callback = function() self:clearSearch() end,
-        }))
+    table.insert(vg, search_row)
+    for _, w in ipairs(query_rows) do
+        table.insert(vg, w)
     end
     table.insert(vg, self:separator())
 
@@ -879,39 +1023,33 @@ function PickerDialog:buildContent()
         end
     end
 
-    -- Paging: a plain caption for the page number (never a control), then
-    -- the actual Previous/Next buttons — only the ones that apply.
+    -- Paging: Storefront's compact centered footer strip — one always-visible
+    -- row of [chevron.left][Page N of M — tap for "Go to page"][chevron.right].
+    -- The arrows disable themselves at the first/last page (a grey glyph,
+    -- never removed), so the controls never jump around between pages. The
+    -- strip sits on the VERY BOTTOM edge: a flexible spacer under the last
+    -- book row soaks up whatever the measured rows left over, so the page
+    -- controls never float above a dead band.
     if #books > 0 then
         table.insert(vg, self:separator())
-        table.insert(vg, self:caption(string.format(_("Page %d of %d"),
-            self.page, max_page)))
-        table.insert(vg, VerticalSpan:new{ width = sc(2) })
-        if self.page > 1 then
-            table.insert(vg, self:row(_("Previous page"), {
-                callback = function() self:gotoPage(self.page - 1) end,
-            }))
+        local rows_h = rpp * row_h + math.max(0, rpp - 1) * sep_h
+        local filler = math.floor(math.max(0, avail - rows_h))
+        if filler > 0 then
+            table.insert(vg, VerticalSpan:new{ width = filler })
         end
-        if hi < #books then
-            table.insert(vg, self:row(_("Next page"), {
-                callback = function() self:gotoPage(self.page + 1) end,
-            }))
-        end
+        table.insert(vg, self:buildPager(max_page))
     end
 
     return vg
 end
 
-function PickerDialog:init()
-    local sc = function(v) return Device.screen:scaleBySize(v) end
-    local sw = Device.screen:getWidth()
-    local sh = Device.screen:getHeight()
-    self.dimen = Geom:new{ w = sw, h = sh }
-
-    local pad = Size.padding.default
-    local inner_w = sw - pad * 2
-    self.row_w = inner_w
-
-    self._closed = false
+-- Cache + scan, done ONCE per picker lifetime (the walk is a real directory
+-- read on slow device storage): paint a notice first so it never reads as a
+-- freeze (the dashboard's check() recipe), then cache the result — toggles
+-- and pages re-init from the cache, never from disk. The SAME notice is held
+-- across BOTH scans: the local walk AND the reader's whole-card duplicate
+-- scan, so the list opens already knowing what the reader holds.
+function PickerDialog:ensureReady()
     -- The durable real-title cache lives next to the plugin (derived from
     -- this file's own path); in tests the file simply doesn't exist yet, and
     -- reads/writes are gated by the lazy-upgrade flow that cannot run there.
@@ -925,14 +1063,6 @@ function PickerDialog:init()
         self:loadTitleCache()
         self._cache_loaded = true
     end
-
-    -- Scan ONCE per dialog lifetime (the walk is a real directory read on
-    -- slow device storage): paint a notice first so it never reads as a
-    -- freeze (the dashboard's check() recipe), then cache the result —
-    -- toggles and pages re-init from the cache, never from disk. The SAME
-    -- notice is held across BOTH scans: the local walk AND the reader's
-    -- whole-card duplicate scan, so the list opens already knowing what the
-    -- reader holds.
     if not self.books then
         local scanning = Notification:new{
             text = _("Scanning for files\226\128\166"),
@@ -953,6 +1083,34 @@ function PickerDialog:init()
     UIManager:nextTick(function()
         if not self._closed then self:upgradeVisibleTitles() end
     end)
+end
+
+-- INLINE render: the picker paints into an existing VerticalGroup — the
+-- dashboard's tab content region below the brand header and tab bar. No own
+-- frame, no own TitleBar (the top of the card already shows CrossDrop and
+-- the Send A File tab); the list fills exactly the AREA height passed in, so
+-- the pager straps to the bottom of the tab region the way it used to strap
+-- to the bottom of the full-screen card.
+function PickerDialog:renderInto(vg, area_w, area_h)
+    self._closed = false
+    if area_w then self.row_w = area_w end
+    if area_h then self.content_h = area_h end
+    self:ensureReady()
+    table.insert(vg, self:buildContent())
+end
+
+function PickerDialog:init()
+    local sc = function(v) return Device.screen:scaleBySize(v) end
+    local sw = Device.screen:getWidth()
+    local sh = Device.screen:getHeight()
+    self.dimen = Geom:new{ w = sw, h = sh }
+
+    local pad = Size.padding.default
+    local inner_w = sw - pad * 2
+    self.row_w = inner_w
+
+    self._closed = false
+    self:ensureReady()
 
     -- Belt-and-suspenders: instance-level modal (never rely on class
     -- inheritance for the field UIManager's stacking depends on).
@@ -978,6 +1136,16 @@ function PickerDialog:init()
         end,
         show_parent = self,
     }
+
+    -- How tall the list can be: the card's inner height minus the title bar
+    -- and the two 8px breathing spans around the content. buildContent then
+    -- measures its own fixed controls and one real book row against this
+    -- budget, so the rows fill the screen and the pager straps to the
+    -- bottom edge (the page once shipped with a fixed 10-row page and left
+    -- a dead band under the list on larger screens).
+    local tb_size = title_bar.getSize and title_bar:getSize()
+    self.title_h = (tb_size and tb_size.h) or sc(80)
+    self.content_h = (sh - pad * 2) - self.title_h - sc(16)
 
     local content = self:buildContent()
 

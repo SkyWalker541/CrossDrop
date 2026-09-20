@@ -1,5 +1,6 @@
 -- CrossDrop Home: the plugin's app-style dashboard (the "Storefront" look).
--- A TitleBar header, an underlined tab bar (Connections / Send), rich rows
+-- A Storefront-style brand lockup (logo + name top-left, ✕ to leave), an
+-- underlined tab bar (Connections / Send A File / Delete), rich rows
 -- with live status dots and short hints, tap-to-act. The white card covers
 -- the whole screen so nothing shows behind it. Loaded lazily from main.lua,
 -- so all widget requires happen when the dashboard opens, never at plugin
@@ -44,9 +45,11 @@ local Device = require("device")
 local Font = require("ui/font")
 local FrameContainer = require("ui/widget/container/framecontainer")
 local Geom = require("ui/geometry")
+local GestureRange = require("ui/gesturerange")
 local HorizontalGroup = require("ui/widget/horizontalgroup")
 local HorizontalSpan = require("ui/widget/horizontalspan")
 local ImageWidget = require("ui/widget/imagewidget")
+local IconButton = require("ui/widget/iconbutton")
 local InputContainer = require("ui/widget/container/inputcontainer")
 local LineWidget = require("ui/widget/linewidget")
 local Notification = require("ui/widget/notification")
@@ -61,6 +64,15 @@ local VerticalSpan = require("ui/widget/verticalspan")
 
 local _ = require("gettext")
 local logger = require("logger")
+
+-- The file picker renders INSIDE this dashboard (the Send tab's browser) but
+-- lives in its own module. Loaded lazily — requiring Home must never pull
+-- the picker's widget code at plugin load time (the Harness guards that).
+local picker_mod
+local function pickerModule()
+    picker_mod = picker_mod or require("crossdrop_picker")
+    return picker_mod
+end
 
 -- This file's own plugin directory (icon.png lives beside it). The on-device
 -- PluginLoader sets plugin.path on the module; this mirrors how the picker
@@ -108,6 +120,12 @@ end
 
 -- ─────────────────────────────── the widget ──────────────────────────────
 
+-- Forward declarations: FolderMenuDialog and DeleteDialog are defined further
+-- down, but earlier-defined methods (showFolderMenu, openDeleteTree) build
+-- them — without this they would resolve as globals (plugin-namespace
+-- pollution on the device, where every plugin shares _G).
+local FolderMenuDialog, DeleteDialog
+
 local HomeDialog = InputContainer:extend{
     modal = true,
     dismissable = false,
@@ -124,6 +142,18 @@ local HomeDialog = InputContainer:extend{
     send_file_list = {},  -- basenames of files sent so far
     send_widgets = nil,   -- reserved: the progress bar was removed (e-ink), onProgress is inert
     fail_reason = nil,    -- text shown on "failed"
+    -- Everything below the tab bar happens INSIDE this dashboard: the file
+    -- picker and the two trees render into the tab content region instead of
+    -- stacked full-screen dialogs (see the buildTabContent dispatch). The
+    -- browser objects keep their state (picked files, tree pages, search
+    -- filter) for the whole Home lifetime; these screen fields only say which
+    -- browser, if any, the active tab is showing. nil == that tab's landing.
+    send_screen = nil,    -- "files" (picker) | "destination" (folder tree)
+    delete_screen = nil,  -- "tree" (delete tree)
+    send_picker = nil,    -- PickerDialog parked on the Send tab
+    dest_browser = nil,   -- DestinationDialog parked on the Send tab
+    delete_browser = nil, -- DeleteDialog parked on the Delete tab
+    content_h = nil,      -- height of the tab content region (measured at init)
 }
 
 function HomeDialog:init()
@@ -141,18 +171,22 @@ function HomeDialog:init()
     local inner_w = sw - pad * 2
     self.row_w = inner_w
 
-    local title_bar = TitleBar:new{
-        width = inner_w,
-        title = _("CrossDrop"),
-        fullscreen = false,
-        with_bottom_line = true,
-        close_callback = function()
-            UIManager:close(self)
-        end,
-        show_parent = self,
-    }
+    -- The tab content region's height: the card's inner height minus the
+    -- MEASURED brand header, tab bar and the three breathing spans. The
+    -- inline browsers (file picker, destination tree, delete tree) and the
+    -- send flow use this as their budget, so their pagers and footers strap
+    -- to the bottom of the tab region exactly like they used to strap to the
+    -- bottom of a full-screen card.
+    local header_vg = self:buildHeader(inner_w, sc)
+    local tabbar_vg = self:buildTabBar(inner_w)
+    local gh = function(w)
+        local s = w.getSize and w:getSize()
+        return (s and s.h) or 0
+    end
+    self.content_h = math.max(sc(120),
+        math.floor((sh - pad * 2) - gh(header_vg) - sc(8) - gh(tabbar_vg) - sc(20) - sc(8)))
 
-    local content = self:buildTabContent(self.tab, inner_w)
+    local content = self:buildTabContent(self.tab, inner_w, self.content_h)
 
     -- A full-screen white frame (not a centered content-sized card): the
     -- whole screen paints white on top of whatever UI sits behind it. Both
@@ -169,11 +203,9 @@ function HomeDialog:init()
         padding = pad,
         VerticalGroup:new{
             align = "left",
-            title_bar,
+            header_vg,
             VerticalSpan:new{ width = sc(8) },
-            self:buildLogo(inner_w, sc),
-            VerticalSpan:new{ width = sc(8) },
-            self:buildTabBar(inner_w),
+            tabbar_vg,
             VerticalSpan:new{ width = sc(20) },
             content,
             VerticalSpan:new{ width = sc(8) },
@@ -188,32 +220,124 @@ function HomeDialog:init()
 end
 
 function HomeDialog:onBack()
-    UIManager:close(self)
+    -- Back inside a browser leaves it for this tab's landing (state stays
+    -- cached on the browser objects). Only a back on a landing closes the
+    -- whole dashboard — the ✕ on the header does the same. Everything is a
+    -- flashless "ui" repaint: this is an in-place state change, never a
+    -- flicker-worthy transition. It delegates to the browser's own leave()
+    -- so its _closed flag flips too (the picker uses it to gate its deferred
+    -- title upgrade).
+    if self.send_screen == "files" then
+        if self.send_picker then self.send_picker:leave() end
+    elseif self.send_screen == "destination" then
+        if self.dest_browser then self.dest_browser:leave() end
+    elseif self.delete_screen then
+        if self.delete_browser then self.delete_browser:leave() end
+    else
+        UIManager:close(self)
+    end
     return true
 end
 
--- The plugin logo (icon.png beside this file) renders as a small centered
--- header under the title bar whenever the file exists. No image on disk, no
--- logo and no dead gap — a stripped install just gets the normal spacing.
--- ImageWidget + CenterContainer are the same blitting path Storefront uses
--- for cover art, so this is proven to paint on the e-ink panel.
-function HomeDialog:buildLogo(inner_w, sc)
-    local dir = (self.plugin and self.plugin.path) or LUA_PLUGIN_DIR
+-- The Storefront-style brand lockup: the plugin logo (icon.png beside this
+-- file) as a small 24px glyph with "CrossDrop" to its right, all the way in
+-- the top-left corner of the title row, with the ✕ that leaves the plugin on
+-- the far right (the dashboard's only ✕). A hairline rules the bottom of the
+-- row in place of TitleBar's bottom line. No image on disk, no logo and no
+-- dead gap — a stripped install just gets the title, and self.logo_shown
+-- mirrors that for tests/Send-more flow.
+function HomeDialog:buildHeader(inner_w, sc)
+    local theme = require("crossdrop_theme")
     local ok, lfs = pcall(require, "libs/libkoreader-lfs")
-    local icon = dir and (dir .. "/icon.png") or nil
-    if not icon or not ok or not lfs or not lfs.attributes
-            or lfs.attributes(icon, "mode") ~= "file" then
-        self.logo_shown = false
-        return VerticalSpan:new{ width = sc(6) }
+    local logo
+    if ok and lfs and lfs.attributes then
+        local dir = (self.plugin and self.plugin.path) or LUA_PLUGIN_DIR
+        -- The lockup glyph is the logo BLACKENED and hardened on white BEFORE
+        -- scaling: icon.png is a near-black mark on white whose anti-aliased
+        -- edges lighten when the 360px master is squeezed to 24px (it read as
+        -- grey next to the wordmark). assets/logo-black.png is the same mark
+        -- re-thresholded to pure black/white, so the small glyph stays black.
+        -- If a designer ships a dedicated monochrome asset later, this is the
+        -- file to replace.
+        local dir_assets = dir and (dir .. "/assets")
+        local black = dir_assets and (dir_assets .. "/logo-black.png") or nil
+        local icon = nil
+        if black and lfs.attributes(black, "mode") == "file" then
+            icon = black
+        elseif dir then
+            local plain = dir .. "/icon.png"
+            if lfs.attributes(plain, "mode") == "file" then
+                icon = plain
+            end
+        end
+        if icon then
+            logo = ImageWidget:new{
+                file = icon,
+                width = sc(24),
+                height = sc(24),
+                -- opaque-on-white glyph: bake it flat like a core icon (no
+                -- alpha path, nothing to blend, nothing to grey out).
+                is_icon = true,
+            }
+        end
     end
-    self.logo_shown = true
-    local size = sc(56)
-    return CenterContainer:new{
-        dimen = Geom:new{ w = inner_w, h = size },
-        ImageWidget:new{
-            file = icon,
-            width = size,
-            height = size,
+    self.logo_shown = logo ~= nil
+
+    local title_label = TextWidget:new{
+        text = _("CrossDrop"),
+        face = Font:getFace("smallinfofont", theme.title_font_size or 22),
+        bold = true,
+        fgcolor = Blitbuffer.COLOR_BLACK,
+    }
+    local logo_w = 0
+    if logo and type(logo.getSize) == "function" then
+        local s = logo:getSize()
+        logo_w = s and s.w or sc(24)
+    end
+    local title_w = 0
+    if type(title_label.getSize) == "function" then
+        local s = title_label:getSize()
+        title_w = s and s.w or 0
+    end
+
+    -- The ✕ that leaves the plugin. This EXACTLY follows the two recipes that
+    -- work on the device: core TitleBar's right-hand ✕ and Storefront's close
+    -- button — an IconButton with width/height = the glyph size, padding
+    -- adding the tap zone, polished off with allow_flash = false (the rule for
+    -- any control that closes the container holding it). A bare Button here
+    -- once left a stuck grey highlight instead of closing.
+    local close_btn = IconButton:new{
+        icon = "close",
+        width = sc(24),
+        height = sc(24),
+        padding = sc(12),
+        bordersize = 0,
+        background = nil,
+        allow_flash = false,
+        show_parent = self,
+        callback = function()
+            UIManager:close(self)
+        end,
+    }
+
+    local elems = {}
+    if logo then
+        elems[#elems + 1] = logo
+        elems[#elems + 1] = HorizontalSpan:new{ width = sc(8) }
+    end
+    elems[#elems + 1] = title_label
+    elems[#elems + 1] = HorizontalSpan:new{
+        width = math.max(sc(8), inner_w - logo_w - sc(8) - title_w - sc(48) - sc(4)),
+    }
+    elems[#elems + 1] = close_btn
+
+    return VerticalGroup:new{
+        align = "left",
+        HorizontalGroup:new(elems),
+        VerticalSpan:new{ width = sc(6) },
+        LineWidget:new{
+            dimen = Geom:new{ w = inner_w, h = Size.line.thick },
+            background = Blitbuffer.COLOR_LIGHT_GRAY,
         },
     }
 end
@@ -228,7 +352,24 @@ end
 -- ─────────────────────────────── tab bar ─────────────────────────────────
 
 function HomeDialog:showTab(key)
-    if self.tab == key then return end
+    -- Re-tapping the ACTIVE tab backs out to that tab's landing (same as the
+    -- back chevron inside a browser): the browser hides, its state (picked
+    -- files, tree pages, search filter) stays cached on the browser object.
+    -- A re-tap while already on a landing is a no-op.
+    if self.tab == key then
+        local backed = false
+        if key == "send" and self.send_screen ~= nil then
+            self.send_screen = nil
+            backed = true
+        elseif key == "delete" and self.delete_screen ~= nil then
+            self.delete_screen = nil
+            backed = true
+        end
+        if not backed then return end
+        self:init()
+        UIManager:setDirty(self, "ui")
+        return
+    end
     -- NOTE: there is NO UIManager:replace in this KOReader build (it crashed
     -- the plugin on the Kindle). Re-init the SAME widget for its new tab and
     -- repaint it in place instead. "ui" (not "partial"): flashless AND never
@@ -236,45 +377,64 @@ function HomeDialog:showTab(key)
     -- to a flashing full, which is exactly the "random" flashing the
     -- dashboard used to show.
     self.tab = key
+    -- Switching tabs always lands on the target tab's LANDING: any browser
+    -- open on the old tab hides, while its state (picked files, tree pages,
+    -- search filter) stays cached on the browser object for the next open.
+    -- The ✕ on the header is still the only thing that leaves the plugin.
+    if key == "delete" then self.delete_screen = nil end
+    if key == "send" then self.send_screen = nil end
     self:init()
     UIManager:setDirty(self, "ui")
 end
 
+-- The tab bar is Storefront's, with one user-facing divergence: EVERY tab
+-- keeps its label visible (active = bold black + full-width underline;
+-- inactive = grey), because here "Connections / Send A File / Delete Files"
+-- are words, not guessable symbols — icons always sit beside the labels
+-- they explain. The plugin SHIPS no glyphs; until assets/* exist the bar
+-- falls back to label-only and still reads perfectly. Equal fixed widths
+-- keep the bar exactly filling the row (a third long tab once pushed an
+-- auto-sized bar off screen); tabs are InputContainers over image/text
+-- blocks centered in each window, the same tap recipe as the picker rows.
 function HomeDialog:buildTabBar(content_w)
     local sc = function(v) return Device.screen:scaleBySize(v) end
+    local theme = require("crossdrop_theme")
     local tabs = {
         { key = "connections", label = _("Connections") },
         { key = "send", label = _("Send A File") },
         { key = "delete", label = _("Delete Files") },
     }
-    -- Fixed equal widths: the bar EXACTLY fills the row no matter how many
-    -- tabs or how long the labels (a third long tab pushed the bar off
-    -- screen when buttons auto-sized to their text).
     local gaps = sc(6) * (#tabs - 1)
-    local frame_w = math.floor((content_w - gaps) / #tabs)
-    local btn_w = frame_w - sc(8) * 2
-    local tabs_widgets = {}
+    local btn_w = math.floor((content_w - gaps) / #tabs)
+    local tab_font = theme.face_label_size or 18
+    local icons = self:tabIconPaths()
+    local widgets = {}
     for i, t in ipairs(tabs) do
         if i > 1 then
-            tabs_widgets[#tabs_widgets + 1] = HorizontalSpan:new{ width = sc(6) }
+            widgets[#widgets + 1] = HorizontalSpan:new{ width = sc(6) }
         end
         local active = self.tab == t.key
-        -- No menu_style here: it force-sets align="left" inside Button:init
-        -- (why the labels refused to center). The same look is set directly —
-        -- and text_font_bold actually works, so the ACTIVE tab reads bold.
-        local btn = Button:new{
+        local icon = icons and icons[t.key]
+        local elems = {}
+        if icon then
+            elems[#elems + 1] = ImageWidget:new{
+                file = active and icon.active or icon.inactive,
+                width = sc(22),
+                height = sc(22),
+                -- is_icon makes ImageWidget bake a transparent PNG onto white
+                -- at load time (the core elevated-icon path): no alpha blit,
+                -- so a glyph can never paint itself black on this panel.
+                is_icon = true,
+            }
+            elems[#elems + 1] = HorizontalSpan:new{ width = sc(6) }
+        end
+        elems[#elems + 1] = TextWidget:new{
             text = t.label,
-            width = btn_w,
-            align = "center",
-            text_font_face = "smallinfofont",
-            text_font_size = 22,
-            text_font_bold = active,
-            padding_h = Size.padding.large,
-            avoid_text_truncation = false,
-            callback = function()
-                self:showTab(t.key)
-            end,
+            face = Font:getFace("smallinfofont", tab_font),
+            bold = active,
+            fgcolor = active and Blitbuffer.COLOR_BLACK or theme.color_label_dim,
         }
+        local row = HorizontalGroup:new(elems)
         local underline
         if active then
             underline = LineWidget:new{
@@ -284,27 +444,95 @@ function HomeDialog:buildTabBar(content_w)
         else
             underline = VerticalSpan:new{ width = sc(3) }
         end
-        tabs_widgets[#tabs_widgets + 1] = FrameContainer:new{
-            padding_top = sc(4),
-            padding_bottom = 0,
-            padding_left = sc(8),
-            padding_right = sc(8),
-            bordersize = 0,
-            VerticalGroup:new{
-                align = "center",
-                btn,
-                VerticalSpan:new{ width = sc(4) },
-                underline,
+        local group = VerticalGroup:new{
+            align = "center",
+            row,
+            VerticalSpan:new{ width = sc(4) },
+            underline,
+        }
+        local gh = type(group.getSize) == "function" and (group:getSize().h or sc(40)) or sc(40)
+        local tab_btn = InputContainer:new{
+            FrameContainer:new{
+                padding_top = sc(4),
+                padding_bottom = 0,
+                bordersize = 0,
+                CenterContainer:new{
+                    dimen = Geom:new{ w = btn_w, h = gh },
+                    group,
+                },
             },
         }
+        tab_btn.show_parent = self
+        tab_btn.isFocusable = function() return true end
+        tab_btn.onTap = function()
+            self:showTab(t.key)
+            return true
+        end
+        tab_btn.ges_events = {
+            Tap = {
+                GestureRange:new{
+                    ges = "tap",
+                    range = function()
+                        local d = tab_btn.dimen or { x = 0, y = 0, w = 0, h = 0 }
+                        return Geom:new{
+                            x = d.x or 0,
+                            y = d.y or 0,
+                            w = d.w or 0,
+                            h = d.h or 0,
+                        }
+                    end,
+                },
+            },
+        }
+        widgets[#widgets + 1] = tab_btn
     end
-    return HorizontalGroup:new(tabs_widgets)
+    return HorizontalGroup:new(widgets)
+end
+
+-- Resolve the optional tab glyphs (plugin-local assets/). Storefront's
+-- convention, adapted: each tab needs two monochrome variants — the inactive
+-- grey glyph (tab-<key>.<ext>) and the active black one (tab-<key>-active.<ext>).
+-- Both must exist for a tab's icon to show, which keeps the label fallback
+-- above honest. Plain PNGs are the proven-safe render path on this device
+-- (icon.png months of uptime); a true vector .svg with the same names is
+-- also accepted when one is ever exported. Never throws when assets/ is
+-- absent (lfs is stubbed in harness and real on-device).
+function HomeDialog:tabIconPaths()
+    if self._tab_icon_paths then return self._tab_icon_paths end
+    local ok, lfs = pcall(require, "libs/libkoreader-lfs")
+    if not ok or not lfs or not lfs.attributes then return nil end
+    local has = function(p) return lfs.attributes(p, "mode") == "file" end
+    local dir = (self.plugin and self.plugin.path) or LUA_PLUGIN_DIR
+    if not dir then return nil end
+    local keys = { "connections", "send", "delete" }
+    local out = {}
+    for _, key in ipairs(keys) do
+        local inactive, active
+        for _, ext in ipairs({ "png", "svg" }) do
+            local base = dir .. "/assets/tab-" .. key
+            local inc = base .. "." .. ext
+            local act = base .. "-active." .. ext
+            if has(inc) and has(act) then
+                inactive, active = inc, act
+                break
+            end
+        end
+        if inactive and active then
+            out[key] = { inactive = inactive, active = active }
+        end
+    end
+    self._tab_icon_paths = next(out) and out or nil
+    return self._tab_icon_paths
 end
 
 function HomeDialog:row(text, opts)
     return Button:new{
         text = text,
         menu_style = true,
+        -- Explicit radius so the tap highlight inverts the WHOLE box: core's
+        -- Button flash uses a rounded rect whenever radius is nil, which on
+        -- our square buttons reads as a blob that skips the corners.
+        radius = Size.radius.button - 1, -- -1: core's unhighlight resets radius == Size.radius.button to nil, squaring the button after first tap
         width = self.row_w,
         callback = opts and opts.callback,
         hold_callback = opts and opts.hold_callback,
@@ -324,13 +552,27 @@ function HomeDialog:header(text)
     }
 end
 
-function HomeDialog:buildTabContent(tab, width)
+-- The Send/Delete tab body. Everything runs BELOW the always-visible brand
+-- header + tab bar: the send state machine, the idle landing, or one of the
+-- inline browsers (file picker on "files", destination tree on "destination",
+-- delete tree on "tree"). Each browser paints itself into a fresh
+-- VerticalGroup sized to the tab content region (area_h == self.content_h).
+function HomeDialog:buildTabContent(tab, width, area_h)
     self.row_w = width
     if tab == "connections" then
         return self:renderConnections()
     end
     if tab == "delete" then
+        if self.delete_screen == "tree" then
+            return self:renderDeleteBrowser(area_h)
+        end
         return self:renderDelete()
+    end
+    if self.send_screen == "files" then
+        return self:renderFilesBrowser(area_h)
+    end
+    if self.send_screen == "destination" then
+        return self:renderDestinationBrowser(area_h)
     end
     if self.send_state == "connecting" then
         return self:renderSendConnecting()
@@ -345,6 +587,56 @@ function HomeDialog:buildTabContent(tab, width)
         return self:renderSendFailed()
     end
     return self:renderSendIdle()
+end
+
+-- ─────────────────── Send tab browsers (inline, below the tabs) ───────────────────
+-- The user rule: the brand header and the tab bar NEVER leave the screen.
+-- Picking files, choosing the destination and deleting all happen inside the
+-- active tab's content region — no stacked full-screen dialogs — and every
+-- back/leave/tab-switch returns to the tab's landing with the browser's
+-- state (picked files, expanded nodes, page) cached on the browser object.
+
+function HomeDialog:renderFilesBrowser(area_h)
+    local vg = VerticalGroup:new{ align = "left" }
+    local picker = self.send_picker
+    if not picker then
+        picker = pickerModule():new{ plugin = self.plugin, home = self }
+        self.send_picker = picker
+    end
+    picker:renderInto(vg, self.row_w, area_h or self.content_h)
+    return vg
+end
+
+function HomeDialog:renderDestinationBrowser(area_h)
+    local vg = VerticalGroup:new{ align = "left" }
+    if self.dest_browser then
+        self.dest_browser:renderInto(vg, self.row_w, area_h or self.content_h)
+    end
+    return vg
+end
+
+function HomeDialog:renderDeleteBrowser(area_h)
+    local vg = VerticalGroup:new{ align = "left" }
+    if self.delete_browser then
+        self.delete_browser:renderInto(vg, self.row_w, area_h or self.content_h)
+    end
+    return vg
+end
+
+-- Open/leave the inline file browser (chooseAndSend wires into this).
+function HomeDialog:openFilesBrowser()
+    if not self.send_picker then
+        self.send_picker = pickerModule():new{ plugin = self.plugin, home = self }
+    end
+    self.send_picker._closed = false
+    self.tab = "send"
+    self.send_screen = "files"
+    self:refresh()
+end
+
+function HomeDialog:leaveFilesBrowser()
+    self.send_screen = nil
+    self:refresh()
 end
 
 -- ─────────────────────── Connections tab ────────────────────────────────
@@ -614,14 +906,25 @@ end
 -- Repaint the tree in place, flash-free (the no-flash rule of the dashboard).
 -- "ui" (not "partial"): flashless AND never promoted — the panel promotes
 -- every FULL_REFRESH_COUNT-th bare partial to a flashing full, which read as
--- "random" flashes while browsing the tree.
-function DestinationDialog:rebuild()
+-- "random" flashes while browsing the tree. Inline, the repaint is the
+-- dashboard's own refresh — the tree lives inside Home, so the brand header
+-- and tabs stay painted while it rebuilds.
+function DestinationDialog:repaint()
+    if self.home and type(self.home.refresh) == "function" then
+        self.home:refresh()
+        return
+    end
     self:init()
     UIManager:setDirty(self, "ui")
     UIManager:forceRePaint()
 end
 
--- Choose `path` as the destination and leave the dialog (dashboard refresh).
+function DestinationDialog:rebuild()
+    self:repaint()
+end
+
+-- Choose `path` as the destination and leave the tree (landing + refresh:
+-- the Send tab's destination row now shows the chosen folder).
 function DestinationDialog:pick(path)
     if self.plugin.setFolder then
         self.plugin:setFolder(path)
@@ -629,18 +932,19 @@ function DestinationDialog:pick(path)
     if type(path) == "string" and path ~= "" then
         self.selected = tostring(path):gsub("^/+", ""):gsub("/+$", "")
     end
-    local home = self.home
-    UIManager:close(self)
-    UIManager:nextTick(function()
-        if home and home.refresh then home:refresh() end
-    end)
+    self:leave()
 end
 
 -- Leave the tree WITHOUT changing the destination (the back chevron and the
--- ✕): back to the dashboard, refreshed so its destination row shows the
--- folder as it stands — including a subfolder created here but not yet on
--- the reader (it materializes when a book is sent).
+-- ✕): back to the Send tab's landing, refreshed so its destination row shows
+-- the folder as it stands — including a subfolder created here but not yet
+-- on the reader (it materializes when a book is sent).
 function DestinationDialog:leave()
+    if self.home and type(self.home.refresh) == "function" then
+        self.home.send_screen = nil
+        self.home:refresh()
+        return
+    end
     local home = self.home
     UIManager:close(self)
     UIManager:nextTick(function()
@@ -744,6 +1048,85 @@ function DestinationDialog:addSubfolder(node, name)
     end
 end
 
+-- INLINE render (the user's rule: everything below the brand + tabs): paint
+-- the tree into an existing VerticalGroup bounded by the tab content region.
+-- The headers, rows/page-strip and the Default footer are measured against
+-- the AREA height exactly like the old full-screen card tallied, so the page
+-- controls keep strapping to the bottom edge. Shared by the tab content
+-- builder AND the standalone init() below.
+function DestinationDialog:renderInto(vg, area_w, area_h)
+    local sc = function(v) return Device.screen:scaleBySize(v) end
+    if area_w then self.row_w = area_w end
+    if area_h then self.content_h = area_h end
+    local ph = function(w)
+        local s = w.getSize and w:getSize()
+        return (s and s.h) or 0
+    end
+
+    -- The Default footer is built FIRST and measured, because the page-nav
+    -- strip above it must save exactly this much room — it stays visible on
+    -- every page as the "reset destination" escape hatch.
+    local dest_label = (self.selected and ("/" .. self.selected)) or folder_str(self.plugin:resolveTarget())
+    local dest_header = self:foldersHeader(_("Destination: ") .. dest_label)
+    local folders_header = self:foldersHeader(_("Folders on the reader"))
+    local default_header = self:foldersHeader(_("Default"))
+    local default_row = self:plainRow(_("CrossDropped Files (back to the default)"),
+        function() self:pick("CrossDropped Files") end)
+    self.default_h = ph(default_header) + ph(default_row)
+
+    -- Rows per page MEASURED from one real row PLUS its hairline separator
+    -- (the delete browser's probe). The budget is the content height minus
+    -- the two headers above the tree, the page-nav strip in its tallest form
+    -- (both buttons visible), and the Default footer below it. Setting
+    -- self.rows_per_page before init skips the probe (how the tests pin it).
+    if not self.rows_per_page then
+        local probe = VerticalGroup:new{}
+        self:treeRowInto(probe, new_node("sample", "sample", 0), 0)
+        table.insert(probe, self:separator())
+        local rh = (probe:getSize() and probe:getSize().h) or sc(60)
+        local top_h = ph(dest_header) + ph(folders_header)
+        local strip = VerticalGroup:new{ align = "left" }
+        table.insert(strip, self:separator())
+        table.insert(strip, self:caption(string.format(_("Page %d of %d"), 1, 1)))
+        table.insert(strip, VerticalSpan:new{ width = sc(2) })
+        table.insert(strip, self:menuRow(_("Previous page"), function() end))
+        table.insert(strip, self:menuRow(_("Next page"), function() end))
+        local strip_h = (strip:getSize() and strip:getSize().h) or sc(150)
+        local avail = math.max(1, self.content_h - top_h - strip_h - self.default_h)
+        self.rows_per_page = math.max(1, math.floor(avail / math.max(rh, 1)))
+    end
+
+    table.insert(vg, dest_header)
+
+    if self.list_err then
+        -- The reader is unreachable: ONLY this message, nothing else.
+        table.insert(vg, TextBoxWidget:new{
+            text = _("Device not found. Please check Xteink IP, and confirm that it matches in Connections."),
+            face = Font:getFace("smallinfofont"),
+            width = self.row_w,
+        })
+    else
+        table.insert(vg, folders_header)
+
+        -- Paged rendering (the delete browser's recipe): long trees slice
+        -- into pages; the page clamps when the tree shortens. The Default
+        -- footer stays visible under the tree, bottom-tacked with the
+        -- page-nav strip above it.
+        local nodes = self.nodes or {}
+        if #nodes > 0 then
+            self:appendPaged(vg)
+        else
+            table.insert(vg, TextBoxWidget:new{
+                text = _("No folders on the reader."),
+                face = Font:getFace("smallinfofont"),
+                width = self.row_w,
+            })
+        end
+        table.insert(vg, default_header)
+        table.insert(vg, default_row)
+    end
+end
+
 function DestinationDialog:init()
     local sc = function(v) return Device.screen:scaleBySize(v) end
     local sw = Device.screen:getWidth()
@@ -752,16 +1135,6 @@ function DestinationDialog:init()
     local pad = Size.padding.default
     local inner_w = sw - pad * 2
     self.row_w = inner_w
-    -- Rows per page MEASURED from one real row (see the delete tree's note:
-    -- a guessed count once pushed the page-nav rows off the fold). The
-    -- allowance is larger than the delete tree's — this page also carries
-    -- the destination line, section headers, and the Default row.
-    if not self.rows_per_page then
-        local probe = VerticalGroup:new{}
-        self:treeRowInto(probe, new_node("sample", "sample", 0), 0)
-        local rh = (probe:getSize() and probe:getSize().h) or sc(60)
-        self.rows_per_page = math.max(5, math.floor((sh - sc(340)) / math.max(rh, 1)))
-    end
 
     -- Back chevron top-left returns to the dashboard. There is NO ✕ here:
     -- the dashboard is still behind this page, and X is reserved for leaving
@@ -776,35 +1149,15 @@ function DestinationDialog:init()
         show_parent = self,
     }
 
-    local vg = VerticalGroup:new{ align = "left" }
-    local dest_label = (self.selected and ("/" .. self.selected)) or folder_str(self.plugin:resolveTarget())
-    table.insert(vg, self:foldersHeader(_("Destination: ") .. dest_label))
+    -- The whole page fills the screen (the delete browser's rule): the tree
+    -- rows plus the page-nav strip plus the Default footer below it must
+    -- exactly match the card's inner height, so rows are counted from the
+    -- measured chrome, not guessed.
+    local tb_size = title_bar.getSize and title_bar:getSize()
+    self.title_h = (tb_size and tb_size.h) or sc(80)
 
-    if self.list_err then
-        -- The reader is unreachable: ONLY this message, nothing else.
-        table.insert(vg, TextBoxWidget:new{
-            text = _("Device not found. Please check Xteink IP, and confirm that it matches in Connections."),
-            face = Font:getFace("smallinfofont"),
-            width = self.row_w,
-        })
-    else
-        table.insert(vg, self:foldersHeader(_("Folders on the reader")))
-        local nodes = self.nodes or {}
-        if #nodes > 0 then
-            -- Long trees slice into pages (the picker's recipe); the page
-            -- clamps when the tree shortens. Default stays visible below.
-            self:appendPaged(vg)
-        else
-            table.insert(vg, TextBoxWidget:new{
-                text = _("No folders on the reader."),
-                face = Font:getFace("smallinfofont"),
-                width = self.row_w,
-            })
-        end
-        table.insert(vg, self:foldersHeader(_("Default")))
-        table.insert(vg, self:plainRow(_("CrossDropped Files (back to the default)"),
-            function() self:pick("CrossDropped Files") end))
-    end
+    local vg = VerticalGroup:new{ align = "left" }
+    self:renderInto(vg, inner_w, (sh - pad * 2) - self.title_h - sc(16))
 
     local frame = FrameContainer:new{
         dimen = Geom:new{ w = sw, h = sh },
@@ -852,6 +1205,12 @@ end
 -- Paged rendering (the picker's device-proven recipe): long trees slice
 -- into pages with Previous/Next rows; the page clamps when the tree
 -- shortens. The Default section always stays visible under the tree.
+-- Paged rendering in the DELETE browser's exact presentation (hairline
+-- separators between rows, a caption plus boxed Previous/Next strip) — the
+-- two trees now read as the same screen. The strip is strapped to the very
+-- bottom of the card: a flexible spacer under the last tree row soaks up
+-- whatever the measured rows left over, saving exactly the room the Default
+-- footer (measured into self.default_h at init) needs below it.
 function DestinationDialog:appendPaged(vg)
     local sc = function(v) return Device.screen:scaleBySize(v) end
     local rows = self:visibleRows()
@@ -876,22 +1235,37 @@ function DestinationDialog:appendPaged(vg)
         else
             self:treeRowInto(vg, r.node, indent)
         end
+        if i < hi then
+            table.insert(vg, self:separator())
+        end
     end
-    -- Page navigation: the caption plus only the buttons that apply.
+    -- Page navigation: the delete browser's strip — separator, caption,
+    -- boxed rows, only the buttons that apply — bottom-tacked by the
+    -- flexible filler, with the Default footer still below it on the card.
     if #rows > rpp then
-        table.insert(vg, VerticalSpan:new{ width = sc(10) })
-        table.insert(vg, TextBoxWidget:new{
-            text = string.format(_("Page %d of %d"), self.page, max_page),
-            face = Font:getFace("xx_smallinfofont"),
-            width = self.row_w,
-        })
+        local strip = VerticalGroup:new{ align = "left" }
+        table.insert(strip, self:separator())
+        table.insert(strip, self:caption(string.format(_("Page %d of %d"), self.page, max_page)))
+        table.insert(strip, VerticalSpan:new{ width = sc(2) })
         if self.page > 1 then
-            table.insert(vg, self:plainRow(_("Previous page"),
+            table.insert(strip, self:menuRow(_("Previous page"),
                 function() self:gotoPage(self.page - 1) end))
         end
         if hi < #rows then
-            table.insert(vg, self:plainRow(_("Next page"),
+            table.insert(strip, self:menuRow(_("Next page"),
                 function() self:gotoPage(self.page + 1) end))
+        end
+        if self.content_h then
+            local busy = (vg.getSize and vg:getSize().h) or 0
+            local strip_h = (strip.getSize and strip:getSize().h) or 0
+            local filler = math.floor(math.max(0,
+                self.content_h - busy - strip_h - (self.default_h or 0)))
+            if filler > 0 then
+                table.insert(vg, VerticalSpan:new{ width = filler })
+            end
+        end
+        for i = 1, #strip do
+            table.insert(vg, strip[i])
         end
     end
 end
@@ -917,6 +1291,7 @@ function DestinationDialog:treeRowInto(vg, node, indent)
         width = sc(TREE_ARROW_W),
         align = "center",
         bordersize = 0,
+        radius = Size.radius.button - 1, -- -1: core's unhighlight resets radius == Size.radius.button to nil, squaring the button after first tap
         padding_h = 0,
         avoid_text_truncation = false,
         text_font_face = "smallinfofont",
@@ -933,6 +1308,7 @@ function DestinationDialog:treeRowInto(vg, node, indent)
         width = math.max(self.row_w - indent - sc(TREE_ARROW_W), 1),
         align = "left",
         bordersize = 0,
+        radius = Size.radius.button - 1, -- -1: core's unhighlight resets radius == Size.radius.button to nil, squaring the button after first tap
         padding_h = Size.padding.large,
         avoid_text_truncation = false,
         text_font_face = "smallinfofont",
@@ -954,6 +1330,7 @@ function DestinationDialog:plainRow(text, callback)
         width = self.row_w,
         align = "left",
         bordersize = 0,
+        radius = Size.radius.button - 1, -- -1: core's unhighlight resets radius == Size.radius.button to nil, squaring the button after first tap
         padding_h = Size.padding.large,
         avoid_text_truncation = false,
         text_font_face = "smallinfofont",
@@ -977,6 +1354,42 @@ function DestinationDialog:foldersHeader(text)
             text = text,
             face = Font:getFace("smallinfofont"),
         },
+    }
+end
+
+-- The delete browser's exact presentation pieces (hairline separators, the
+-- page caption, boxed page-nav rows), so the destination tree and the delete
+-- tree read as ONE screen (they share the whole tree system).
+function DestinationDialog:separator()
+    local sc = function(v) return Device.screen:scaleBySize(v) end
+    return VerticalGroup:new{
+        VerticalSpan:new{ width = sc(2) },
+        LineWidget:new{
+            dimen = Geom:new{ w = self.row_w, h = Size.line.thick },
+            background = Blitbuffer.COLOR_LIGHT_GRAY,
+        },
+        VerticalSpan:new{ width = sc(2) },
+    }
+end
+
+function DestinationDialog:caption(text)
+    return TextBoxWidget:new{
+        text = text,
+        face = Font:getFace("smallinfofont"),
+        width = self.row_w,
+    }
+end
+
+function DestinationDialog:menuRow(text, callback)
+    return Button:new{
+        text = text,
+        menu_style = true,
+        -- Explicit radius so the tap highlight inverts the WHOLE box: core's
+        -- Button flash uses a rounded rect whenever radius is nil, which on
+        -- our square buttons reads as a blob that skips the corners.
+        radius = Size.radius.button - 1, -- -1: core's unhighlight resets radius == Size.radius.button to nil, squaring the button after first tap
+        width = self.row_w,
+        callback = callback,
     }
 end
 
@@ -1126,6 +1539,10 @@ function FolderMenuDialog:menuRow(row_w, text, callback)
     return Button:new{
         text = text,
         menu_style = true,
+        -- Explicit radius so the tap highlight inverts the WHOLE box: core's
+        -- Button flash uses a rounded rect whenever radius is nil, which on
+        -- our square buttons reads as a blob that skips the corners.
+        radius = Size.radius.button - 1, -- -1: core's unhighlight resets radius == Size.radius.button to nil, squaring the button after first tap
         width = row_w,
         callback = callback,
     }
@@ -1136,14 +1553,15 @@ function FolderMenuDialog:onBack()
     return true
 end
 
--- Open the destination folder tree. The root listing is one bounded attempt
--- (socketutil); if the reader does not answer, the tree opens with ONLY the
--- "Device not found…" message — nothing to retry or type around. No
--- "Looking up…" notice first: against a reachable reader the listing returns
--- in milliseconds, and the notice's show/close repaint cycle both added a
--- paint to every open and raced the tree's first paint (a stale region
--- half-covered it). The tree paints in ONE flashless "ui" pass, exactly
--- like the picker.
+-- Choose the destination: the folder tree opens INSIDE the Send tab (below
+-- the brand header and tabs), never as a stacked full-screen dialog. The
+-- root listing is one bounded attempt (socketutil); if the reader does not
+-- answer, the tree opens with ONLY the "Device not found…" message — nothing
+-- to retry or type around. No "Looking up…" notice first: against a
+-- reachable reader the listing returns in milliseconds, and the notice's
+-- show/close repaint cycle both added a paint to every open and raced the
+-- tree's first paint. The browser object is parked on Home so its state
+-- (expanded nodes, page) survives leaving; each open re-lists the root.
 function HomeDialog:chooseDestination()
     local InfoMessage = require("ui/widget/infomessage")
     local target = self.plugin:resolveTarget()
@@ -1161,13 +1579,22 @@ function HomeDialog:chooseDestination()
             nodes[#nodes + 1] = new_node(name, name, 0)
         end
     end
-    UIManager:show(DestinationDialog:new{
-        plugin = self.plugin,
-        home = self,
-        nodes = nodes,
-        list_err = not ok,
-    }, "ui")
-    UIManager:forceRePaint()
+    if self.dest_browser then
+        self.dest_browser.nodes = nodes
+        self.dest_browser.list_err = not ok
+        self.dest_browser.page = nil
+        self.dest_browser.rows_per_page = nil
+    else
+        self.dest_browser = DestinationDialog:new{
+            plugin = self.plugin,
+            home = self,
+            nodes = nodes,
+            list_err = not ok,
+        }
+    end
+    self.tab = "send"
+    self.send_screen = "destination"
+    self:refresh()
 end
 
 -- The Delete Folders/Files tab body: its own screen (never mixed into Send
@@ -1191,7 +1618,9 @@ function HomeDialog:renderDelete()
 end
 
 -- Open the delete tree: the destination tree's system, listing FILES too.
--- Same shape as chooseDestination — one flashless "ui" pass, no notice.
+-- Inline like everything else — the tree paints into the Delete tab's
+-- content region, so the brand header and tabs stay on screen. Same shape
+-- as chooseDestination: one flashless "ui" pass, no notice.
 function HomeDialog:openDeleteTree()
     local InfoMessage = require("ui/widget/infomessage")
     local target = self.plugin:resolveTarget()
@@ -1211,13 +1640,22 @@ function HomeDialog:openDeleteTree()
             nodes[#nodes + 1] = n
         end
     end
-    UIManager:show(DeleteDialog:new{
-        plugin = self.plugin,
-        home = self,
-        nodes = nodes,
-        list_err = not ok,
-    }, "ui")
-    UIManager:forceRePaint()
+    if self.delete_browser then
+        self.delete_browser.nodes = nodes
+        self.delete_browser.list_err = not ok
+        self.delete_browser.page = nil
+        self.delete_browser.rows_per_page = nil
+    else
+        self.delete_browser = DeleteDialog:new{
+            plugin = self.plugin,
+            home = self,
+            nodes = nodes,
+            list_err = not ok,
+        }
+    end
+    self.tab = "delete"
+    self.delete_screen = "tree"
+    self:refresh()
 end
 
 -- ───────────────────── delete tab (files & folders) ─────────────────────
@@ -1278,13 +1716,26 @@ function DeleteDialog:removeNode(path)
     return walk(self.nodes or {})
 end
 
-function DeleteDialog:rebuild()
+function DeleteDialog:repaint()
+    if self.home and type(self.home.refresh) == "function" then
+        self.home:refresh()
+        return
+    end
     self:init()
     UIManager:setDirty(self, "ui")
     UIManager:forceRePaint()
 end
 
+function DeleteDialog:rebuild()
+    self:repaint()
+end
+
 function DeleteDialog:leave()
+    if self.home and type(self.home.refresh) == "function" then
+        self.home.delete_screen = nil
+        self.home:refresh()
+        return
+    end
     local home = self.home
     UIManager:close(self)
     UIManager:nextTick(function()
@@ -1486,19 +1937,34 @@ function DeleteDialog:appendPaged(vg)
             table.insert(vg, self:separator())
         end
     end
-    -- Page navigation: the picker's shape — separator, caption, boxed rows,
-    -- and only the buttons that apply.
+    -- The page-nav strip: the picker's shape — separator, caption, boxed
+    -- rows. It is strapped to the VERY BOTTOM of the card: a flexible
+    -- spacer under the last tree row soaks up whatever the measured rows
+    -- left over, so an always-on-screen pager sits on the bottom edge
+    -- (never a dead band above it, and never pushed below the fold).
     if #rows > rpp then
-        table.insert(vg, self:separator())
-        table.insert(vg, self:caption(string.format(_("Page %d of %d"), self.page, max_page)))
-        table.insert(vg, VerticalSpan:new{ width = sc(2) })
+        local strip = VerticalGroup:new{ align = "left" }
+        table.insert(strip, self:separator())
+        table.insert(strip, self:caption(string.format(_("Page %d of %d"), self.page, max_page)))
+        table.insert(strip, VerticalSpan:new{ width = sc(2) })
         if self.page > 1 then
-            table.insert(vg, self:menuRow(_("Previous page"),
+            table.insert(strip, self:menuRow(_("Previous page"),
                 function() self:gotoPage(self.page - 1) end))
         end
         if hi < #rows then
-            table.insert(vg, self:menuRow(_("Next page"),
+            table.insert(strip, self:menuRow(_("Next page"),
                 function() self:gotoPage(self.page + 1) end))
+        end
+        if self.content_h then
+            local busy = (vg.getSize and vg:getSize().h) or 0
+            local strip_h = (strip.getSize and strip:getSize().h) or 0
+            local filler = math.floor(math.max(0, self.content_h - busy - strip_h))
+            if filler > 0 then
+                table.insert(vg, VerticalSpan:new{ width = filler })
+            end
+        end
+        for i = 1, #strip do
+            table.insert(vg, strip[i])
         end
     end
 end
@@ -1529,6 +1995,10 @@ function DeleteDialog:menuRow(text, callback)
     return Button:new{
         text = text,
         menu_style = true,
+        -- Explicit radius so the tap highlight inverts the WHOLE box: core's
+        -- Button flash uses a rounded rect whenever radius is nil, which on
+        -- our square buttons reads as a blob that skips the corners.
+        radius = Size.radius.button - 1, -- -1: core's unhighlight resets radius == Size.radius.button to nil, squaring the button after first tap
         width = self.row_w,
         callback = callback,
     }
@@ -1536,9 +2006,7 @@ end
 
 function DeleteDialog:gotoPage(n)
     self.page = math.max(1, n)
-    self:init()
-    UIManager:setDirty(self, "ui")
-    UIManager:forceRePaint()
+    self:repaint()
 end
 
 -- One tree row: folders carry the ▸/▾ control, files just a spacer in its
@@ -1554,6 +2022,7 @@ function DeleteDialog:treeRowInto(vg, node, indent)
             width = sc(TREE_ARROW_W),
             align = "center",
             bordersize = 0,
+            radius = Size.radius.button - 1, -- -1: core's unhighlight resets radius == Size.radius.button to nil, squaring the button after first tap
             padding_h = 0,
             avoid_text_truncation = false,
             text_font_face = "smallinfofont",
@@ -1566,6 +2035,7 @@ function DeleteDialog:treeRowInto(vg, node, indent)
         width = math.max(self.row_w - indent - sc(TREE_ARROW_W), 1),
         align = "left",
         bordersize = 0,
+        radius = Size.radius.button - 1, -- -1: core's unhighlight resets radius == Size.radius.button to nil, squaring the button after first tap
         padding_h = Size.padding.large,
         avoid_text_truncation = false,
         text_font_face = "smallinfofont",
@@ -1579,6 +2049,68 @@ function DeleteDialog:treeRowInto(vg, node, indent)
     })
 end
 
+-- INLINE render (everything below the brand + tabs): paint the delete tree
+-- into an existing VerticalGroup bounded by the tab content region. The old
+-- TitleBar's subtitle becomes a plain leading caption ("N item(s) at the
+-- root — tap a name to delete"); rows/pager bottom-tack against the AREA
+-- height exactly like the old full-screen card. Shared by the tab content
+-- builder AND the standalone init() below.
+function DeleteDialog:renderInto(vg, area_w, area_h)
+    local sc = function(v) return Device.screen:scaleBySize(v) end
+    if area_w then self.row_w = area_w end
+    if area_h then self.content_h = area_h end
+
+    -- Rows per page MEASURED from one real row PLUS its hairline separator
+    -- (the panel's fonts and paddings decide, not a guessed row height — a
+    -- guessed count once put the page-nav rows themselves below the fold,
+    -- so long folders looked unscrollable). The budget below the tree is
+    -- the page-nav strip probed in its TALLEST form (both Previous and Next
+    -- visible) plus the leading caption; a shorter strip leaves room the
+    -- bottom-tack filler absorbs. Setting self.rows_per_page before init
+    -- skips the probe (how the tests pin it).
+    if not self.rows_per_page then
+        local probe = VerticalGroup:new{}
+        self:treeRowInto(probe, new_node("sample", "sample", 0), 0)
+        table.insert(probe, self:separator())
+        local rh = (probe:getSize() and probe:getSize().h) or sc(60)
+        local cap_probe = self:caption("probe")
+        local cap_h = (cap_probe.getSize and cap_probe:getSize().h) or sc(30)
+        local strip = VerticalGroup:new{ align = "left" }
+        table.insert(strip, self:separator())
+        table.insert(strip, self:caption(string.format(_("Page %d of %d"), 1, 1)))
+        table.insert(strip, VerticalSpan:new{ width = sc(2) })
+        table.insert(strip, self:menuRow(_("Previous page"), function() end))
+        table.insert(strip, self:menuRow(_("Next page"), function() end))
+        local strip_h = (strip:getSize() and strip:getSize().h) or sc(150)
+        self.rows_per_page = math.max(1,
+            math.floor((self.content_h - cap_h - strip_h) / math.max(rh, 1)))
+    end
+
+    if self.list_err then
+        table.insert(vg, TextBoxWidget:new{
+            text = _("Device not found. Please check Xteink IP, and confirm that it matches in Connections."),
+            face = Font:getFace("smallinfofont"),
+            width = self.row_w,
+        })
+        return
+    end
+    -- The TitleBar's subtitle lives on as a plain leading caption.
+    table.insert(vg, self:caption(string.format(
+        _("%d item(s) at the root \226\128\148 tap a name to delete"), #(self.nodes or {}))))
+    local nodes = self.nodes or {}
+    if #nodes > 0 then
+        -- Long lists slice into pages (the picker's recipe); the page
+        -- clamps when a deletion shortens the tree.
+        self:appendPaged(vg)
+    else
+        table.insert(vg, TextBoxWidget:new{
+            text = _("Nothing on the reader."),
+            face = Font:getFace("smallinfofont"),
+            width = self.row_w,
+        })
+    end
+end
+
 function DeleteDialog:init()
     local sc = function(v) return Device.screen:scaleBySize(v) end
     local sw = Device.screen:getWidth()
@@ -1587,19 +2119,6 @@ function DeleteDialog:init()
     local pad = Size.padding.default
     local inner_w = sw - pad * 2
     self.row_w = inner_w
-    -- Rows per page MEASURED from one real row PLUS its hairline separator
-    -- (the panel's fonts and paddings decide, not a guessed row height — a
-    -- guessed count once put the page-nav rows themselves below the fold,
-    -- so long folders looked unscrollable). The allowance covers the title
-    -- bar, the subtitle, and the page-nav rows below the tree. Setting
-    -- self.rows_per_page before init skips the probe (how the tests pin it).
-    if not self.rows_per_page then
-        local probe = VerticalGroup:new{}
-        self:treeRowInto(probe, new_node("sample", "sample", 0), 0)
-        table.insert(probe, self:separator())
-        local rh = (probe:getSize() and probe:getSize().h) or sc(60)
-        self.rows_per_page = math.max(5, math.floor((sh - sc(290)) / math.max(rh, 1)))
-    end
 
     -- The picker's TitleBar shape: title + a subtitle line that says what
     -- the page holds and how to act on it.
@@ -1619,27 +2138,14 @@ function DeleteDialog:init()
         show_parent = self,
     }
 
+    -- The whole page fills the screen edge to edge: the tree rows plus the
+    -- page-nav strip at the bottom must exactly match the card's inner
+    -- height, so rows are counted from the measured chrome, not guessed.
+    local tb_size = title_bar.getSize and title_bar:getSize()
+    self.title_h = (tb_size and tb_size.h) or sc(80)
+
     local vg = VerticalGroup:new{ align = "left" }
-    if self.list_err then
-        table.insert(vg, TextBoxWidget:new{
-            text = _("Device not found. Please check Xteink IP, and confirm that it matches in Connections."),
-            face = Font:getFace("smallinfofont"),
-            width = self.row_w,
-        })
-    else
-        local nodes = self.nodes or {}
-        if #nodes > 0 then
-            -- Long lists slice into pages (the picker's recipe); the page
-            -- clamps when a deletion shortens the tree.
-            self:appendPaged(vg)
-        else
-            table.insert(vg, TextBoxWidget:new{
-                text = _("Nothing on the reader."),
-                face = Font:getFace("smallinfofont"),
-                width = self.row_w,
-            })
-        end
-    end
+    self:renderInto(vg, inner_w, (sh - pad * 2) - self.title_h - sc(16))
 
     local frame = FrameContainer:new{
         dimen = Geom:new{ w = sw, h = sh },
@@ -1752,6 +2258,10 @@ function DeleteConfirmDialog:menuRow(row_w, text, callback)
     return Button:new{
         text = text,
         menu_style = true,
+        -- Explicit radius so the tap highlight inverts the WHOLE box: core's
+        -- Button flash uses a rounded rect whenever radius is nil, which on
+        -- our square buttons reads as a blob that skips the corners.
+        radius = Size.radius.button - 1, -- -1: core's unhighlight resets radius == Size.radius.button to nil, squaring the button after first tap
         width = row_w,
         callback = callback,
     }
