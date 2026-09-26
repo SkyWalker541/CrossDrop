@@ -7,6 +7,8 @@
 Send books from **KOReader** to your **Xteink (CrossPoint)** e-ink reader over
 Wi-Fi — no cable, no cloud.
 
+📦 **Also available in the Storefront plugin** — open Tools → Storefront, search "CrossDrop", and tap Install. No manual file copying needed.
+
 ## What it does
 
 - A full-screen CrossDrop dashboard (**Connections** / **Send A File** /
