@@ -19,10 +19,13 @@ keeps the old behavior.
 
 One connection is supported, matching the reader's File Transfer mode:
 
-    WiFi          File Transfer → Join Network   (address shown on screen)
+    WiFi          File Transfer → Join a Network  (address shown on screen)
 
-Its stored IP is set on the Connections tab. Sending a book probes it and
-streams the book to the reader over the shared Wi-Fi network.
+Its stored IP is set on the Connections tab — the everyday "Set WiFi IP"
+method, or a router-fixed address picked from the separate Stored Devices
+list (a selection wins the connection while one is set). Sending a book
+probes the active target and streams the book to the reader over the shared
+Wi-Fi network.
 
 Pure LuaSocket (part of KOReader) — no external dependencies, and the file is
 streamed chunk-by-chunk from disk so devices with little RAM (like a Kindle)
@@ -61,11 +64,25 @@ local _ = require("gettext")
 
 local DEFAULT_FOLDER = "/CrossDropped Files"
 
+-- UTF-8 named constants (replaces inline byte escapes for readability)
+local ELLIPSIS = "…"
+local EM_DASH = "—"
+local ARROW = "→"
+local BULLET = "•"
+local LDQUO = "“"
+local RDQUO = "”"
+local LSQUO = "‘"
+local RSQUO = "’"
+
+-- Version from _meta.lua (single source of truth)
+local META = require("_meta")
+local VERSION = META.version or "1.0.0"
+
 -- Shown by the fast fail-fast guards on single-op network calls (folder
 -- listings, deletes) when the radio is off but has a stored IP: instant,
 -- actionable feedback instead of a silent bounded-timeout hang.
 local WIFI_OFF_MSG =
-    _("Wi-Fi is off on this device. Turn it on (Menu → Wi-Fi connection) — CrossDrop connects for you on send/check.")
+    _("Wi-Fi is off on this device. Turn it on (Menu " .. ARROW .. " Wi-Fi connection) " .. EM_DASH .. " CrossDrop connects for you on send/check.")
 
 -- UI extras (toast, waiting dialog, full-screen Home) are sibling modules in
 -- this plugin folder. They must be required at plugin load (the Storefront
@@ -83,13 +100,239 @@ local function progressModule() return progress_mod end
 local function homeModule() return home_mod end
 local function pickerModule() return picker_mod end
 
+-- CrossDrop's visible-text-offset resolver (KOReaderSync parity). Required
+-- lazily + pcall'd so a missing/broken crossdrop_visible.lua never takes the
+-- whole plugin down. Every other optional dependency in this file degrades
+-- gracefully the same way.
+local visible_mod, visible_tried
+local function visibleModule()
+    if not visible_tried then
+        visible_tried = true
+        local ok, m = pcall(require, "crossdrop_visible")
+        visible_mod = ok and m or false
+    end
+    return visible_mod
+end
+
+-- CrossPoint extended position format (matches CompactPosition from firmware):
+-- pctQ: percentage × 1,000,000 (0–1,000,000)
+-- spine: spine (chapter) index (uint16)
+-- page: page within spine (uint16)
+-- pages: spine page count (uint16)
+-- para: paragraph index (uint16, optional)
+-- li: list item count (uint16, optional)
+-- anchor: nearest <a id> anchor (string ≤ 48 bytes, optional)
+-- xpath: KOReader-style xpath (string ≤ 120 bytes, optional)
+local function getCrossPointPosition(file_path, doc)
+    local lfs = require("libs/libkoreader-lfs")
+    local DataStorage = require("datastorage")
+    local docsettings_dir = DataStorage:getDocSettingsDir() .. "/"
+    local docsettings_hash_dir = DataStorage:getDocSettingsHashDir() .. "/"
+    local filename = file_path:match("([^/]+)$") or file_path
+    -- Mirror frontend/docsettings.lua: the sidecar folder is the book path
+    -- minus its LAST suffix plus ".sdr", holding "metadata.<last suffix>.lua"
+    -- with the suffix's case preserved (metadata.epub.lua for .epub,
+    -- metadata.EPUB.lua for .EPUB). "doc" mode puts that next to the book, the
+    -- "dir" location rebases it under DataStorage:getDocSettingsDir().
+    local last_suffix = filename:match("%.([^%.]+)$") or "_"
+    local stripped = (file_path:match("(.*)%.") or file_path)
+    local doc_sidecar_dir = stripped .. ".sdr"
+    local dir_sidecar_dir = docsettings_dir .. stripped .. ".sdr"
+
+    local candidates = {
+        doc_sidecar_dir .. "/metadata." .. last_suffix .. ".lua",          -- doc mode (verified)
+        doc_sidecar_dir .. "/metadata." .. last_suffix .. ".lua.old",      -- doc mode backup
+        doc_sidecar_dir .. "/" .. filename .. ".lua",                       -- legacy doc sidecar
+        dir_sidecar_dir .. "/metadata." .. last_suffix .. ".lua",          -- dir mode
+        dir_sidecar_dir .. "/metadata." .. last_suffix .. ".lua.old",      -- dir mode backup
+        docsettings_hash_dir .. filename:gsub("%.", "_") .. ".lua",        -- hash mode (best effort)
+    }
+
+    local progress_data = nil
+    for _, path in ipairs(candidates) do
+        if lfs.attributes(path, "mode") == "file" then
+            local ok, data = pcall(dofile, path)
+            if ok and data and data.percent_finished then
+                progress_data = data
+                break
+            end
+        end
+    end
+
+    -- If the document is currently open and matches this file, use its LIVE
+    -- position (spine/page) instead of the persisted sidecar, which may be stale.
+    local live_spine, live_page, live_pages
+    if doc and doc.file and doc.file == file_path then
+        if doc.getSpineIndex then
+            live_spine = doc:getSpineIndex()
+        end
+        if doc.getCurrentPage then
+            live_page = doc:getCurrentPage()
+        end
+        if doc.getPageCount then
+            live_pages = doc:getPageCount()
+        end
+    end
+
+    if not progress_data and not live_spine and not live_page then
+        return nil
+    end
+
+    local pctQ = 0
+    if progress_data then
+        pctQ = math.floor((progress_data.percent_finished or 0) * 1000000 + 0.5)
+        if pctQ < 0 then pctQ = 0 end
+        if pctQ > 1000000 then pctQ = 1000000 end
+    end
+
+    -- Prefer LIVE xpointer from the open document (ReaderRolling/KOSync style).
+    -- The sidecar's last_xpointer can be stale if it hasn't been flushed since
+    -- the last page turn, and feeding a stale xpath into the offset resolver
+    -- while spine/page are live produces an inconsistent (wrong) offset.
+    local live_xpath
+    if doc and doc.file == file_path and doc.getXPointer then
+        local ok, xp = pcall(doc.getXPointer, doc)
+        if ok and xp and xp ~= "" then live_xpath = xp end
+    end
+
+    local xpath = live_xpath or (progress_data and progress_data.last_xpointer)
+
+    -- Extract spine/page info from xpointer if available
+    local spine = live_spine or 0
+    local page = live_page or 1
+    local pages = live_pages or 1
+    local para = 0
+    local anchor = nil
+
+    if xpath then
+        -- Try to extract spine index from xpath like /body/DocFragment[8]/...
+        -- Device-verified (2026-09-26): CrossPoint's progress.bin spineIndex is
+        -- the 0-based OPF <spine> itemref order, but KOReader's DocFragment[N]
+        -- is 1-based (XPath-style), so the raw number overshoots by one chapter
+        -- (user at Chapter 4 = DocFragment[15] was written as spine 15 and the
+        -- reader opened Chapter 5). Subtract 1 to land on the right chapter.
+        local spine_match = xpath:match("DocFragment%[(%d+)%]")
+        if spine_match and not live_spine then
+            spine = (tonumber(spine_match) or 1) - 1
+            if spine < 0 then spine = 0 end
+        end
+    end
+
+    -- Use page info from sidecar if available and no live page
+    if progress_data and progress_data.page and not live_page then
+        page = progress_data.page
+    end
+
+    -- Compute visibleTextOffset from the xpointer via the lazy-loaded module.
+    -- The module encapsulates the same ParagraphStreamer logic the reader uses
+    -- for its page LUT, so the offset matches getPageForVisibleTextOffset().
+    local visibleOffset = nil
+    local ok_vm, vm = pcall(visibleModule)
+    if not ok_vm then
+    end
+    local vm = vm
+    if xpath and file_path and vm and vm.resolve then
+        local ok, res = pcall(vm.resolve, file_path, spine, xpath)
+        if ok and res and res.offset then
+            visibleOffset = res.offset
+        end
+    end
+
+    return {
+        pctQ = pctQ,
+        spine = spine,
+        page = page,
+        pages = pages,
+        para = para,
+        li = 0,
+        anchor = anchor,
+        xpath = xpath,
+        visibleOffset = visibleOffset,
+    }
+end
+
+-- ───────────────────── crosspoint cache-dir hash (verified) ─────────────────────
+
+-- The X3's cache dir for a book is `/.crosspoint/epub_<hash>` where `<hash>` is
+-- std::hash<std::string> of the DEVICE-SIDE path (e.g. "/CrossDropped
+-- Files/Worm.epub") as computed by this firmware's libstdc++ — the 32-bit
+-- _Hash_bytes (MurmurHash2) with seed 0xc70f6907 and m 0x5bd1e995 running on a
+-- 32-bit size_t. Device-verified twice: the reader created `epub_1293787078`
+-- for "/CrossDropped Files/HashProbe Test.epub" and `murmur2_32` of the
+-- Butcher's path equals the dir (1735301347) that restored a mid-book open.
+-- All stages are uint32. NOTE: hashes shorter than 4 bytes (rare paths) take
+-- the early-return; the reader's dirs only ever derive from real book paths.
+local function crosspointHash(path)
+    local bitops = require("bit")
+    local M = 0x5bd1e995
+    local h = bitops.bxor(0xc70f6907, #path)
+    local p = 1
+    local n = #path
+    local function mul(a, b)
+        -- 32-bit multiply (a*b) mod 2^32 without 64-bit ints: split b
+        local bhi = math.floor(b / 65536)
+        local blo = b - bhi * 65536
+        local lo = (a * blo) % 4294967296
+        local hi = ((a * bhi) % 65536) * 65536
+        return (lo + hi) % 4294967296
+    end
+    while n - p + 1 >= 4 do
+        local b1, b2, b3, b4 = path:byte(p, p + 3)
+        local k = b1 + b2 * 256 + b3 * 65536 + b4 * 16777216
+        k = mul(k, M)
+        k = bitops.bxor(k, bitops.rshift(k, 24))
+        k = mul(k, M)
+        h = bitops.bxor(mul(h, M), k)
+        p = p + 4
+    end
+    local tail = n - p + 1
+    if tail > 0 then
+        local k = 0
+        for i = 0, tail - 1 do
+            k = k + (path:byte(p + i) or 0) * (256 ^ i)
+        end
+        h = mul(bitops.bxor(h, k), M)
+        h = bitops.bxor(h, bitops.rshift(h, 13))
+        h = mul(h, M)
+        h = bitops.bxor(h, bitops.rshift(h, 15))
+        return h
+    end
+    h = bitops.bxor(h, bitops.rshift(h, 13))
+    h = mul(h, M)
+    h = bitops.bxor(h, bitops.rshift(h, 15))
+    return h
+end
+
+-- Which dir name the reader derives for a book at a device-side path: the cache
+-- dir X3 firmware v1.6.0 reads progress.bin from when opening that path.
+local function crosspointCacheDir(device_path)
+    return "/.crosspoint/epub_" .. tostring(crosspointHash(device_path))
+end
+
+-- The 10-byte progress.bin the reader uses for an EPUB: little-endian
+--   spineIndex (u16)  pageNumber (u16)  pageCount (u16)  visibleTextOffset (u32)
+-- spine==0 signals "first text reference" on open, so real writes use spine>=1.
+-- pageNumber 65535 is an ignored stale sentinel. 4/6/10-byte files all parse;
+-- 10-byte is what the reader writes itself and what we verified restores live.
+local function crosspointProgressBytes(spine, page, pages, visibleOffset)
+    local function u16(v)
+        v = v % 65536
+        return string.char(v % 256, math.floor(v / 256))
+    end
+    local function u32(v)
+        v = v % 4294967296
+        return string.char(v % 256, math.floor(v / 256) % 256, math.floor(v / 65536) % 256, math.floor(v / 16777216) % 256)
+    end
+    return u16(spine or 0) .. u16(page or 0) .. u16(pages or 1) .. u32(visibleOffset or 0)
+end
+
 local CROSSDROP = WidgetContainer:extend{
     name = "crossdrop",
     is_doc_only = false,
     -- Shown on the dashboard's Connections tab so the running build is
     -- always identifiable on the device (KOReader loads plugins once at
     -- startup — a replaced plugin file does nothing until restart).
-    VERSION = "1.6.0",
+    VERSION = VERSION,
 }
 
 local socket, http
@@ -150,7 +393,15 @@ local function networkManager()
     return NetworkMgr_mod
 end
 
--- Keep the device from suspending while a blocking network op runs. On Kobo
+-- CrossDrop's visible-text-offset resolver (KOReaderSync parity). Required
+-- lazily + pcall'd so a missing/broken crossdrop_visible.lua never takes the
+-- whole plugin down. Every other optional dependency in this file degrades
+-- gracefully the same way.
+-- CrossDrop's visible-text-offset resolver (KOReaderSync parity). Required
+-- lazily + pcall'd so a missing/broken crossdrop_visible.lua never takes the
+-- whole plugin down. Every other optional dependency in this file degrades
+-- gracefully the same way.
+
 -- (and other KOReader-managed radios) the Wi-Fi chip is torn down on suspend,
 -- which would kill an in-flight transfer. pcall-guarded: not every build or
 -- platform provides these guards, so this is a strict no-op where they're
@@ -222,6 +473,86 @@ local function setIp(kind, ip)
     end
 end
 
+-- ─────────────────────────── Stored Devices ───────────────────────────
+
+-- Saved devices live OUTSIDE the plugin folder (the same Storefront-style
+-- root collections.json uses: <KOReader data dir>/crossdrop/), so a plugin
+-- update — which replaces this whole folder — never wipes the saved list.
+function CROSSDROP:storedDevicesPath()
+    local base = nil
+    local ok, DataStorage = pcall(require, "datastorage")
+    if ok and DataStorage and type(DataStorage.getDataDir) == "function" then
+        local ok2, dd = pcall(function() return DataStorage:getDataDir() end)
+        if ok2 and type(dd) == "string" and dd ~= "" then
+            base = dd .. "/crossdrop"
+        end
+    end
+    if not base and type(self.path) == "string" then
+        base = tostring(self.path):match("^(.*)/[^/]+$") .. "/crossdrop"
+    end
+    if not base then return nil end
+    local ok3, lfs = pcall(require, "libs/libkoreader-lfs")
+    if ok3 and lfs and type(lfs.mkdir) == "function" then
+        pcall(lfs.mkdir, base)
+    end
+    return base .. "/devices.json"
+end
+
+function CROSSDROP:loadStoredDevices()
+    local path = self:storedDevicesPath()
+    local ok, lfs = pcall(require, "libs/libkoreader-lfs")
+    if not ok or not lfs or not lfs.attributes then return {} end
+    if lfs.attributes(path, "mode") ~= "file" then return {} end
+    local file = io.open(path, "r")
+    if not file then return {} end
+    local content = file:read("*a")
+    file:close()
+    if not content or content == "" then return {} end
+    local okj, data = pcall(require("json").decode, content)
+    if okj and type(data) == "table" then return data end
+    return {}
+end
+
+function CROSSDROP:saveStoredDevices(devices)
+    devices = devices or {}
+    local path = self:storedDevicesPath()
+    local content = require("json").encode(devices)
+    local file = io.open(path, "w")
+    if file then
+        file:write(content)
+        file:close()
+    end
+end
+
+-- The stored device currently marked as the ACTIVE target (devices.json
+-- carries `selected = true` on at most one entry). nil when nothing is
+-- selected — the connection then falls back to the manual "Set WiFi IP" slot.
+function CROSSDROP:selectedDevice()
+    for _, d in ipairs(self:loadStoredDevices()) do
+        if d.selected then return d end
+    end
+    return nil
+end
+
+-- Mark exactly one stored device as the active target (clears every other
+-- device's flag) and persist. Selecting from the Stored Devices menu NEVER
+-- touches the manual crossdrop_wifi_ip slot — the two areas are independent;
+-- a selection merely takes precedence over the manual IP while set.
+function CROSSDROP:selectDevice(dev)
+    if not dev or not dev.name then return nil end
+    local name = tostring(dev.name)
+    local devices = self:loadStoredDevices()
+    for _, d in ipairs(devices) do
+        if tostring(d.name) == name then
+            d.selected = true
+        else
+            d.selected = nil
+        end
+    end
+    self:saveStoredDevices(devices)
+    return self:selectedDevice()
+end
+
 function CROSSDROP:init()
     -- 1.x migration: the single crossdrop_ip setting becomes the WiFi slot.
     if not wifiIp() and G_reader_settings:readSetting("crossdrop_ip") then
@@ -238,6 +569,12 @@ end
 -- carries LuaSocket's error string and `ok` is nil. `timeout` is the socket
 -- timeout in seconds (default: Storefront's file sizes; probes pass short
 -- retrying timeouts so failure is snappy).
+--
+-- `source` may be a plain STRING body (wrapped into an LTN12 source here) or
+-- an LTN12 source function like putFile's chunk reader. Never pass a raw
+-- string straight into http.request: this build's ltn12 tries to CALL it and
+-- dies with "attempt to call local 'src' (a string value)" — the device crash
+-- that silently killed the position write.
 --
 -- FREEZE FIX: raw socket.http forces its OWN 60s connect timeout (http.lua
 -- calls settimeout(http.TIMEOUT) AFTER any custom `create()`), so an
@@ -258,6 +595,17 @@ function CROSSDROP:req(method, url, headers, source_fn, timeout)
         su:set_timeout(timeout, timeout)
     else
         su:set_timeout(su.FILE_BLOCK_TIMEOUT or 15, su.FILE_TOTAL_TIMEOUT or 60)
+    end
+    -- A plain string body becomes an LTN12 source (pipe it out once, then EOF).
+    -- http.request with a raw string source crashes ltn12 — this is the
+    -- one-liner that un-breaks POST /mkdir and /upload (position writes).
+    if type(source_fn) == "string" then
+        local body = source_fn
+        source_fn = function()
+            local block = body
+            body = nil
+            return block
+        end
     end
     local ok, body, code = pcall(http.request, {
         url = url,
@@ -287,17 +635,31 @@ function CROSSDROP:req(method, url, headers, source_fn, timeout)
     return nil, tostring(code or body or "unknown error"), body
 end
 
--- The single connection in send order: WiFi (the reader's File Transfer →
--- Join Network address). Its destination folder comes from the Send A File
--- tab (crossdrop_folder) and falls back to the CrossDropped Files default.
--- The IP is empty until the user sets it.
+-- The connections in send order: the ACTIVE stored device when one is
+-- selected comes FIRST (its router-fixed IP is the preferred target), and
+-- the manual "Set WiFi IP" slot is ALWAYS listed alongside it — so the
+-- Connections-tab connection test probes both and reports whichever answers
+-- first, instead of hiding the manual entry while a stored device is active.
+-- When no stored device is selected the manual slot is the only connection.
+-- The destination folder comes from the Send A File tab (crossdrop_folder)
+-- and falls back to the CrossDropped Files default. An IP is empty until the
+-- user sets it.
 function CROSSDROP:configuredTargets()
     local port = tonumber(G_reader_settings:readSetting("crossdrop_port") or 80) or 80
     local dest = G_reader_settings:readSetting("crossdrop_folder")
     local folder = (dest and dest ~= "") and dest or DEFAULT_FOLDER
-    return {
-        { kind = "wifi", ip = wifiIp() or "", port = port, folder = folder },
+    local targets = {}
+    local selected = self:selectedDevice()
+    if selected then
+        targets[#targets + 1] = {
+            kind = "wifi", ip = tostring(selected.ip or ""), port = port, folder = folder,
+            name = tostring(selected.name or ""), selected = true,
+        }
+    end
+    targets[#targets + 1] = {
+        kind = "wifi", ip = wifiIp() or "", port = port, folder = folder,
     }
+    return targets
 end
 
 -- The connection. Used by dialogs that operate on "the" device (status
@@ -777,45 +1139,50 @@ function CROSSDROP:connectionSummary()
     return table.concat(lines, "\n")
 end
 
--- Edit the WiFi IP. `on_saved` runs after the dialog closes so the open
--- dashboard can repaint.
+-- Saved-device management lives on the dashboard's Connections tab (the
+-- Stored Devices page in crossdrop_home.lua): the add/edit form, the saved
+-- device list, and each device's detail page (Select / Edit / Delete) are
+-- all INLINE pages under the tab bar — popups are only the name/IP input
+-- dialogs and the delete confirmation. The dashboard owns that UI; the
+-- CROSSDROP instance here owns the persistence.
+
+-- "Set WiFi IP" — the everyday manual method: type the reader's current IP
+-- (shown on its File Transfer → Join a Network screen) into a plain input.
+-- This is the ONLY writer of crossdrop_wifi_ip. Stored Devices is a separate
+-- area for router-fixed IPs; while one is selected it wins the connection,
+-- but it never overwrites this slot. `on_saved` runs after the dialog closes
+-- so the open dashboard can repaint.
 function CROSSDROP:editIp(kind, on_saved)
-    local ip_dialog
-    ip_dialog = InputDialog:new{
-        title = _("WiFi IP (File Transfer → Join Network)"),
+    if kind ~= "wifi" then return end
+    local dlg
+    dlg = InputDialog:new{
+        title = _("WiFi IP (File Transfer → Join a Network)"),
         input = wifiIp() or "",
         type = "text",
-        -- modal=true is REQUIRED here: Home is a modal full-screen dialog, and
-        -- UIManager stacks non-modal widgets BELOW an existing modal — a plain
-        -- InputDialog would render behind the dashboard and be unusable.
         modal = true,
         buttons = {
             {
                 {
                     text = _("Save"),
                     callback = function()
-                        local value = ip_dialog:getInputText()
-                        if value then
-                            setIp(kind, value)
-                        end
-                        UIManager:close(ip_dialog)
-                        if on_saved then
-                            on_saved()
-                        end
+                        local value = dlg:getInputText()
+                        if value then setIp("wifi", value) end
+                        UIManager:close(dlg)
+                        UIManager:nextTick(function()
+                            if on_saved then on_saved() end
+                        end)
                     end,
                 },
             },
             {
                 {
                     text = _("Cancel"),
-                    callback = function()
-                        UIManager:close(ip_dialog)
-                    end,
+                    callback = function() UIManager:close(dlg) end,
                 },
             },
         },
     }
-    UIManager:show(ip_dialog)
+    UIManager:show(dlg)
 end
 
 -- GET /api/status on the first reachable connection and show the result.
@@ -934,6 +1301,80 @@ function CROSSDROP:putFile(target, file_path, on_progress)
             or tostring(result or "unknown error")
     end
     return true, result
+end
+
+-- Write a reading position straight into the reader's cache dir the way the
+-- firmware actually reads it: mkdir `/.crosspoint/epub_<hash>` (HTTP POST
+-- /mkdir — WebDAV blocks dot-segments, HTTP does not), then multipart-POST
+-- /upload a 10-byte progress.bin. Non-fatal: a failure never fails the batch,
+-- it only logs, exactly like the old sidecar write.
+--
+-- Ordering matters: uploading a BOOK clears the reader's cache dir for that
+-- path (WebDAV PUT → clearBookCache), so this runs strictly AFTER putFile — as
+-- it does at both call sites. `device_path` is the path the book ended up at
+-- ON the reader (the one hashed at open: "/" + folder + "/" + filename, no
+-- schema, exact case).
+function CROSSDROP:sendCrossPointPosition(target, device_path, position)
+    if not target or not device_path or not position then
+        return
+    end
+    local progress_bytes = crosspointProgressBytes(position.spine, position.page, position.pages, position.visibleOffset)
+    local cache_dir = crosspointCacheDir(device_path)
+    local base = base_url(target)
+
+    -- POST /mkdir (name=epub_<hash>, path=/.crosspoint); 400 "already exists" is fine.
+    local mk_body = "name=epub_" .. tostring(crosspointHash(device_path)) ..
+        "&path=" .. url_encode_segment("/.crosspoint")
+    local mk_ok, mk_result = self:req("POST", base .. "/mkdir",
+        {
+            ["Content-Length"] = tostring(#mk_body),
+            ["Content-Type"] = "application/x-www-form-urlencoded",
+            ["User-Agent"] = "KOReader/crossdrop",
+        },
+        mk_body)
+    if not mk_ok then
+        local code_ok = type(mk_result) == "number" and (mk_result == 200 or mk_result == 400)
+        if not code_ok then
+            logger.warn("crossdrop: could not create position cache dir for ", device_path, ": ", tostring(mk_result))
+            return
+        end
+    end
+
+    -- POST /upload?path=<cache dir>, multipart, filename=progress.bin
+    local boundary = "----CrossDrop" .. tostring(os.time())
+    if not mk_ok then
+        local code_ok = type(mk_result) == "number" and (mk_result == 200 or mk_result == 400)
+        if not code_ok then
+            logger.warn("crossdrop: could not create position cache dir for ", device_path, ": ", tostring(mk_result))
+            return
+        end
+    end
+
+    -- POST /upload?path=<cache dir>, multipart, filename=progress.bin
+    local boundary = "----CrossDrop" .. tostring(os.time())
+    local file_part = "--" .. boundary .. "\r\n"
+        .. 'Content-Disposition: form-data; name="file"; filename="progress.bin"\r\n'
+        .. "Content-Type: application/octet-stream\r\n\r\n"
+        .. progress_bytes .. "\r\n"
+        .. "--" .. boundary .. "--\r\n"
+    local up_url = base .. "/upload?path=" .. encode_path(cache_dir)
+    local up_ok, up_result = self:req("POST", up_url,
+        {
+            ["Content-Length"] = tostring(#file_part),
+            ["Content-Type"] = "multipart/form-data; boundary=" .. boundary,
+            ["User-Agent"] = "KOReader/crossdrop",
+        },
+        file_part)
+    if up_ok then
+        logger.info("crossdrop: wrote position for ", device_path, " (", position.spine, "/", position.page, "/", position.pages, ", offset=", tostring(position.visibleOffset), ")")
+    else
+        -- 400 = the cache dir appeared and already holds a progress.bin (the
+        -- reader reopened the book meanwhile) — that position is at least as fresh.
+        local code_ok = type(up_result) == "number" and up_result == 400
+        if not code_ok then
+            logger.warn("crossdrop: failed to write progress.bin for ", device_path, ": ", tostring(up_result))
+        end
+    end
 end
 
 -- Storefront-style Wi-Fi gate around a blocking network action. If the radio
@@ -1123,7 +1564,6 @@ function CROSSDROP:sendBooksChecked(ordered, sink)
         if not target then
             return false
         end
-
         local batch_start = os.clock()
 
         local batch_ok = true
@@ -1149,6 +1589,22 @@ function CROSSDROP:sendBooksChecked(ordered, sink)
                 end
                 break
             end
+
+            -- If read position sync is enabled, write the position straight
+            -- into the reader's cache dir (progress.bin) — the ONLY thing the
+            -- firmware reads on open. Runs AFTER putFile: a book upload clears
+            -- that cache dir, so ordering is what makes the write stick.
+            local send_read_pos = G_reader_settings:readSetting("crossdrop_send_read_pos") or false
+            if send_read_pos then
+                local doc = (self.ui and self.ui.document and self.ui.document.file == path) and self.ui.document or nil
+                local position = getCrossPointPosition(path, doc)
+                if position then
+                    local folder = tostring(target.folder or DEFAULT_FOLDER):gsub("^/*", ""):gsub("/+$", "")
+                    local device_path = "/" .. folder .. "/" .. (path:match("([^/]+)$") or path)
+                    self:sendCrossPointPosition(target, device_path, position)
+                end
+            end
+
             if sink.onFileSent then sink:onFileSent(path, target) end
             logger.info("crossdrop: sent ", path, " to ", target.kind, " ", target.ip)
         end
@@ -1215,6 +1671,24 @@ function CROSSDROP:sendFileChecked(book_path)
         local ok, result = self:putFile(target, book_path, function(sent, total)
             progress:update(sent / total * 100, sent, total, os.clock() - start)
         end)
+
+        -- If read position sync is enabled, write the position straight
+        -- into the reader's cache dir (progress.bin) — the ONLY thing the
+        -- firmware reads on open. Runs AFTER putFile: a book upload clears
+        -- that cache dir, so ordering is what makes the write stick.
+        if ok then
+            local send_read_pos = G_reader_settings:readSetting("crossdrop_send_read_pos") or false
+            if send_read_pos then
+                local doc = (self.ui and self.ui.document and self.ui.document.file == book_path) and self.ui.document or nil
+                local position = getCrossPointPosition(book_path, doc)
+                if position then
+                    local folder = tostring(target.folder or DEFAULT_FOLDER):gsub("^/*", ""):gsub("/+$", "")
+                    local device_path = "/" .. folder .. "/" .. (book_path:match("([^/]+)$") or book_path)
+                    self:sendCrossPointPosition(target, device_path, position)
+                end
+            end
+        end
+
         UIManager:close(progress)
 
         if ok then

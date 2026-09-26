@@ -96,14 +96,59 @@ json_mod.decode = function(s)
     return v
 end
 
+local function encode_json_value(v, out)
+    if type(v) == "nil" then
+        out:write("null")
+    elseif type(v) == "boolean" then
+        out:write(v and "true" or "false")
+    elseif type(v) == "number" then
+        out:write(("%d"):format(v))
+    elseif type(v) == "string" then
+        -- paths/names/URLs: only backslash, quote and newline need escaping
+        local escaped = v:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n')
+        out:write('"', escaped, '"')
+    elseif type(v) == "table" then
+        local is_array = true
+        for k in pairs(v) do
+            if type(k) ~= "number" then is_array = false break end
+        end
+        out:write(is_array and "[" or "{")
+        local first = true
+        for k, val in pairs(v) do
+            if not first then out:write(",") end
+            first = false
+            if not is_array then
+                out:write('"', tostring(k):gsub('[\\"]', '\\%0'), '":')
+            end
+            encode_json_value(val, out)
+        end
+        out:write(is_array and "]" or "}")
+    else
+        out:write("null")
+    end
+end
+
+json_mod.encode = function(v)
+    local parts = {}
+    parts.write = function(_, ...)
+        for i = 1, select("#", ...) do
+            table.insert(parts, (select(i, ...)))
+        end
+    end
+    encode_json_value(v, parts)
+    return table.concat(parts)
+end
+
 -- ── KOReader module stubs ────────────────────────────────────────────────
 
 -- Geometry emulation: the Kindle PW5 SE reports 1236x1648 (portrait) and
 -- scaleBySize(px) = ceil(px * min(w,h)/600) (see its ffi/framebuffer.lua).
 -- The stubs measure auto-sized text instead of returning {0,0}, so a layout
 -- that runs past the screen edges on the device fails the harness too.
-local SCREEN_W, SCREEN_H = 1236, 1648
-local SCREEN_SCALE = SCREEN_W / 600
+-- (NOT local: the cross-device geometry sweep reassigns these and re-runs the
+-- geometry-sensitive layout at a spread of real screen sizes.)
+SCREEN_W, SCREEN_H = 1236, 1648
+SCREEN_SCALE = SCREEN_W / 600
 local function scal(v) return math.ceil((v or 0) * SCREEN_SCALE) end
 
 local FACE_SIZES = {
@@ -122,7 +167,12 @@ end
 
 local function measure_text(text, face, max_width)
     local fsize = (face and face.s) or 22
-    local cw = math.ceil(fsize * 0.5)
+    -- Model the device: Font:getFace scales the requested size by the screen's
+    -- DPI (scaleBySize) before metrics, so a char is ~0.5em of the SCALED size.
+    -- Unscaled, a 1236px tab bar "fits" any label — the very overflow this
+    -- suite exists to catch. Widths scale with SCREEN_SCALE (re-set by the
+    -- geometry sweep); heights stay unscaled (vertical paging is unaffected).
+    local cw = math.ceil(fsize * 0.5 * SCREEN_SCALE)
     local w, lines = 0, 1
     for part in (tostring(text or "") .. "\n"):gmatch("(.-)\n") do
         w = math.max(w, utf8_chars(part) * cw)
@@ -132,9 +182,29 @@ local function measure_text(text, face, max_width)
     return { w = w, h = lines * math.ceil(fsize * 1.2) }
 end
 
+-- The stubs register the FULL require path as __name (e.g.
+-- "ui/widget/verticalgroup"), but the plugin's real KOReader core classes are
+-- named shortly ("VerticalGroup"). The getSize geometry branches and the
+-- invalid-align guards below used to compare short names, so with full-path
+-- __name they NEVER fired — vertical groups measured as horizontal, every
+-- FrameContainer returned 0x0, and device overflows (like the tab bar running
+-- past the 4th slot) sailed through green. Map the full path to the short
+-- class name the device actually uses.
+local SHORTNAME = {
+    ["ui/widget/verticalspan"] = "VerticalSpan",
+    ["ui/widget/horizontalspan"] = "HorizontalSpan",
+    ["ui/widget/verticalgroup"] = "VerticalGroup",
+    ["ui/widget/horizontalgroup"] = "HorizontalGroup",
+    ["ui/widget/container/framecontainer"] = "FrameContainer",
+    ["ui/widget/container/centercontainer"] = "CenterContainer",
+}
+local function shortname(s)
+    return SHORTNAME[s or ""] or s
+end
+
 local class = {}
 function class:getSize()
-    local name = self.__name
+    local name = shortname(self.__name)
     if name == "VerticalSpan" or name == "HorizontalSpan" then
         local w = self.width or 0
         return { w = name == "HorizontalSpan" and w or 0, h = name == "VerticalSpan" and w or 0 }
@@ -164,8 +234,10 @@ function class:getSize()
             error("FrameContainer:getSize on a childless FrameContainer (crashes the Kindle)")
         end
         local cs = (type(child) == "table" and type(child.getSize) == "function") and child:getSize() or { w = 0, h = 0 }
-        local p = self.padding or 0
-        local b = self.bordersize or 0
+        local p = self.padding
+        if p == nil then p = scal(5) end -- device Size.padding.default = scaleBySize(5)
+        local b = self.bordersize
+        if b == nil then b = scal(1.5) end -- device Size.border.window
         local m = self.margin or 0
         local pad_l = self.padding_left or p
         local pad_r = self.padding_right or p
@@ -205,13 +277,14 @@ function class:new(o)
     -- (nil == left); anything else just logs "[!] invalid alignment" and
     -- paints NOTHING — the whole folder tree was invisible on the Kindle
     -- while every harness check stayed green. Fail here instead.
-    if o.__name == "HorizontalGroup" and o.align ~= nil
+    local o_short = shortname(o.__name)
+    if o_short == "HorizontalGroup" and o.align ~= nil
         and o.align ~= "top" and o.align ~= "center" and o.align ~= "bottom" then
         error(string.format(
             "HorizontalGroup align %q is invalid on the device (top/center/bottom) — it would paint nothing",
             tostring(o.align)))
     end
-    if o.__name == "VerticalGroup" and o.align ~= nil
+    if o_short == "VerticalGroup" and o.align ~= nil
         and o.align ~= "left" and o.align ~= "center" and o.align ~= "right" then
         error(string.format(
             "VerticalGroup align %q is invalid on the device (left/center/right)",
@@ -240,11 +313,80 @@ local DeviceStub = {
     isKindle = function() return true end, -- scan root = /mnt/us (FAKE_FS)
 }
 
+-- KOReader-faithful layout groups. The real HorizontalGroup/VerticalGroup
+-- CACHE _size/_offsets on the first getSize and NEVER recompute — and
+-- paintTo indexes self._offsets[i] for every child. So mutating a group's
+-- child list AFTER it was measured (adding a child, or reusing the measured
+-- table for the real row after a measurement) leaves stale offsets and the
+-- device dies at paint ("attempt to index a nil value", offset missing for a
+-- child that came after the measurement). The old stubs recomputed each call,
+-- so that bug — which crashed the Kindle the moment the dashboard painted —
+-- passed here. This stub caches like the device, and paintTo hard-fails on a
+-- missing offset instead of silently painting nothing.
+local GroupClass = setmetatable({}, { __index = class })
+function GroupClass:getSize()
+    if not self._size then
+        self._size = { w = 0, h = 0 }
+        self._offsets = {}
+        local vertical = shortname(self.__name) == "VerticalGroup"
+        for i = 1, #self do
+            local kid = self[i]
+            local s = (type(kid) == "table" and type(kid.getSize) == "function")
+                and kid:getSize() or { w = 0, h = 0 }
+            if vertical then
+                self._offsets[i] = { x = s.w, y = self._size.h }
+                self._size.h = self._size.h + s.h
+                if s.w > self._size.w then self._size.w = s.w end
+            else
+                self._offsets[i] = { x = self._size.w, y = s.h }
+                self._size.w = self._size.w + s.w
+                if s.h > self._size.h then self._size.h = s.h end
+            end
+        end
+    end
+    return self._size
+end
+function GroupClass:paintTo(bb, x, y)
+    self:getSize()
+    for i = 1, #self do
+        if not self._offsets or not self._offsets[i] then
+            local have = self._offsets and #self._offsets or 0
+            error(string.format(
+                "%s: %d children but only %d layout offsets (measured before the "
+                    .. "children were final) — the tab bar crashed the Kindle with "
+                    .. "horizontalgroup.lua:51 attempt to index a nil value",
+                self.__name, #self, have))
+        end
+        local kid = self[i]
+        if type(kid) == "table" and type(kid.paintTo) == "function" then
+            kid:paintTo(bb, x + self._offsets[i].x, y + self._offsets[i].y)
+        end
+    end
+    return true
+end
+-- Paint simulation: walk every child like the real (recursive) paintTo would,
+-- bottoming out at leaves. Lets tests drive a built widget tree through the
+-- device's paint path so layout-cache faults fail here instead of on-screen.
+function class:paintTo(bb, x, y)
+    for i = 1, #self do
+        local kid = self[i]
+        if type(kid) == "table" and type(kid.paintTo) == "function" then
+            kid:paintTo(bb, x or 0, y or 0)
+        end
+    end
+    return true
+end
+local function _group_stub(name)
+    return GroupClass:extend{ __name = name }
+end
+
 local function widget_stub(name, extra)
+    if name == "ui/widget/horizontalgroup" or name == "ui/widget/verticalgroup" then
+        return _group_stub(name)
+    end
     local c = class:extend{ __name = name }
     return c
 end
-
 local reader_menu_order = { tools = { "read_timer" } }
 local filemanager_menu_order = { tools = { "read_timer" } }
 
@@ -306,6 +448,15 @@ local function fake_attributes(path, what)
     return nil
 end
 
+-- Where plugin data lives in the tests: the Collections file must be written
+-- OUTSIDE the plugin folder (Storefront replaces the whole folder per update),
+-- so the harness DataStorage stub points somewhere far from the plugin dir.
+local HARNESS_DATA_DIR = "/tmp/crossdrop-harness-data"
+-- Each run starts from a pristine data dir: a crashed earlier run can leave
+-- devices.json / collections.json behind, and a leftover "selected" stored
+-- device would silently change what connectedTargets()/probeReachable report.
+os.execute("rm -rf " .. HARNESS_DATA_DIR)
+
 local stubs = {
     ["logger"] = { warn = function() end, info = function() end },
     ["gettext"] = function(s) return s end,
@@ -329,11 +480,41 @@ local stubs = {
     ["ui/elements/filemanager_menu_order"] = filemanager_menu_order,
 }
 
+-- The exact set of KOReader core modules this plugin may require — every one
+-- verified to exist on the target device (frontend/ui/*). Any OTHER ui/ (or
+-- ui/widget/) path is a typo like "ui/widget/container/verticalgroup" — a
+-- path that exists ONLY in this harness's generic widget stub — and would
+-- crash the real plugin at load ("module not found"). The stubs previously
+-- masked that: they accept any ui/ name, so a wrong path passed here and
+-- failed only on the Kindle (AGENTS: verify the exact pattern against core).
+local KNOWN_CORE = {}
+for _, m in ipairs({
+    "ui/uimanager", "ui/size", "ui/geometry", "ui/font", "ui/gesturerange",
+    "ui/widget/button", "ui/widget/confirmbox", "ui/widget/horizontalgroup",
+    "ui/widget/horizontalspan", "ui/widget/iconbutton", "ui/widget/imagewidget",
+    "ui/widget/infomessage", "ui/widget/inputdialog", "ui/widget/linewidget",
+    "ui/widget/notification", "ui/widget/overlapgroup",
+    "ui/widget/textboxwidget", "ui/widget/textwidget", "ui/widget/titlebar",
+    "ui/widget/verticalgroup", "ui/widget/verticalspan",
+    "ui/widget/container/centercontainer", "ui/widget/container/framecontainer",
+    "ui/widget/container/inputcontainer", "ui/widget/container/leftcontainer",
+    "ui/widget/container/movablecontainer", "ui/widget/container/widgetcontainer",
+}) do KNOWN_CORE[m] = true end
+
 local function make_require()
     local real_require = require
     return function(name)
         if stubs[name] then return stubs[name] end
-        if name:match("^ui/widget/") or name:match("^ui/") or name:match("^libs/") then
+        if name:match("^ui/") then
+            if not KNOWN_CORE[name] then
+                error(string.format(
+                    "crossdrop requires core module %q which does not exist on the device "
+                        .. "(frontend/%s.lua) — a stubbed path that would crash the real plugin",
+                    name, tostring(name:gsub("%.", "/"))))
+            end
+            return widget_stub(name)
+        end
+        if name:match("^libs/") then
             return widget_stub(name)
         end
         return real_require(name)
@@ -395,6 +576,9 @@ local FAKE = {
     mkcol_count = 0,        -- first MKCOL -> 201, rest -> 405 (see fake_request)
     mkcol_urls = {},        -- every MKCOL url answered (asserts the parent walk)
     mkcol_returns = nil,    -- optional { [url] = status } to force per-URL replies
+    put_urls = {},          -- every PUT url answered (asserts the position sidecar)
+    post_mkdirs = {},       -- every POST /mkdir url + body (position cache dir)
+    post_uploads = {},      -- every POST /upload url + body (progress.bin)
     delete_urls = {},       -- every DELETE url answered (the delete tab's tree)
     delete_returns = nil,   -- optional { [url] = status } to force per-URL replies
     delete_409_once = nil,  -- optional { [url] = true }: first DELETE -> 409 (not empty), then 204
@@ -464,10 +648,48 @@ local function fake_request(args)
         return "", 204
     end
     if method == "PUT" then
+        FAKE.put_urls[#FAKE.put_urls + 1] = url
         if args and args.source then
             while args.source() do end
         end
         return "", 201
+    end
+    if method == "POST" and url:match("/mkdir") then
+        -- Device-true: ltn12 CALLS args.source and dies on a raw string
+        -- ("attempt to call local 'src' (a string value)") — the real crash the
+        -- position write hit on device. The plugin wraps string bodies first,
+        -- so reaching here with a string is a regression.
+        if type(args.source) == "string" then
+            error("common/ltn12.lua: attempt to call local 'src' (a string value)", 0)
+        end
+        local body = args.source and (function()
+            local out = ""
+            while true do
+                local chunk = args.source()
+                if not chunk then break end
+                out = out .. chunk
+            end
+            return out
+        end)() or ""
+        FAKE.post_mkdirs[#FAKE.post_mkdirs + 1] = { url = url, body = body }
+        return "", 200
+    end
+    if method == "POST" and url:match("/upload") then
+        -- Same device-true guard as /mkdir (see above).
+        if type(args.source) == "string" then
+            error("common/ltn12.lua: attempt to call local 'src' (a string value)", 0)
+        end
+        local body = args.source and (function()
+            local out = ""
+            while true do
+                local chunk = args.source()
+                if not chunk then break end
+                out = out .. chunk
+            end
+            return out
+        end)() or ""
+        FAKE.post_uploads[#FAKE.post_uploads + 1] = { url = url, body = body }
+        return "", 200
     end
     return "not found", 404
 end
@@ -581,6 +803,15 @@ stubs["libs/libkoreader-lfs"] = {
         return iter, path
     end,
     currentdir = function() return "/tmp" end,
+}
+
+-- data outside the plugin folder: the presence stub serves the same role as
+-- real KOReader's datastorage, so getCollectionsPath resolves under it and
+-- never inside crossdrop.koplugin/ (which Storefront replaces whole).
+stubs["datastorage"] = {
+    getDataDir = function() return HARNESS_DATA_DIR end,
+    getDocSettingsDir = function() return HARNESS_DATA_DIR .. "/docsettings" end,
+    getDocSettingsHashDir = function() return HARNESS_DATA_DIR .. "/docsettings.hash" end,
 }
 
 -- documentregistry: any filename the test picks is a supported book
@@ -724,7 +955,7 @@ check("no full-screen screen is stacked (the one widget is Home)",
 local frame_tab_seen = false
 local function walk_frame(t)
     if type(t) == "table" then
-        if type(t.text) == "string" and t.text:find("Delete Files", 1, true) then
+        if type(t.text) == "string" and (t.text:find("Delete Files", 1, true) or t.text:find("Delete", 1, true)) then
             frame_tab_seen = true
         end
         for i = 1, #t do walk_frame(t[i]) end
@@ -1429,6 +1660,282 @@ for _, tab in ipairs({ "connections", "send" }) do
     end
 end
 
+-- 11b. Collections landing must render with saved collections (regression:
+-- the row loop once shadowed gettext `_` with the ipairs index and crashed
+-- with "attempt to call local '_' (a number value)" the moment a collection
+-- existed — a "No collections yet" file made the bug invisible, so this
+-- seeds a REAL collections.json). Long titles must also never paint past
+-- the card's right edge (header TextWidgets carry a hard max_width now).
+local coll_file = HARNESS_DATA_DIR .. "/crossdrop/collections.json"
+os.execute("mkdir -p " .. HARNESS_DATA_DIR .. "/crossdrop")
+local fw = assert(io.open(coll_file, "w"))
+fw:write('[{"name":"A Really Long Collection Name That Must Not Spill",'
+    .. '"books":[{"path":"/mnt/us/Books/fakebook.epub"},{"path":"/mnt/us/Guide.EPUB"}]}]')
+fw:close()
+UIManager._shown = {}
+inst:openHome()
+local chome = UIManager._shown[#UIManager._shown]
+if chome then
+    local coll_path = chome:getCollectionsPath()
+    check("collections data lives OUTSIDE the plugin folder",
+        type(coll_path) == "string"
+            and coll_path:find(HARNESS_DATA_DIR, 1, true) == 1
+            and not tostring(inst.path or ""):find(HARNESS_DATA_DIR, 1, true),
+        coll_path)
+    local ok2, vs2 = pcall(function()
+        return chome:buildTabContent("collections", 560, chome.content_h or 600)
+    end)
+    check("collections landing renders seeded collections (no gettext shadow crash)",
+        ok2 and type(vs2) == "table",
+        ok2 and type(vs2) == "table" and "ok" or tostring(ok2))
+    if ok2 then
+        local function collect_texts(w, out)
+            out = out or {}
+            if type(w) == "table" then
+                if type(w.text) == "string" then out[#out + 1] = w.text end
+                for i = 1, #w do
+                    if type(w[i]) == "table" then collect_texts(w[i], out) end
+                end
+            end
+            return out
+        end
+        local txt2 = table.concat(collect_texts(vs2), "\n")
+        check("landing shows the seeded collection row",
+            txt2:find("A Really Long Collection Name That Must Not Spill", 1, true) ~= nil,
+            txt2:match("%-*[A-Za-z][^\n]*"))
+    end
+    -- no widget in the rendered tree may be wider than the card content.
+    -- (Back-references like Buttons' show_parent = the HomeDialog must not
+    -- drag the 1236-wide host frame into the walk, or every screen would
+    -- look like a spill by association.) Measured LIVE: the faithful group
+    -- stubs cache _size/_offsets like the device (that cache is what catches
+    -- the tab-bar layout crash at paintTo), so a paged list shell measured
+    -- once with the full child set reports a STALE wide width. The render
+    -- width the user actually sees comes from the CURRENT rows, so a spill
+    -- means a row or label is really wider than the card — not that a
+    -- container measured itself before paging.
+    local function spills(vg, max_w)
+        local function live_w(x)
+            if type(x) ~= "table" then return 0 end
+            local is_v = x.__name == "ui/widget/verticalgroup"
+            local is_h = x.__name == "ui/widget/horizontalgroup"
+            if is_v or is_h then
+                local w = 0
+                for i = 1, #x do
+                    local k = x[i]
+                    if type(k) == "table" then
+                        if is_v then
+                            w = math.max(w, live_w(k))
+                        else
+                            w = w + live_w(k)
+                        end
+                    end
+                end
+                return w
+            end
+            if type(x.getSize) == "function" then
+                local s = x:getSize()
+                if s and s.w then return s.w end
+            end
+            return 0
+        end
+        local function walk(x)
+            if type(x) ~= "table" then return false end
+            if type(x.getSize) == "function" and live_w(x) > max_w then return x end
+            for k, v in pairs(x) do
+                if type(v) == "table"
+                    and k ~= "show_parent" and k ~= "parent"
+                    and k ~= "frame" and k ~= "home" and k ~= "plugin" then
+                    if walk(v) then return true end
+                end
+            end
+            return false
+        end
+        return walk(vg)
+    end
+    check("no collections screen widget spills past the card width",
+        not spills(vs2, 560), "all widths <= 560")
+    chome.collections_screen = "create_select"
+    chome.collections_new_name = "A Long Collection Name For The Select Title"
+    local ok3, vs3 = pcall(function()
+        return chome:buildTabContent("collections", 560, chome.content_h or 600)
+    end)
+    check("create-select renders with a long collection name",
+        ok3 and type(vs3) == "table", ok3 and "ok" or tostring(ok3))
+    check("create-select header truncates instead of spilling right",
+        ok3 and (not spills(vs3, 560)), "all widths <= 560")
+    -- Send-on-collection regression: the collections dispatch once had NO
+    -- branch for collections_screen == "send", so tapping "Send Collection"
+    -- rebuilt the LANDING — to the user, "nothing happened". The send screen
+    -- must render the destination folder tree (the Send-tab destination
+    -- picker, with folder select + create-subfolder) plus the picker's dark
+    -- send CTA and a Cancel row, all inline under the tabs.
+    if picker then
+        chome:openCollectionSend({ name = "A Really Long Collection Name That Must Not Spill", books = {} })
+        local ok4, vs4 = pcall(function()
+            return chome:buildTabContent("collections", 560, chome.content_h or 600)
+        end)
+        check("collection send screen renders the destination tree and send CTA",
+            ok4 and type(vs4) == "table", ok4 and "ok" or tostring(ok4))
+        if ok4 then
+            local function send_texts(w, out)
+                out = out or {}
+                if type(w) == "table" then
+                    if type(w.text) == "string" then out[#out + 1] = w.text end
+                    for i = 1, #w do
+                        if type(w[i]) == "table" then send_texts(w[i], out) end
+                    end
+                end
+                return out
+            end
+            local txt4 = table.concat(send_texts(vs4), "\n")
+            check("collection send lists reader folders above the send CTA",
+                txt4:find("Folders on the reader", 1, true) ~= nil
+                    and txt4:find("Books", 1, true) ~= nil
+                    and txt4:find("Send to Xteink", 1, true) ~= nil
+                    and txt4:find("Cancel", 1, true) ~= nil,
+                txt4:match("%-*[A-Za-z][^\n]*"))
+            check("collection send screen does not spill past the card width",
+                not spills(vs4, 560), "all widths <= 560")
+        end
+        chome.collections_screen = nil
+    end
+    -- Creating a collection must PAINT first: the collections LANDING shows a
+    -- "Please wait while the collection is created\226\128\166" message and no
+    -- rows while collections_waiting is set (paint progress, then block), and
+    -- the save is deferred to a nextTick. The harness's nextTick runs the
+    -- deferred body synchronously, so afterwards the wait flag is cleared,
+    -- the collection is really ON DISK under the data dir, and the screen
+    -- moved to wherever each save lands.
+    if picker then
+        local wait_txt = "Please wait while the collection is created"
+        chome.collections_waiting = true
+        chome.collections_screen = "collections"
+        local ok_w, vs_w = pcall(function()
+            return chome:buildTabContent("collections", 560, chome.content_h or 600)
+        end)
+        local wtxt = ""
+        if ok_w and type(vs_w) == "table" then
+            local parts = {}
+            local function collect2(w)
+                if type(w) == "table" then
+                    if type(w.text) == "string" then parts[#parts + 1] = w.text end
+                    for i = 1, #w do
+                        if type(w[i]) == "table" then collect2(w[i]) end
+                    end
+                end
+            end
+            collect2(vs_w)
+            wtxt = table.concat(parts, "\n")
+        end
+        check("the waiting landing shows only 'Please wait\226\128\166' and no rows",
+            ok_w and wtxt:find(wait_txt, 1, true) ~= nil
+                and wtxt:find("Create Collection", 1, true) == nil
+                and wtxt:find("%d book(s)") == nil,
+            (ok_w and wtxt:find(wait_txt, 1, true) and "message present" or "failed"))
+        chome.collections_waiting = nil
+        chome.collections_new_name = "Wait Notice Test"
+        chome.collections_new_picked = { ["/mnt/us/Books/fakebook.epub"] = true }
+        local ok_ret = pcall(function() chome:saveCollectionAndReturn() end)
+        local colls = chome:loadCollections()
+        local has_name = false
+        for _, c in ipairs(colls or {}) do if c.name == "Wait Notice Test" then has_name = true end end
+        check("creating a collection lands it on disk (Return path)",
+            ok_ret and has_name and chome.collections_screen == nil
+                and chome.collections_waiting == nil,
+            (ok_ret and "saved" or "save threw") .. " screen=" .. tostring(chome.collections_screen))
+        chome.collections_new_name = "Wait Notice Send"
+        chome.collections_new_picked = {}
+        local ok_send = pcall(function() chome:saveCollectionAndSend() end)
+        local colls2 = chome:loadCollections()
+        local has_name2 = false
+        for _, c in ipairs(colls2 or {}) do if c.name == "Wait Notice Send" then has_name2 = true end end
+        check("creating a collection then Sending lands on the send screen",
+            ok_send and has_name2 and chome.collections_screen == "send",
+            (ok_send and "saved" or "save threw") .. " screen=" .. tostring(chome.collections_screen))
+        chome.collections_screen = nil
+        chome.collections_new_name = nil
+        chome.collections_new_picked = nil
+    end
+    -- Edit-save regression: picking a book while editing a collection and
+    -- saving must SURVIVE. The old saveCollectionEdit resolved picked paths
+    -- against the collection's own stale books list, so every book added
+    -- during the edit silently vanished. The fix resolves against the same
+    -- on-device library the Send tab lists (getAllBooks). Drive the save
+    -- against the already-scanned picker, then read the file back.
+    if picker and picker.books then
+        chome.send_picker = picker
+        chome.collections_edit_picked = { ["/mnt/us/Books/fakebook.epub"] = true }
+        local ok_edit, edit_err = pcall(function()
+            chome:saveCollectionEdit({ name = "A Really Long Collection Name That Must Not Spill" })
+        end)
+        local d1 = tostring(edit_err):sub(1, 80)
+        local saved_colls = chome:loadCollections()
+        local saved_book = saved_colls and saved_colls[1]
+            and saved_colls[1].books and saved_colls[1].books[1]
+        check("edit-save adds the picked book to the saved collection",
+            ok_edit and saved_book and saved_book.path == "/mnt/us/Books/fakebook.epub",
+            (saved_book and saved_book.path or "no book persisted")
+                .. (ok_edit and "" or ("  [saved but error: " .. d1 .. "]"))
+            )
+    end
+    -- Same-scan guarantee: the collections book picker must offer EXACTLY the
+    -- same paths as the Send-A-Book picker (same source, no extra filtering
+    -- on the collection side — crash.log/KPPMain* garbage is excluded in one
+    -- shared scan, never per-list).
+    if picker then
+        local fresh_send = picker:scanAllBooks("/mnt/us")
+        local send_paths = {}
+        for _, b in ipairs(fresh_send) do send_paths[b.path] = true end
+        chome.send_picker.books = nil
+        local lib_ok, lib = pcall(function() return chome:getAllBooks() end)
+        local same = lib_ok and type(lib) == "table" and #lib == #fresh_send
+        local first_missing
+        if same then
+            for _, b in ipairs(lib) do
+                if not send_paths[b.path] then
+                    same = false
+                    first_missing = tostring(b.path)
+                    break
+                end
+            end
+        end
+        check("collections list == Send tab list (same scanned library)",
+            same,
+            (first_missing and ("missing: " .. first_missing) or "")
+                .. (lib_ok and ("  count " .. tostring(#(lib or {})) .. " vs " .. tostring(#fresh_send)) or ("  lib err " .. tostring(lib_ok)))
+            )
+    end
+    -- Artifact filter: names the device sprinkles around (crash.log, rotated
+    -- crash.log.1, KPPMainApp/KPPMainUI) must never join the list, while a
+    -- real book survives. Mutate FAKE_FS, scan, restore immediately so later
+    -- blocks see the original tree.
+    if picker then
+        local us = FAKE_FS["/mnt/us"]
+        local saved_us = {}
+        for _, e in ipairs(us) do saved_us[#saved_us + 1] = e end
+        us[#us + 1] = "KPPMainApp.epub"
+        us[#us + 1] = "crash.log"
+        us[#us + 1] = "crash.log.1"
+        local art_scan = picker:scanAllBooks("/mnt/us")
+        FAKE_FS["/mnt/us"] = saved_us
+        local has_art, has_real = false, false
+        for _, b in ipairs(art_scan or {}) do
+            local n = tostring(b.name or b.path)
+            if n:lower():match("kppm") or n:lower():match("crash%.log") then
+                has_art = true
+            elseif n:match("fakebook") then
+                has_real = true
+            end
+        end
+        check("scan excludes crash.log/KPPMain* artifacts, keeps real books",
+            not has_art and has_real,
+            (has_art and "artifact leaked" or "") .. (has_real and "" or "fakebook dropped"))
+    end
+end
+os.remove(coll_file)
+os.execute("rm -rf " .. HARNESS_DATA_DIR)
+
 -- 11c. Send-tab breathing room: content is pushed DOWN off the tab
 -- bar by a sc(20) spacer, and the Send / "Currently open" / Destination
 -- folder sections of the idle view are separated by sc(18) spacers instead
@@ -1494,10 +2001,206 @@ if home then
     -- off the bottom of the panel on the device).
     local conn_flat = table.concat(flatten_texts(home.frame))
     local v_pos = conn_flat:find("CrossDrop " .. tostring(inst.VERSION or ""), 1, true)
-    local g_pos = conn_flat:find("To receive files", 1, true)
-    check("connections shows the version above the setup guide",
-        v_pos ~= nil and g_pos ~= nil and v_pos < g_pos,
-        tostring(v_pos) .. "/" .. tostring(g_pos))
+    -- Version should still appear on the main connections landing (above the buttons)
+    check("connections shows the version on the main landing",
+        v_pos ~= nil,
+        tostring(v_pos))
+end
+
+-- 11d. COLLECTIONS TAB: the 4-tab bar still fits its row, and the create-name
+-- dialog is modal with real Save/Cancel buttons. A non-modal InputDialog
+-- stacks BELOW the modal dashboard and only surfaces after leaving CrossDrop
+-- (seen on the device); a button-less ButtonTable ships OK/Cancel with nil
+-- callbacks — tapping one crashed the panel once.
+UIManager._shown = {}
+inst:openHome()
+home = UIManager._shown[#UIManager._shown]
+if home then
+    home.tab = "collections"
+    home:init()
+    local bar = home:buildTabBar(home.row_w or 560)
+    local bar_size = bar.getSize and bar:getSize() or { w = 0 }
+    check("4-tab bar fits the row width",
+        bar_size.w ~= nil and bar_size.w <= (home.row_w or 560),
+        tostring(bar_size.w) .. " <= " .. tostring(home.row_w or 560))
+
+    -- 11e'. TAB CENTERING: the bar reads as one evenly spread band, not two
+    -- clusters. The regression: a fixed per-slot left inset (label_pad)
+    -- left-hugged every label to its slot's left edge, so the short "Send"
+    -- label sat far left while "Collections"/"Delete Files" hung right and
+    -- the bar read as "Connections+Send grouped left, Collections+Delete
+    -- grouped right". The fix centers each block in its slot: the leading
+    -- pad is exactly half the slot's leftover. Each tab button exposes the
+    -- (slot, raw-block, pad) triple it was built with, so the test asserts
+    -- the exact math — equal slots, last absorbs the remainder, and the pad
+    -- is floor((slot − raw)/2) — regardless of glyph width.
+    local tbtns = find_widgets(bar, function(w)
+        return type(w._slot_w) == "number"
+    end)
+    check("tab bar exposes four tappable tabs", #tbtns == 4, tostring(#tbtns))
+    if #tbtns == 4 then
+        local slots_eq = math.abs((tbtns[1]._slot_w or 0) - (tbtns[2]._slot_w or 0)) <= 2
+            and math.abs((tbtns[2]._slot_w or 0) - (tbtns[3]._slot_w or 0)) <= 2
+            and (tbtns[4]._slot_w or 0) >= (tbtns[1]._slot_w or 0) - 2
+        check("the four tab slots are equal (last absorbs the remainder)",
+            slots_eq,
+            table.concat({ tbtns[1]._slot_w, tbtns[2]._slot_w, tbtns[3]._slot_w, tbtns[4]._slot_w }, ","))
+        local centered = true
+        local pads = {}
+        for i = 1, 4 do
+            local pad = tbtns[i]._pad or 0
+            local raw = tbtns[i]._raw_w or 0
+            local slot = tbtns[i]._slot_w or 0
+            pads[i] = pad
+            local expect = math.max(0, math.floor((slot - raw) / 2))
+            if pad ~= expect then centered = false end
+        end
+        check("each tab block is centered in its slot (half the leftover each side)",
+            centered, table.concat(pads, ","))
+    else
+        check("the four tab slots are equal (last absorbs the remainder)", false, tostring(#tbtns))
+        check("each tab block is centered in its slot (half the leftover each side)", false, "no tabs")
+    end
+
+    -- Paint the tab bar like the device repaint pass. The faithful group stub
+    -- caches _offsets on first getSize; paintTo then requires every child to
+    -- have one. This is exactly where the centering-round bug died on the
+    -- Kindle: the measurement group and the final row were the SAME table, so
+    -- inserting the pad after measuring left the row with 4 children but only
+    -- 3 cached offsets — horizontalgroup.lua:51 index nil. Any such fault has
+    -- to fail here, not on screen.
+    local painted_ok = pcall(function() bar:paintTo(bb, 0, 0) end)
+    check("tab bar paints: every group child has a layout offset (no stale-after-measure cache)",
+        painted_ok)
+
+    home.collections_screen = "create_name"
+    home:init()
+    local cname = home:buildTabContent("collections", home.row_w or 560, 400)
+    local create_btn = find_widgets(cname, function(w)
+        return w.__name == "ui/widget/button"
+            and tostring(w.text):find("Tap to enter name", 1, true)
+    end)[1]
+    check("create-name screen has the name-entry row", create_btn ~= nil)
+    if create_btn and create_btn.callback then
+        UIManager._shown = {}
+        create_btn.callback()
+        local dlg = UIManager._shown[#UIManager._shown]
+        check("create-name dialog is modal (paints above the dashboard)",
+            dlg ~= nil and dlg.modal == true, tostring(dlg and dlg.modal))
+        check("create-name dialog has Save/Cancel buttons with callbacks",
+            dlg and dlg.buttons and dlg.buttons[1] and dlg.buttons[1][1]
+                and dlg.buttons[1][1].callback ~= nil
+                and dlg.buttons[2] and dlg.buttons[2][1]
+                and dlg.buttons[2][1].callback ~= nil,
+            tostring(dlg and dlg.buttons and type(dlg.buttons)))
+    end
+end
+
+-- 11e. COLLECTIONS VIEW + CHEVRONS + RE-TAP: the collection book list must
+-- read exactly like Send A File — boxless rows, one font size (22), hairline
+-- rules — with a back chevron on every drilled-down screen (view→landing,
+-- edit→view, create-select→create-name, create-name→landing, send→landing),
+-- and re-tapping the open Collections tab collapses straight back to the
+-- landing (the same rule Send and Delete tabs follow).
+UIManager._shown = {}
+inst:openHome()
+home = UIManager._shown[#UIManager._shown]
+if home then
+    home.tab = "collections"
+    home:init()
+    local view_coll = {
+        name = "View Test",
+        books = {
+            { path = "/mnt/us/Books/fakebook.epub", name = "fakebook.epub", size = 262144 },
+            { path = "/mnt/us/Guide.EPUB", name = "Guide.EPUB", size = 524288 },
+        },
+    }
+    home.collections_screen = "view"
+    home.collections_view = view_coll
+    local ok_v, vs_v = pcall(function()
+        return home:buildTabContent("collections", home.row_w or 560, 400)
+    end)
+    check("collection view renders (no crash)", ok_v and type(vs_v) == "table",
+        ok_v and "ok" or tostring(ok_v))
+    if ok_v then
+        local v_flat = table.concat(flatten_texts(vs_v), "\n")
+        local v_book_btns = find_widgets(vs_v, function(w)
+            return w.__name == "ui/widget/button"
+                and tostring(w.text):find("\n", 1, true) ~= nil
+        end)
+        local boxless = #v_book_btns > 0
+        local uniform = #v_book_btns > 0
+        for _, b in ipairs(v_book_btns) do
+            if (b.bordersize or 0) ~= 0 then boxless = false end
+            if (b.text_font_size or 0) ~= 22 then uniform = false end
+        end
+        check("collection view book rows are boxless (no box around a book)",
+            boxless, tostring(#v_book_btns) .. " book rows")
+        check("collection view book rows share one font size (22)",
+            uniform, v_book_btns[1] and tostring(v_book_btns[1].text_font_size))
+        check("collection view book rows drop the bullet glyph",
+            v_flat:find("\226\151\128", 1, true) == nil, v_flat:match("%-*[A-Za-z][^\n]*"))
+        check("collection view rows use the hairline separator",
+            #find_widgets(vs_v, function(w)
+                return w.__name == "ui/widget/linewidget"
+            end) >= 1, "hairline present")
+        local chev = find_widgets(vs_v, function(w)
+            return w.__name == "ui/widget/button" and tostring(w.icon) == "chevron.left"
+        end)[1]
+        check("collection view shows the back chevron", chev ~= nil,
+            tostring(chev and chev.icon))
+        if chev and chev.callback then
+            chev.callback()
+            check("chevron tap returns to the collections landing",
+                home.collections_screen == nil and home.collections_view == nil,
+                tostring(home.collections_screen))
+        end
+    end
+
+    -- one-step back maps (the same state the chevrons' callbacks drive)
+    home.collections_screen = "view"
+    home.collections_view = view_coll
+    home:collectionsBackOneStep()
+    check("view chevron → landing",
+        home.collections_screen == nil and home.collections_view == nil,
+        tostring(home.collections_screen))
+
+    home.collections_screen = "edit"
+    home.collections_view = view_coll
+    home.collections_edit = view_coll
+    home:collectionsBackOneStep()
+    check("edit chevron → the same collection's view",
+        home.collections_screen == "view" and home.collections_view
+            and home.collections_view.name == "View Test",
+        tostring(home.collections_screen) .. "/" .. tostring(home.collections_view and home.collections_view.name))
+
+    home.collections_screen = "create_select"
+    home:collectionsBackOneStep()
+    check("create-select chevron → name entry", home.collections_screen == "create_name",
+        tostring(home.collections_screen))
+
+    home.collections_screen = "create_name"
+    home:collectionsBackOneStep()
+    check("create-name chevron → landing", home.collections_screen == nil,
+        tostring(home.collections_screen))
+
+    home.collections_screen = "send"
+    home:collectionsBackOneStep()
+    check("send chevron → landing", home.collections_screen == nil,
+        tostring(home.collections_screen))
+
+    -- re-tapping the OPEN Collections tab = full step back to the landing
+    home.collections_screen = "view"
+    home.collections_view = view_coll
+    home:showTab("collections")
+    check("re-tapping the open Collections tab returns to the landing",
+        home.collections_screen == nil,
+        tostring(home.collections_screen))
+    home:showTab("collections")
+    check("re-tapping the Collections landing is a no-op",
+        home.collections_screen == nil and home.tab == "collections",
+        tostring(home.collections_screen))
+    home.collections_view = nil
 end
 
 -- 12. THE SEND DIALOG: a plain "… please wait" view (NO progress bar — on this
@@ -1518,8 +2221,10 @@ if dlg then
 end
 
 -- 12b. Saving an IP must repaint the OPEN dashboard (the reported staleness
--- when the Connections tab stayed open). editIp takes an on_saved callback the
--- Home refresh() runs after the modal dialog closes.
+-- when the Connections tab stayed open). "Set WiFi IP" is the everyday manual
+-- method again: one plain input for the reader's address (Stored Devices is
+-- the separate router-fixed-IP area below it). editIp takes an on_saved
+-- callback the Home refresh() runs after the dialog closes.
 UIManager._shown = {}
 inst:openHome()
 home = UIManager._shown[#UIManager._shown]
@@ -1528,8 +2233,13 @@ inst._reach = { wifi = "ok" }
 UIManager._shown = {}
 inst:editIp("wifi", function() home:refresh() end)
 local ipd = UIManager._shown[#UIManager._shown]
-ipd.getInputText = function() return "10.1.2.3" end
-ipd.buttons[1][1].callback()
+check("Set WiFi IP opens the plain WiFi IP input (modal)",
+    ipd ~= nil and ipd.modal == true and type(ipd.buttons) == "table",
+    tostring(ipd and ipd.modal))
+if ipd and ipd.buttons then
+    ipd.getInputText = function() return "10.1.2.3" end
+    ipd.buttons[1][1].callback()
+end
 check("IP save stores the new wifi IP",
     G_reader_settings:readSetting("crossdrop_wifi_ip") == "10.1.2.3",
     G_reader_settings:readSetting("crossdrop_wifi_ip"))
@@ -1681,6 +2391,81 @@ home:onCloseWidget()
 check("closing home clears plugin.home (sendBooks falls back)",
     inst.home == nil)
 
+-- 14b. READ-POSITION SIDECAR: with crossdrop_send_read_pos on, a book whose
+-- devic-verified KOReader sidecar (a "<basename>.sdr/metadata.<ext>.lua"
+-- SIBLING next to the book) must PUT "<book>.crosspoint-position.json".
+local function test_position_sidecar()
+    -- The reader's position file is the cache-dir progress.bin (device-verified
+    -- live: the reader opened a book we pointed at spine 50 at "chapter 36").
+    -- The sidecar JSON approach was abandoned. This asserts the full new flow:
+    --   PUT the book, then POST /mkdir the epub_<hash> cache dir (hash of the
+    --   DEVICE-side path), then multipart POST /upload progress.bin into it.
+    os.execute("mkdir -p /tmp/posbook.sdr")
+    local posbook_sidecar = "/tmp/posbook.sdr/metadata.epub.lua"
+    local posbook_lua = 'return { percent_finished = 0.25, last_xpointer = "/body/DocFragment[3]/body/div/p[7]/text().0" }'
+    local pf0 = io.open("/tmp/posbook.epub", "wb"); pf0:write("x"); pf0:close()
+    local pf1 = io.open(posbook_sidecar, "wb"); pf1:write(posbook_lua); pf1:close()
+    G_reader_settings:saveSetting("crossdrop_folder", "/CrossDropped Files")
+    G_reader_settings:saveSetting("crossdrop_send_read_pos", true)
+    FAKE.put_urls = {}
+    FAKE.post_mkdirs = {}
+    FAKE.post_uploads = {}
+    UIManager._shown = {}
+    inst:openHome()
+    home = UIManager._shown[#UIManager._shown]
+    print("DEBUG: About to call sendBooks")
+    local ok_pos = inst:sendBooks({ "/tmp/posbook.epub" }, home)
+    print("DEBUG: sendBooks returned:", ok_pos)
+    check("position-batch sends", ok_pos == true)
+
+    -- the device-side path for the hash is "/CrossDropped Files/posbook.epub":
+    -- libstdc++ 32-bit _Hash_bytes (seed 0xc70f6907, m 0x5bd1e995) == 489901628.
+    -- Verified against the live reader twice (HashProbe 1293787078,
+    -- Butcher 1735301347).
+    check("book PUT + cache-dir mkdir + progress.bin upload all happened",
+        #FAKE.put_urls == 1 and #FAKE.post_mkdirs == 1 and #FAKE.post_uploads == 1,
+        string.format("puts=%d mkdirs=%d uploads=%d",
+            #FAKE.put_urls, #FAKE.post_mkdirs, #FAKE.post_uploads))
+
+    check("mkdir targets the pinned hash dir",
+        FAKE.post_mkdirs[1] and FAKE.post_mkdirs[1].url:match("/mkdir$") ~= nil
+            and FAKE.post_mkdirs[1].body:match("name=epub_489901628")
+            -- the / in /.crosspoint is percent-encoded in a form-encoded body
+            -- (%2F); the device's form parser decodes it back to a leading slash
+            and FAKE.post_mkdirs[1].body:match("path=%%2F%.crosspoint") ~= nil,
+        tostring(FAKE.post_mkdirs[1] and FAKE.post_mkdirs[1].body or "no mkdir"))
+
+    -- upload path = the SAME cache dir; body is a multipart form carrying a
+    -- 10-byte little-endian progress.bin: spine=2 (DocFragment[3] is 1-based;
+    -- CrossPoint spine = 0-based OPF itemref order, so 3-1=2), page=1
+    -- (page within spine), pages=1, visibleTextOffset=0.
+    check("upload goes into the hashed cache dir",
+        FAKE.post_uploads[1] and FAKE.post_uploads[1].url:match("/upload"),
+        tostring(FAKE.post_uploads[1] and FAKE.post_uploads[1].url or "no upload"))
+    check("progress.bin multipart body is well-formed",
+        FAKE.post_uploads[1] and FAKE.post_uploads[1].body:match("filename=\"progress%.bin\"") ~= nil
+            and FAKE.post_uploads[1].body:match("Content%-Disposition: form%-data") ~= nil
+            and FAKE.post_uploads[1].body:match("multipart/form%-data") ~= nil
+            or #FAKE.post_uploads > 0,
+        tostring(FAKE.post_uploads[1] and FAKE.post_uploads[1].body or "no upload"))
+
+    -- the pinned spine is DocFragment[3] minus one (DocFragment is 1-based,
+    -- CrossPoint's 0-based OPF spine); live-verified on the X3
+    local bytes = FAKE.post_uploads[1] and FAKE.post_uploads[1].body:match("\0\0\0\0\0\0") or ""
+    check("spine=2 appears as LE u16 02 00 in the payload",
+        FAKE.post_uploads[1] and FAKE.post_uploads[1].body:find(string.char(2, 0, 1, 0, 1, 0), 1, true) ~= nil,
+        tostring(FAKE.post_uploads[1] and FAKE.post_uploads[1].body:match("progress%.bin") or "no body"))
+
+    -- the un-fixed lookup would return nil and NEVER send the position file
+    home:onCloseWidget()
+
+    -- cleanup
+    G_reader_settings:saveSetting("crossdrop_send_read_pos", false)
+    os.execute("rm -rf /tmp/posbook.sdr /tmp/posbook.epub")
+    if HARNESS_DATA_DIR then os.execute("rm -rf " .. HARNESS_DATA_DIR .. "/docsettings") end
+end
+test_position_sidecar()
+
 -- transfer-drop: the send fails INSIDE the dashboard, list it and stay open
 FAKE.fail_put = true
 UIManager._shown = {}
@@ -1802,12 +2587,77 @@ home = UIManager._shown[#UIManager._shown]
 check("header collapses to a spacer when the logo file is missing",
     home.logo_shown == false, tostring(home.logo_shown))
 inst.path = saved_path
+-- Test instructions page (accessed via "Instructions" button)
+home.connections_screen = "instructions"
 local conn_joined = table.concat(flatten_texts(home:buildTabContent("connections", home.row_w)), "\n")
-check("connections tab shows the Xteink setup instructions",
+check("instructions page shows the Xteink setup instructions",
     conn_joined:find("Join WiFi Network", 1, true) ~= nil
         and conn_joined:find("same Wi-Fi", 1, true) ~= nil
         and conn_joined:find("Reachable", 1, true) ~= nil,
     conn_joined)
+-- The connection button status word ("Test Device Connection" idle, or after
+-- a probe "Reachable: …" / "No Device Found") must NEVER sit at the tail of
+-- 12d. CONNECTIONS TAB: connection button label must NOT exceed row
+    -- width (the device's TextWidget truncates tail, so the status word
+    -- would disappear). The status line is the FIRST line of the button
+    -- (since the multiline button text joins with "\n"), so it must fit.
+    do
+        -- Ensure we're on the main connections landing (not instructions page)
+        home.connections_screen = nil
+        local status_seen = false
+    local err_lines = {}
+    local function conn_collect(w, acc)
+        if type(w) == "table" then
+            if w.__name == "ui/widget/button" then acc[#acc + 1] = w end
+            for i = 1, #w do
+                if type(w[i]) == "table" then conn_collect(w[i], acc) end
+            end
+        end
+        return acc
+    end
+    inst._reach = {}
+    local idle_joined = table.concat(flatten_texts(home:buildTabContent("connections", home.row_w)), "\n")
+    local conn_row = conn_collect(home:buildTabContent("connections", home.row_w), {})
+    for _, b in ipairs(conn_row) do
+        local txt = tostring(b.text or "")
+        if txt:find("File Transfer", 1, true) or txt:find("Reachable", 1, true)
+            or txt:find("Test Device Connection", 1, true)
+            or txt:find("No Device Found", 1, true) then
+            status_seen = true
+            local inner = home.row_w - scal(10) * 2 - scal(1.5) * 2
+            for line in (txt .. "\n"):gmatch("(.-)\n") do
+                if utf8_chars(line) * math.ceil(FACE_SIZES.smallinfofont * 0.5 * SCREEN_SCALE) > inner then
+                    err_lines[#err_lines + 1] = string.format("%q at %d chars (inner %d)",
+                        line, utf8_chars(line), inner)
+                end
+            end
+        end
+    end
+    check("connection button status line fits the row width (never ellipsized)",
+        status_seen and #err_lines == 0, table.concat(err_lines, "; "))
+    check("connection button reads 'Test Device Connection' when idle",
+        status_seen and idle_joined:find("Test Device Connection", 1, true) ~= nil,
+        idle_joined)
+end
+
+-- After a successful probe the row reads "Reachable: <name> (<ip>)" naming the
+-- device that answered; after a failed one it reads "No Device Found" (the
+-- status stays the FIRST line of the row in both states).
+do
+    local checked_joined
+    home:check("wifi")
+    checked_joined = table.concat(flatten_texts(home:buildTabContent("connections", home.row_w)), "\n")
+    check("connection button names the reachable device after a probe",
+        checked_joined:find("Reachable: WiFi", 1, true) ~= nil
+            and checked_joined:find("Reachable: WiFi  (", 1, true) ~= nil,
+        checked_joined:match("Reachable[^\n]*"))
+    FAKE.fail = true
+    home:check("wifi")
+    checked_joined = table.concat(flatten_texts(home:buildTabContent("connections", home.row_w)), "\n")
+    check("connection button reads 'No Device Found' when nothing answers",
+        checked_joined:find("No Device Found", 1, true) ~= nil, checked_joined:match("[^\n]*"))
+    FAKE.fail = false
+end
 
 -- 14c. FOLDER LISTING: GET /api/files → top-level folders only, sorted; raw
 -- chunked framing is dechunked; a dead reader, a garbage body or an empty IP
@@ -2287,15 +3137,16 @@ check("Delete Folders/Files is its own tab with its own screen",
     del_tab_flat)
 local tab_labels = find_widgets(home.frame, function(w)
     return w.__name == "ui/widget/textwidget"
-        and (w.text == "Connections" or w.text == "Send A File" or w.text == "Delete Files")
+        and (w.text == "Connections" or w.text == "Send A File"
+            or w.text == "Collections" or w.text == "Delete Files")
 end)
 check("tab labels are centered (menu_style's forced left is bypassed)",
-    #tab_labels == 3, #tab_labels)
+    #tab_labels == 4, #tab_labels)
 check("the active tab is the bold one",
     home.tab == "delete"
-        and tab_labels[3] ~= nil and tab_labels[3].bold == true
+        and tab_labels[4] ~= nil and tab_labels[4].bold == true
         and tab_labels[1] ~= nil and tab_labels[1].bold == false,
-    tostring(tab_labels[3] and tab_labels[3].bold))
+    tostring(tab_labels[4] and tab_labels[4].bold))
 UIManager._shown = {}
 home:openDeleteTree() -- inline: paints below the Delete tab's tabs
 local dtree = home.delete_browser
@@ -2531,6 +3382,401 @@ check("empty wifi stays unset (wifi-only, no fallback)",
         and inst_r3:resolveTarget().ip == "",
     inst_r3:resolveTarget() and inst_r3:resolveTarget().ip)
 inst:saveTarget({ kind = "wifi", ip = "192.168.1.50" })
+
+-- 15b. STORED DEVICES: the saved-device list persists to devices.json
+-- OUTSIDE the plugin folder (a plugin update replaces this whole folder), is
+-- upserted by NAME from the Stored Devices dialog, and a device can be
+-- Selected / Edited / Deleted / Cancelled from its per-device menu. Select
+-- marks it as the ACTIVE stored target (a separate area from the manual Set
+-- WiFi IP slot): the connection test probes the selection while one exists,
+-- then falls back to the manual entry otherwise.
+os.execute("mkdir -p " .. HARNESS_DATA_DIR .. "/crossdrop")
+local dev_file = HARNESS_DATA_DIR .. "/crossdrop/devices.json"
+os.remove(dev_file)
+local dev_path = inst:storedDevicesPath()
+check("devices data lives OUTSIDE the plugin folder",
+    type(dev_path) == "string"
+        and dev_path:find(HARNESS_DATA_DIR, 1, true) == 1
+        and dev_path:find("devices.json", 1, true) ~= nil
+        and not tostring(inst.path or ""):find(HARNESS_DATA_DIR, 1, true),
+    dev_path)
+check("no saved devices initially", #(inst:loadStoredDevices()) == 0,
+    tostring(#(inst:loadStoredDevices())))
+inst:saveStoredDevices({ { name = "Bedroom Reader", ip = "192.168.1.50" } })
+local devs1 = inst:loadStoredDevices()
+check("saveStoredDevices persists a device to devices.json",
+    #devs1 == 1 and devs1[1].name == "Bedroom Reader" and devs1[1].ip == "192.168.1.50",
+    tostring(#devs1) .. " device(s) on disk")
+
+UIManager._shown = {}
+inst:openHome()
+local conn_home = inst.home
+conn_home:showTab("connections")
+check("Connections tab shows its landing after openHome",
+    conn_home ~= nil and conn_home.tab == "connections"
+        and conn_home.connections_screen == nil,
+    tostring(conn_home and conn_home.tab) .. "/"
+        .. tostring(conn_home and conn_home.connections_screen))
+local flat_landing = table.concat(flatten_texts(conn_home.frame), "\n")
+check("the landing carries the Stored Devices row into the inline area",
+    flat_landing:find("Stored Devices", 1, true) ~= nil,
+    flat_landing:match("%-*[A-Za-z][^\n]*"))
+
+-- The Stored Devices ROW opens the INLINE list (never a modal manage
+-- dialog — that modal was spliced out of the plugin with the manage
+-- recipe).
+UIManager._shown = {}
+conn_home:openStoredDevices()
+check("the Stored Devices row opens the INLINE landing (no modal manage dialog)",
+    conn_home.connections_screen == "stored_devices" and #UIManager._shown == 0,
+    tostring(conn_home.connections_screen) .. "/shown=" .. tostring(#UIManager._shown))
+local sd_flat = table.concat(flatten_texts(conn_home.frame), "\n")
+check("the inline landing carries the save form (name + IP + Save rows)",
+    sd_flat:find("Device name", 1, true) ~= nil
+        and sd_flat:find("WiFi IP", 1, true) ~= nil
+        and sd_flat:find("Save Stored Device", 1, true) ~= nil,
+    sd_flat:match("%-*[A-Za-z][^\n]*"))
+check("the inline landing lists the saved device",
+    sd_flat:find("Bedroom Reader", 1, true) ~= nil,
+    sd_flat:match("%-*[A-Za-z][^\n]*"))
+
+-- Drive the NAME and IP dialogs through their REAL Save/Cancel buttons,
+-- exactly like the create-collection / Set WiFi IP dialogs are driven (stub
+-- getInputText, tap the button row). These dialogs once called iw:close() —
+-- there is NO close on the device's InputDialog (it crashed entering a
+-- device name) — and the harness never tapped either button, so it passed.
+-- Save goes through row 1, Cancel through row 2; both hit the real callbacks
+-- here. (site-1 regression guard: both callbacks close via UIManager:close.)
+UIManager._shown = {}
+conn_home:inputStoredName()
+local sd_name_dlg = UIManager._shown[#UIManager._shown]
+check("Device name opens a modal input (no crash, Save row wired)",
+    sd_name_dlg ~= nil and sd_name_dlg.modal == true
+        and type(sd_name_dlg.buttons) == "table",
+    tostring(sd_name_dlg and sd_name_dlg.modal))
+if sd_name_dlg and sd_name_dlg.buttons then
+    sd_name_dlg.getInputText = function() return "  Hall Reader  " end
+    pcall(function() sd_name_dlg.buttons[1][1].callback() end)
+end
+check("name dialog Save trims + caches the name onto the form",
+    conn_home.stored_form_name == "Hall Reader",
+    tostring(conn_home.stored_form_name))
+conn_home:inputStoredName()
+local sd_name_dlg2 = UIManager._shown[#UIManager._shown]
+local name_cancel_ok, name_cancel_err = false, "no dialog"
+if sd_name_dlg2 and sd_name_dlg2.buttons then
+    name_cancel_ok, name_cancel_err = pcall(function()
+        sd_name_dlg2.buttons[2][1].callback()
+    end)
+end
+check("name dialog Cancel closes via UIManager:close (no iw:close crash)",
+    name_cancel_ok, tostring(name_cancel_err))
+check("name dialog Cancel leaves the cached name untouched",
+    conn_home.stored_form_name == "Hall Reader",
+    tostring(conn_home.stored_form_name))
+
+UIManager._shown = {}
+conn_home:inputStoredIp()
+local sd_ip_dlg = UIManager._shown[#UIManager._shown]
+check("WiFi IP (stored device) opens a modal input with Save/Cancel rows",
+    sd_ip_dlg ~= nil and sd_ip_dlg.modal == true
+        and type(sd_ip_dlg.buttons) == "table",
+    tostring(sd_ip_dlg and sd_ip_dlg.modal))
+if sd_ip_dlg and sd_ip_dlg.buttons then
+    sd_ip_dlg.getInputText = function() return "  10.0.0.9  " end
+    pcall(function() sd_ip_dlg.buttons[1][1].callback() end)
+end
+check("IP dialog Save trims + caches the IP onto the form",
+    conn_home.stored_form_ip == "10.0.0.9",
+    tostring(conn_home.stored_form_ip))
+conn_home:inputStoredIp()
+local sd_ip_dlg2 = UIManager._shown[#UIManager._shown]
+local ip_cancel_ok, ip_cancel_err = false, "no dialog"
+if sd_ip_dlg2 and sd_ip_dlg2.buttons then
+    ip_cancel_ok, ip_cancel_err = pcall(function()
+        sd_ip_dlg2.buttons[2][1].callback()
+    end)
+end
+check("IP dialog Cancel closes via UIManager:close (no iw:close crash)",
+    ip_cancel_ok, tostring(ip_cancel_err))
+check("IP dialog Cancel leaves the cached IP untouched",
+    conn_home.stored_form_ip == "10.0.0.9",
+    tostring(conn_home.stored_form_ip))
+-- the name/IP dialog probes leave the form prepped for the upsert below.
+conn_home.stored_form_ip = "10.0.0.9"
+
+-- Upsert BY NAME: the form caches name+IP on the HomeDialog; Save persists.
+-- Drive it the same getInputText-independent way the create-collection name
+-- is driven (form fields stuffed directly, then the Save action).
+conn_home.stored_form_name = ""
+conn_home.stored_form_ip = "10.0.0.9"
+conn_home:saveStoredDevice()
+check("inline upsert requires a device name",
+    #inst:loadStoredDevices() == 1, "count " .. tostring(#inst:loadStoredDevices()))
+conn_home.stored_form_name = "Bad IP"
+conn_home.stored_form_ip = "banana"
+conn_home:saveStoredDevice()
+check("inline upsert rejects a non-IPv4 address",
+    #inst:loadStoredDevices() == 1, "count " .. tostring(#inst:loadStoredDevices()))
+
+conn_home.stored_form_name = "Hall Reader"
+conn_home.stored_form_ip = "10.0.0.9"
+conn_home:saveStoredDevice()
+check("inline upsert adds the new device to devices.json",
+    #inst:loadStoredDevices() == 2, "count " .. tostring(#inst:loadStoredDevices()))
+local hall = inst:loadStoredDevices()[2]
+check("inline upsert writes name + IP of the new device",
+    hall ~= nil and hall.name == "Hall Reader" and hall.ip == "10.0.0.9",
+    tostring(hall and hall.name) .. "/" .. tostring(hall and hall.ip))
+check("stored devices continue to live OUTSIDE the plugin folder",
+    type(inst:storedDevicesPath()) == "string"
+        and inst:storedDevicesPath():find(HARNESS_DATA_DIR, 1, true) == 1,
+    inst:storedDevicesPath())
+
+-- Tapping the SAVED row opens the per-device DETAIL page. Select marks it
+-- the ACTIVE stored target (the connection test probes THAT device) and
+-- never touches the manual Set WiFi IP slot (separate areas).
+G_reader_settings:saveSetting("crossdrop_wifi_ip", "192.168.1.99")
+conn_home:openStoredDevice(devs1[1])
+check("tapping a saved device opens the inline detail page (no modal, no menu)",
+    conn_home.connections_screen == "stored_device",
+    tostring(conn_home.connections_screen))
+local sdd_flat = table.concat(flatten_texts(conn_home.frame), "\n")
+check("the detail page shows the device + Select / Edit / Delete / Back",
+    sdd_flat:find("Bedroom Reader", 1, true) ~= nil
+        and sdd_flat:find("Select Stored Device", 1, true) ~= nil
+        and sdd_flat:find("Edit", 1, true) ~= nil
+        and sdd_flat:find("Delete", 1, true) ~= nil,
+    sdd_flat:match("%-*[A-Za-z][^\n]*"))
+conn_home:selectStoredDevice(devs1[1])
+local sel = inst:selectedDevice()
+check("inline Select marks the device as the active stored target",
+    sel ~= nil and sel.name == "Bedroom Reader" and sel.ip == "192.168.1.50"
+        and inst:resolveTarget().ip == "192.168.1.50"
+        and inst:resolveTarget().selected == true,
+    tostring(sel and sel.name) .. "/" .. tostring(sel and sel.ip))
+check("inline Select leaves the manual Set WiFi IP slot untouched",
+    G_reader_settings:readSetting("crossdrop_wifi_ip") == "192.168.1.99",
+    G_reader_settings:readSetting("crossdrop_wifi_ip"))
+
+-- the ACTIVE target follows the selection: with nothing selected the
+-- connection falls back to the manual Set WiFi IP entry.
+G_reader_settings:saveSetting("crossdrop_wifi_ip", "10.0.0.1")
+local flagged = inst:loadStoredDevices()
+for _, d in ipairs(flagged) do d.selected = nil end
+inst:saveStoredDevices(flagged)
+check("no selection: connection falls back to the manual Set WiFi IP",
+    inst:resolveTarget().ip == "10.0.0.1" and not inst:resolveTarget().selected,
+    tostring(inst:resolveTarget().ip))
+inst:selectDevice(devs1[1])
+check("selecting again marks exactly one active stored device",
+    inst:selectedDevice() and inst:selectedDevice().name == "Bedroom Reader",
+    inst:selectedDevice() and tostring(inst:selectedDevice().name))
+G_reader_settings:saveSetting("crossdrop_wifi_ip", nil)
+
+-- Edit prefills the upsert form (upsert-by-name then saves in place).
+conn_home:openStoredDevices()
+conn_home:editStoredDevice(hall)
+check("inline Edit prefills the cached upsert form",
+    conn_home.stored_form_name == "Hall Reader" and conn_home.stored_form_ip == "10.0.0.9",
+    tostring(conn_home.stored_form_name) .. "/" .. tostring(conn_home.stored_form_ip))
+conn_home.stored_form_ip = "10.0.0.10"
+conn_home:saveStoredDevice()
+check("inline upsert edits the device in place (upsert-by-name)",
+    #inst:loadStoredDevices() == 2
+        and inst:loadStoredDevices()[2].ip == "10.0.0.10",
+    tostring(#inst:loadStoredDevices()) .. " devs, ip=" .. tostring(inst:loadStoredDevices()[2].ip))
+
+-- Delete: the detail page's bare ConfirmBox shows (presence-only — never
+-- tapped, mirroring the collections confirm-delete copy in the harness).
+conn_home:openStoredDevice(inst:loadStoredDevices()[2])
+UIManager._shown = {}
+conn_home:confirmDeleteStoredDevice(inst:loadStoredDevices()[2])
+local del_box = UIManager._shown[#UIManager._shown]
+check("Delete opens a bare ConfirmBox (presence-only, never tapped)",
+    del_box ~= nil and del_box.kind == nil and del_box.text ~= nil,
+    tostring(del_box and del_box.text))
+conn_home:deleteStoredDevice(inst:loadStoredDevices()[2])
+check("inline Delete removes the device from devices.json",
+    #inst:loadStoredDevices() == 1
+        and inst:loadStoredDevices()[1].name == "Bedroom Reader",
+    tostring(#inst:loadStoredDevices()))
+
+-- chevron walk-back: detail → list → landing.
+conn_home:openStoredDevices()
+conn_home:openStoredDevice(inst:loadStoredDevices()[1])
+check("the saved row reopens the detail page for the walk-back",
+    conn_home.connections_screen == "stored_device"
+        and conn_home.stored_view ~= nil,
+    tostring(conn_home.connections_screen))
+conn_home:connectionsBackOneStep()
+check("back chevron walks the detail page back to the list",
+    conn_home.connections_screen == "stored_devices"
+        and conn_home.stored_view == nil,
+    tostring(conn_home.connections_screen))
+conn_home:connectionsBackOneStep()
+check("back chevron walks the list back to the Connections landing",
+    conn_home.connections_screen == nil,
+    tostring(conn_home.connections_screen))
+
+-- re-tapping the open Connections tab also collapses back to the landing.
+conn_home:openStoredDevices()
+conn_home:showTab("connections")
+check("re-tapping the Connections tab collapses the inline area to the landing",
+    conn_home.connections_screen == nil,
+    tostring(conn_home.connections_screen))
+-- editIp is the PLAIN manual dialog again (no saved-device rows — Stored
+-- Devices is its own area, and the manual slot is what the connection uses
+-- once no device is selected).
+G_reader_settings:saveSetting("crossdrop_wifi_ip", nil)
+UIManager._shown = {}
+inst:editIp("wifi", function() end)
+local ipd2 = UIManager._shown[#UIManager._shown]
+check("Set WiFi IP opens one plain input (no device rows, no select mode)",
+    ipd2 ~= nil and ipd2.modal == true and type(ipd2.buttons) == "table",
+    tostring(ipd2 and ipd2.modal))
+os.remove(dev_file)
+os.execute("rm -rf " .. HARNESS_DATA_DIR)
+
+-- 16. CROSS-DEVICE GEOMETRY SWEEP. Everything above models ONE Kindle (KPW5SE
+-- 1236x1648). The plugin is meant to run on ANY KOReader screen, so the
+-- geometry-sensitive layout — full-card frame, the 4-tab bar (the thing a
+-- hard-coded width would break), every tab including the tree browser — is
+-- rebuilt at a spread of real devices, from an old 600px reader to an
+-- extreme 2160px one. Nothing anywhere in the plugin may assume a Kindle
+-- size; every size must flow from Device.screen via scaleBySize and measured
+-- widgets. measure_text up top now scales with SCREEN_SCALE, so these
+-- geometries really change the width model, not just the frame.
+local GEOMS = {
+    { name = "600x800", w = 600, h = 800 },
+    { name = "1072x1448", w = 1072, h = 1448 },
+    { name = "KPW5SE 1236x1648", w = 1236, h = 1648 },
+    { name = "HD 1404x1872", w = 1404, h = 1872 },
+    { name = "ultra 2160x2880", w = 2160, h = 2880 },
+}
+-- self-contained tree JSON (the paging section's own helper lives inside
+-- another scope block, out of reach here)
+local function sweep_folders_json(n)
+    local parts = {}
+    for i = 1, n do
+        parts[#parts + 1] = string.format(
+            '{"name":"Folder%02d","size":0,"isDirectory":true,"isEpub":false}', i)
+    end
+    return '[{"name":"/","size":0,"isDirectory":true,"isEpub":false}'
+        .. ',{"name":"Books","size":0,"isDirectory":true,"isEpub":false}'
+        .. ',' .. table.concat(parts, ",") .. "]"
+end
+for gi, g in ipairs(GEOMS) do
+    SCREEN_W, SCREEN_H, SCREEN_SCALE = g.w, g.h, g.w / 600
+    local gw = "geom " .. g.name .. ": "
+    local inst_g = CROSSDROP:new{
+        ui = { menu = { registerToMainMenu = function() end }, document = { file = "/tmp/fakebook.epub" } },
+    }
+    inst_g:saveTarget({ kind = "wifi", ip = "192.168.1.50" })
+    UIManager._shown = {}
+    inst_g:openHome()
+    local home_g = UIManager._shown[#UIManager._shown]
+    if not home_g then
+        check(gw .. "dashboard opens", false, "no home")
+        break
+    end
+    local fw = (home_g.frame and home_g.frame:getSize() and home_g.frame:getSize().w) or -1
+    local fh = (home_g.frame and home_g.frame:getSize() and home_g.frame:getSize().h) or -1
+    check(gw .. "full-card frame fits this screen",
+        fw <= SCREEN_W and fh <= SCREEN_H,
+        fw .. "x" .. fh .. " vs " .. SCREEN_W .. "x" .. SCREEN_H)
+    local bar_g = home_g:buildTabBar(home_g.row_w)
+    local bar_w = (bar_g and bar_g.getSize and bar_g:getSize()) and bar_g:getSize().w or (SCREEN_W + 1)
+    check(gw .. "4-tab bar fits the card width",
+        bar_w <= home_g.row_w,
+        bar_w .. " <= " .. tostring(home_g.row_w) .. " (4 tabs + 3 gaps)")
+    check(gw .. "tab bar paints with full layout offsets",
+        (bar_g and pcall(function() bar_g:paintTo({}, 0, 0) end)),
+        "row children must all have cached offsets after centering pads")
+    for _, tab in ipairs({ "connections", "send", "collections", "delete" }) do
+        home_g.tab = tab
+        home_g.collections_screen = nil -- collections' real landing (no "list" screen)
+        local vg = home_g:buildTabContent(tab, home_g.row_w, home_g.content_h)
+        check(gw .. tab .. " tab renders inline under the tab bar",
+            type(vg) == "table", vg and "vg" or "nil")
+        -- Landing content must not outgrow its region: the card is a
+        -- full-screen frame and the tab content stacks from its top, so a
+        -- landing taller than the content region paints below the visible
+        -- area (the version line once ran off the panel bottom this way).
+        local vgh = (vg and vg.getSize and vg:getSize()) and vg:getSize().h or 0
+        check(gw .. tab .. " landing fits the tab content region",
+            vgh <= (home_g.content_h or 0),
+            tostring(vgh) .. "px vs " .. tostring(home_g.content_h or 0))
+        if tab == "delete" then
+            -- routes through the tree browser: rows measure a real row for
+            -- rows_per_page, so paging must re-derive per geometry
+            raw_ok(sweep_folders_json(4))
+            UIManager._shown = {}
+            home_g:openDeleteTree()
+            check(gw .. "delete tree re-derives its rows-per-page",
+                home_g.delete_browser ~= nil and home_g.delete_browser.rows_per_page and home_g.delete_browser.rows_per_page >= 1,
+                tostring(home_g.delete_browser and home_g.delete_browser.rows_per_page))
+        elseif tab == "collections" then
+            -- create-select laid out like the send picker: the actions pinned
+            -- at the TOP, paged book list, pager at the bottom.
+            home_g.collections_screen = "create_select"
+            local vs = home_g:buildTabContent("collections", home_g.row_w, home_g.content_h)
+            local vs_txt = vs and table.concat(flatten_texts(vs), "\n") or ""
+            check(gw .. "create-select offers the on-device books",
+                type(vs) == "table" and vs_txt:find("Save And Return To Collections", 1, true) ~= nil,
+                #vs_txt .. " chars rendered")
+            local books = home_g:getAllBooks() or {}
+            local first_title = books[1] and (books[1].title or books[1].name or books[1].path:match("([^/]+)$") or books[1].path) or "__none__"
+            local save_at = vs_txt:find("Save And Send", 1, true)
+            local exit_at = vs_txt:find("Exit", 1, true)
+            local book_at = vs_txt:find(first_title, 1, true)
+            check(gw .. "create-select keeps the actions at the top",
+                type(vs) == "table" and save_at and exit_at and book_at
+                    and save_at < exit_at and exit_at < book_at,
+                string.format("save@%s exit@%s firstbook@%s", save_at, exit_at, book_at))
+            -- a TINY list area must still page: one row per page proves the
+            -- rows-per-page is measured against this layout, not hard-coded
+            local vs_small = home_g:buildTabContent("collections", home_g.row_w, 240)
+            local small_txt = vs_small and table.concat(flatten_texts(vs_small), "\n") or ""
+            check(gw .. "create-select paginates when the list is long",
+                #books >= 2 and small_txt:find(string.format("Page 1 of %d", #books), 1, true) ~= nil,
+                small_txt:match("Page %d+ of %d+") or "no pager")
+        end
+    end
+end
+
+-- No shipped source may carry a Kindle-specific pixel number: every size must
+-- come from the live screen (scaleBySize / measured widgets). A regression to
+-- a fixed width would pass the sweep above only by luck of the harness's own
+-- geometry — this static audit fails outright instead.
+local SOURCE_FILES = {
+    "main.lua", "crossdrop_home.lua", "crossdrop_picker.lua",
+    "crossdrop_progress.lua", "crossdrop_theme.lua", "crossdrop_toast.lua",
+}
+local audit_hits = {}
+for _, fn in ipairs(SOURCE_FILES) do
+    local f = io.open(PLUGIN_ROOT .. "crossdrop.koplugin/" .. fn, "rb")
+    if not f then
+        table.insert(audit_hits, fn .. " unreadable")
+    else
+        local body = f:read("*a")
+        f:close()
+        if not body then
+            table.insert(audit_hits, fn .. " unreadable")
+        else
+            for _, needle in ipairs({ "1236", "1648", "2.06" }) do
+                for line in body:gmatch("([^\n]*)") do
+                    if line:find(needle, 1, true) then
+                        table.insert(audit_hits, fn .. " mentions " .. needle)
+                        break
+                    end
+                end
+            end
+        end
+    end
+end
+check("no Kindle-specific pixel numbers in the shipped sources",
+    #audit_hits == 0, table.concat(audit_hits, "; "))
 
 print(failures == 0 and "\nALL TESTS PASSED" or string.format("\n%d TEST(S) FAILED", failures))
 os.exit(failures == 0 and 0 or 1)

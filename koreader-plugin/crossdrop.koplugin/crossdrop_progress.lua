@@ -4,6 +4,16 @@
 -- and a plain "… please wait" line; update() is inert (progress never paints).
 
 local _ = require("gettext")
+
+-- UTF-8 named constants (shared with main.lua for readability)
+local ELLIPSIS = "…"
+local EM_DASH = "—"
+local ARROW = "→"
+local BULLET = "•"
+local LDQUO = "“"
+local RDQUO = "”"
+local LSQUO = "‘"
+local RSQUO = "’"
 local Blitbuffer = require("ffi/blitbuffer")
 local CenterContainer = require("ui/widget/container/centercontainer")
 local Device = require("device")
@@ -43,7 +53,7 @@ function WaitingDialog:init()
         target_txt = target_txt .. ":" .. tostring(self.target.port)
     end
     if self.target and self.target.folder and self.target.folder ~= "" then
-        target_txt = target_txt .. "  →  " .. self.target.folder
+        target_txt = target_txt .. "  " .. ARROW .. "  " .. self.target.folder
     end
     local target_line = TextWidget:new{
         text = target_txt,
@@ -68,7 +78,7 @@ function WaitingDialog:init()
             target_line,
             VerticalSpan:new{ width = sc(14) },
             TextBoxWidget:new{
-                text = _("… please wait\n\nThe reader is writing to its card."),
+                text = _(ELLIPSIS .. " please wait\n\nThe reader is writing to its card."),
                 face = Font:getFace("smallinfofont"),
                 width = inner_w,
             },

@@ -41,6 +41,8 @@
 local Blitbuffer = require("ffi/blitbuffer")
 local Button = require("ui/widget/button")
 local CenterContainer = require("ui/widget/container/centercontainer")
+local ConfirmBox = require("ui/widget/confirmbox")
+local LeftContainer = require("ui/widget/container/leftcontainer")
 local Device = require("device")
 local Font = require("ui/font")
 local FrameContainer = require("ui/widget/container/framecontainer")
@@ -51,6 +53,7 @@ local HorizontalSpan = require("ui/widget/horizontalspan")
 local ImageWidget = require("ui/widget/imagewidget")
 local IconButton = require("ui/widget/iconbutton")
 local InputContainer = require("ui/widget/container/inputcontainer")
+local InputDialog = require("ui/widget/inputdialog")
 local LineWidget = require("ui/widget/linewidget")
 local Notification = require("ui/widget/notification")
 local OverlapGroup = require("ui/widget/overlapgroup")
@@ -150,10 +153,31 @@ local HomeDialog = InputContainer:extend{
     -- browser, if any, the active tab is showing. nil == that tab's landing.
     send_screen = nil,    -- "files" (picker) | "destination" (folder tree)
     delete_screen = nil,  -- "tree" (delete tree)
+    -- Stored Devices is the Connections tab's inline manage area, exactly like
+    -- collections: a landing (the saved-device list), a per-device detail
+    -- page, both painted into the tab content region below the brand header +
+    -- tab bar — never a modal popup (the old storedDevicesDialog is gone; a
+    -- modal manage dialog over the dashboard is exactly what the device
+    -- rejected). connections_screen == nil means the Connections LANDING.
+    connections_screen = nil,  -- nil | "stored_devices" | "stored_device"
+    stored_view = nil,         -- the device the detail page is managing
+    stored_form_name = nil,    -- cached "Device name" from the name InputDialog
+    stored_form_ip = nil,      -- cached "WiFi IP" from the IP InputDialog
+    stored_editing = nil,      -- name of the device the upsert is REPLACING
     send_picker = nil,    -- PickerDialog parked on the Send tab
     dest_browser = nil,   -- DestinationDialog parked on the Send tab
     delete_browser = nil, -- DeleteDialog parked on the Delete tab
     content_h = nil,      -- height of the tab content region (measured at init)
+    -- Stored Devices is the Connections tab's INLINE manage area, exactly
+    -- like collections: a list landing (nil == Connections LANDING) and a
+    -- per-device detail page, both painted into the tab content region
+    -- below the brand header + tab bar — never a modal manage dialog
+    -- (that the device rejected on first field-test).
+    connections_screen = nil,  -- nil | "stored_devices" (list) | "stored_device" (detail)
+    stored_view = nil,         -- the device the detail page is managing
+    stored_form_name = nil,    -- cached "Device name" from the name InputDialog
+    stored_form_ip = nil,      -- cached "WiFi IP" from the IP InputDialog
+    stored_editing = nil,      -- name of the device the upsert is REPLACING (upsert-by-name)
 }
 
 function HomeDialog:init()
@@ -240,7 +264,7 @@ function HomeDialog:onBack()
 end
 
 -- The Storefront-style brand lockup: the plugin logo (icon.png beside this
--- file) as a small 24px glyph with "CrossDrop" to its right, all the way in
+-- file) as a small glyph with "CrossDrop" to its right, all the way in
 -- the top-left corner of the title row, with the ✕ that leaves the plugin on
 -- the far right (the dashboard's only ✕). A hairline rules the bottom of the
 -- row in place of TitleBar's bottom line. No image on disk, no logo and no
@@ -252,13 +276,8 @@ function HomeDialog:buildHeader(inner_w, sc)
     local logo
     if ok and lfs and lfs.attributes then
         local dir = (self.plugin and self.plugin.path) or LUA_PLUGIN_DIR
-        -- The lockup glyph is the logo BLACKENED and hardened on white BEFORE
-        -- scaling: icon.png is a near-black mark on white whose anti-aliased
-        -- edges lighten when the 360px master is squeezed to 24px (it read as
-        -- grey next to the wordmark). assets/logo-black.png is the same mark
-        -- re-thresholded to pure black/white, so the small glyph stays black.
-        -- If a designer ships a dedicated monochrome asset later, this is the
-        -- file to replace.
+        -- Use the pre-thresholded black asset so the small glyph stays black.
+        -- icon.png has anti-aliased edges that grey out when scaled down.
         local dir_assets = dir and (dir .. "/assets")
         local black = dir_assets and (dir_assets .. "/logo-black.png") or nil
         local icon = nil
@@ -273,8 +292,8 @@ function HomeDialog:buildHeader(inner_w, sc)
         if icon then
             logo = ImageWidget:new{
                 file = icon,
-                width = sc(24),
-                height = sc(24),
+                width = sc(28),
+                height = sc(28),
                 -- opaque-on-white glyph: bake it flat like a core icon (no
                 -- alpha path, nothing to blend, nothing to grey out).
                 is_icon = true,
@@ -364,6 +383,19 @@ function HomeDialog:showTab(key)
         elseif key == "delete" and self.delete_screen ~= nil then
             self.delete_screen = nil
             backed = true
+        elseif key == "connections" and self.connections_screen ~= nil then
+            -- Re-tapping the open Connections tab backs out to the landing
+            -- (Stored Devices list + per-device detail collapse to the WiFi
+            -- landing) exactly like Send, Delete and Collections collapse to
+            -- theirs.
+            self.connections_screen = nil
+            backed = true
+        elseif key == "collections" and self.collections_screen ~= nil then
+            -- Re-tapping the open Collections tab backs out to the landing
+            -- (view / edit / create / send all collapse to "Your Collections")
+            -- exactly like Send and Delete collapse to theirs.
+            self.collections_screen = nil
+            backed = true
         end
         if not backed then return end
         self:init()
@@ -387,59 +419,125 @@ function HomeDialog:showTab(key)
     UIManager:setDirty(self, "ui")
 end
 
--- The tab bar is Storefront's, with one user-facing divergence: EVERY tab
--- keeps its label visible (active = bold black + full-width underline;
--- inactive = grey), because here "Connections / Send A File / Delete Files"
--- are words, not guessable symbols — icons always sit beside the labels
--- they explain. The plugin SHIPS no glyphs; until assets/* exist the bar
--- falls back to label-only and still reads perfectly. Equal fixed widths
--- keep the bar exactly filling the row (a third long tab once pushed an
--- auto-sized bar off screen); tabs are InputContainers over image/text
--- blocks centered in each window, the same tap recipe as the picker rows.
+-- The tab bar: four EVEN slots (25% each), labels centered, truncated if needed.
+-- No complex fitting cascade — fixed geometry guarantees even columns on any device.
 function HomeDialog:buildTabBar(content_w)
     local sc = function(v) return Device.screen:scaleBySize(v) end
     local theme = require("crossdrop_theme")
     local tabs = {
         { key = "connections", label = _("Connections") },
         { key = "send", label = _("Send A File") },
+        { key = "collections", label = _("Collections") },
         { key = "delete", label = _("Delete Files") },
     }
-    local gaps = sc(6) * (#tabs - 1)
+    -- ONE gap between every pair of tabs (sc(2) = 2px scaled).
+    local gap = sc(2)
+    local gaps = gap * (#tabs - 1)
+    -- Each slot is exactly 1/4 of the available width (minus gaps).
+    -- Distribute the floor remainder to the last slot so the bar exactly spans content_w.
     local btn_w = math.floor((content_w - gaps) / #tabs)
-    local tab_font = theme.face_label_size or 18
+    local remain = math.max(0, content_w - (gaps + #tabs * btn_w))
+    local slots = {}
+    for i = 1, #tabs do
+        slots[i] = btn_w + (i == #tabs and remain or 0)
+    end
     local icons = self:tabIconPaths()
+
+    -- Dynamic cascade: fit icon + FULL label in each slot at the largest readable font.
+    -- Shrinks font until all 4 tabs fit their slots — NO short labels.
+    local base_font = theme.face_label_size or 18
+    local function iconWidth()
+        return sc(22)
+    end
+    local function measure(text, font_size, active)
+        local ok, face = pcall(Font.getFace, Font, "smallinfofont", font_size)
+        if not ok or not face then return math.huge end
+        local tw_ok, w = pcall(function()
+            return TextWidget:new{ text = text, face = face, bold = active }:getSize().w or 0
+        end)
+        return tw_ok and w or math.huge
+    end
+    local function fits(slot_w, font_size, with_icons)
+        for i, t in ipairs(tabs) do
+            local w = slot_w
+            if with_icons and icons and icons[t.key] then
+                w = w - iconWidth() - gap
+            end
+            if w <= 0 then return false end
+            if measure(t.label, font_size, self.tab == t.key) > w then
+                return false
+            end
+        end
+        return true
+    end
+    local chosen_font = base_font
+    local chosen_icons = icons ~= nil
+    local found = false
+    for f = base_font, 10, -2 do
+        for _, with_icons in ipairs({ true, false }) do
+            if not with_icons or icons then
+                local all_fit = true
+                for i = 1, #tabs do
+                    if not fits(slots[i], f, with_icons) then
+                        all_fit = false
+                        break
+                    end
+                end
+                if all_fit then
+                    chosen_font = f
+                    chosen_icons = with_icons
+                    found = true
+                    break
+                end
+            end
+        end
+        if found then break end
+    end
+    -- Fallback: if even floor font doesn't fit, force smallest font, no icons
+    if not found then
+        chosen_font = 10
+        chosen_icons = false
+    end
+
     local widgets = {}
     for i, t in ipairs(tabs) do
         if i > 1 then
-            widgets[#widgets + 1] = HorizontalSpan:new{ width = sc(6) }
+            widgets[#widgets + 1] = HorizontalSpan:new{ width = gap }
         end
         local active = self.tab == t.key
-        local icon = icons and icons[t.key]
+        local slot_w = slots[i]
         local elems = {}
-        if icon then
+        if chosen_icons and icons and icons[t.key] then
+            local icon = icons[t.key]
             elems[#elems + 1] = ImageWidget:new{
                 file = active and icon.active or icon.inactive,
                 width = sc(22),
                 height = sc(22),
-                -- is_icon makes ImageWidget bake a transparent PNG onto white
-                -- at load time (the core elevated-icon path): no alpha blit,
-                -- so a glyph can never paint itself black on this panel.
                 is_icon = true,
             }
-            elems[#elems + 1] = HorizontalSpan:new{ width = sc(6) }
+            elems[#elems + 1] = HorizontalSpan:new{ width = gap }
         end
         elems[#elems + 1] = TextWidget:new{
             text = t.label,
-            face = Font:getFace("smallinfofont", tab_font),
+            face = Font:getFace("smallinfofont", chosen_font),
             bold = active,
+            max_width = slot_w - (chosen_icons and icons and icons[t.key] and (sc(22) + gap) or 0),
             fgcolor = active and Blitbuffer.COLOR_BLACK or theme.color_label_dim,
         }
+        -- Center the block in its exact slot: leading spacer = half the leftover.
+        local raw = HorizontalGroup:new({})
+        for _, e in ipairs(elems) do table.insert(raw, e) end
+        local raw_w = type(raw.getSize) == "function" and (raw:getSize().w or 0) or 0
+        local hpad = math.max(0, math.floor((slot_w - raw_w) / 2))
+        if hpad > 0 then
+            table.insert(elems, 1, HorizontalSpan:new{ width = hpad })
+        end
         local row = HorizontalGroup:new(elems)
         local underline
         if active then
             underline = LineWidget:new{
                 background = Blitbuffer.COLOR_BLACK,
-                dimen = Geom:new{ w = btn_w, h = sc(3) },
+                dimen = Geom:new{ w = slot_w, h = sc(3) },
             }
         else
             underline = VerticalSpan:new{ width = sc(3) }
@@ -453,11 +551,12 @@ function HomeDialog:buildTabBar(content_w)
         local gh = type(group.getSize) == "function" and (group:getSize().h or sc(40)) or sc(40)
         local tab_btn = InputContainer:new{
             FrameContainer:new{
+                padding = 0, -- device FrameContainer defaults padding to Size.padding.default; explicit 0 so the tab is exactly slot_w
                 padding_top = sc(4),
                 padding_bottom = 0,
                 bordersize = 0,
-                CenterContainer:new{
-                    dimen = Geom:new{ w = btn_w, h = gh },
+                LeftContainer:new{
+                    dimen = Geom:new{ w = slot_w, h = gh },
                     group,
                 },
             },
@@ -468,6 +567,7 @@ function HomeDialog:buildTabBar(content_w)
             self:showTab(t.key)
             return true
         end
+        -- Gesture events so InputContainer actually receives taps (device).
         tab_btn.ges_events = {
             Tap = {
                 GestureRange:new{
@@ -484,9 +584,20 @@ function HomeDialog:buildTabBar(content_w)
                 },
             },
         }
+        -- Centering contract metadata (trace only; no rendering effect).
+        tab_btn._slot_w = slot_w
+        tab_btn._raw_w = raw_w
+        tab_btn._pad = hpad
         widgets[#widgets + 1] = tab_btn
     end
-    return HorizontalGroup:new(widgets)
+    local tab_bar = HorizontalGroup:new(widgets)
+    local bar_w = type(tab_bar.getSize) == "function" and (tab_bar:getSize().w or 0) or 0
+    if bar_w > content_w then
+        logger.warn("crossdrop: tab bar WIDTH ", bar_w,
+            " exceeds content width ", content_w, " — the last tab will hang off",
+            " the right edge of the screen (slot ", btn_w, ", gap ", gap, ")")
+    end
+    return tab_bar
 end
 
 -- Resolve the optional tab glyphs (plugin-local assets/). Storefront's
@@ -504,7 +615,7 @@ function HomeDialog:tabIconPaths()
     local has = function(p) return lfs.attributes(p, "mode") == "file" end
     local dir = (self.plugin and self.plugin.path) or LUA_PLUGIN_DIR
     if not dir then return nil end
-    local keys = { "connections", "send", "delete" }
+    local keys = { "connections", "send", "collections", "delete" }
     local out = {}
     for _, key in ipairs(keys) do
         local inactive, active
@@ -534,6 +645,10 @@ function HomeDialog:row(text, opts)
         -- our square buttons reads as a blob that skips the corners.
         radius = Size.radius.button - 1, -- -1: core's unhighlight resets radius == Size.radius.button to nil, squaring the button after first tap
         width = self.row_w,
+        bordersize = opts and opts.bordersize,
+        text_font_bold = opts and opts.bold == true,
+        background = opts and opts.background,
+        text_font_color = opts and opts.text_color,
         callback = opts and opts.callback,
         hold_callback = opts and opts.hold_callback,
     }
@@ -541,14 +656,132 @@ end
 
 function HomeDialog:header(text)
     local sc = function(v) return Device.screen:scaleBySize(v) end
+    -- max_width is what keeps a long per-screen title (a collection name)
+    -- from painting PAST the card and off the right edge of the screen:
+    -- TextWidget clips at max_width with an ellipsis instead of spilling.
+    -- padding_left/right = 0: the device FrameContainer default side padding
+    -- would add sc(5) each side on top of the capped max_width and push the
+    -- frame past the card anyway.
     return FrameContainer:new{
         padding_top = sc(6),
         padding_bottom = sc(2),
+        padding_left = 0,
+        padding_right = 0,
         bordersize = 0,
         TextWidget:new{
             text = text,
             face = Font:getFace("smallinfofont"),
+            max_width = self.row_w or 600,
         },
+    }
+end
+
+-- A drill-down screen's title row: a small back chevron (chevron.left) on the
+-- left, then the title beside it. EVERY forward step out of a landing gets one
+-- — one chevron tap walks back exactly one screen (view→landing, edit→view,
+-- create-select→create-name, send→landing), while re-tapping the open TAB is
+-- the full shortcut straight back to the tab's landing. The chevron is a
+-- plain icon Button (the pager's recipe), flashless; its stretch is taken off
+-- the title's max_width so a long title still clips, never spills.
+function HomeDialog:screenTitle(text, one_step)
+    local sc = function(v) return Device.screen:scaleBySize(v) end
+    local row_w = self.row_w or 600
+    local elems = {}
+    local back_w = 0
+    if one_step then
+        local back = Button:new{
+            icon = "chevron.left",
+            icon_width = sc(18),
+            icon_height = sc(18),
+            width = sc(36),
+            height = sc(36),
+            bordersize = 0,
+            radius = Size.radius.button - 1,
+            background = nil,
+            allow_flash = false,
+            show_parent = self,
+            callback = one_step,
+        }
+        elems[#elems + 1] = back
+        back_w = sc(36)
+    end
+    local tw = TextWidget:new{
+        text = text,
+        face = Font:getFace("smallinfofont"),
+        max_width = math.max(0, row_w - back_w - sc(4)),
+    }
+    -- Center the title text against the (taller) chevron button: pad the
+    -- title up by half the height difference so the title reads vertically
+    -- centered beside the chevron instead of clinging to the row's top.
+    local th = (tw.getSize and tw:getSize().h) or sc(26)
+    local pad_top = math.max(0, math.floor((sc(36) - th) / 2))
+    elems[#elems + 1] = FrameContainer:new{
+        padding_top = pad_top,
+        padding_bottom = 0,
+        bordersize = 0,
+        tw,
+    }
+    return FrameContainer:new{
+        padding_top = sc(6),
+        padding_bottom = sc(2),
+        bordersize = 0,
+        VerticalGroup:new{ align = "left", HorizontalGroup:new(elems) },
+    }
+end
+
+-- One chevron tap back to the previous collections screen. The TAB's re-tap is
+-- the full shortcut (showTab collapses any sub-screen to the landing); this is
+-- the single-step walk-up: view→landing, edit→view, create-select→create-name,
+-- create-name→landing, send→landing.
+function HomeDialog:collectionsBackOneStep()
+    self.collections_view = nil
+    if self.collections_screen == "edit" and self.collections_edit then
+        self.collections_screen = "view"
+        self.collections_view = self.collections_edit
+    elseif self.collections_screen == "create_select" then
+        self.collections_screen = "create_name"
+    else
+        self.collections_screen = nil
+    end
+    self:refresh()
+end
+
+-- The hairline between list rows: a thin gray rule with a little air around
+    -- it (the send picker's separator, verbatim). Book lists — collection view,
+    -- edit, create-select — read as discrete rows, never boxes.
+function HomeDialog:separator()
+    local sc = function(v) return Device.screen:scaleBySize(v) end
+    return VerticalGroup:new{
+        VerticalSpan:new{ width = sc(2) },
+        LineWidget:new{
+            dimen = Geom:new{ w = self.row_w, h = Size.line.thick },
+            background = Blitbuffer.COLOR_LIGHT_GRAY,
+        },
+        VerticalSpan:new{ width = sc(2) },
+    }
+end
+
+-- A collection book row: the SEND PICKER'S row recipe verbatim (boxless —
+-- bordersize 0 — font 22 everywhere, aligned left, hairlines only between
+-- rows), so every collection list (view / edit / create-select) reads exactly
+-- like Send A File. No box ever wraps a book, and every row's text is the
+-- same size.
+function HomeDialog:bookRow(text, opts)
+    opts = opts or {}
+    return Button:new{
+        text = text,
+        width = self.row_w,
+        align = "left",
+        bordersize = opts.bordersize or 0,
+        radius = Size.radius.button - 1,
+        avoid_text_truncation = false,
+        padding_h = Size.padding.large,
+        text_font_face = "smallinfofont",
+        text_font_size = 22,
+        text_font_bold = opts.bold == true,
+        background = opts.background,
+        text_font_color = opts.text_color,
+        callback = opts.callback,
     }
 end
 
@@ -560,7 +793,36 @@ end
 function HomeDialog:buildTabContent(tab, width, area_h)
     self.row_w = width
     if tab == "connections" then
+        -- Connections is a tab-with-a-dashboard, exactly like Collections:
+        -- a landing plus an inline manage area. connections_screen is nil on
+        -- the landing ("stored_devices" = the saved-device list, whose rows
+        -- open the per-device detail "stored_device" — both painted into the
+        -- same tab content region, never a modal).
+        if self.connections_screen == "stored_devices" then
+            return self:renderStoredDevicesLanding()
+        end
+        if self.connections_screen == "stored_device" then
+            return self:renderStoredDeviceDetail()
+        end
         return self:renderConnections()
+    end
+    if tab == "collections" then
+        if self.collections_screen == "view" then
+            return self:renderCollectionView(area_h)
+        end
+        if self.collections_screen == "edit" then
+            return self:renderCollectionEdit(area_h)
+        end
+        if self.collections_screen == "create_name" then
+            return self:renderCollectionCreateName(area_h)
+        end
+        if self.collections_screen == "create_select" then
+            return self:renderCollectionCreateSelect(area_h)
+        end
+        if self.collections_screen == "send" then
+            return self:renderCollectionSend(area_h)
+        end
+        return self:renderCollectionsLanding()
     end
     if tab == "delete" then
         if self.delete_screen == "tree" then
@@ -670,10 +932,19 @@ end
 -- KOReader-managed radios a power-save suspend would tear the link down
 -- mid-probe and read as a false "Offline". The probe retries (3s then 6s)
 -- inside main.lua, so this tap still paints a notice first and never looks
--- frozen if the reader answers on a late attempt.
+-- frozen if the reader answers on a late attempt. Every configured
+-- connection of this kind is probed — the manual "Set WiFi IP" slot and, when
+-- one is selected, the stored device — and the FIRST that answers is what the
+-- test reports (both should be the same reader on the same network; probing
+-- both means the row never only checks the stored device).
 function HomeDialog:probeAndShow(kind)
-    local target = self:targetFor(kind)
-    if not target then return end
+    local targets = {}
+    for _, t in ipairs(self.plugin:configuredTargets() or {}) do
+        if t.kind == kind then
+            targets[#targets + 1] = t
+        end
+    end
+    if #targets == 0 then return end
     local checking = Notification:new{
         text = _("Checking WiFi\226\128\166"),
         timeout = 0,
@@ -681,16 +952,26 @@ function HomeDialog:probeAndShow(kind)
     UIManager:show(checking)
     UIManager:forceRePaint()
     local run_ok, ok, info, err = self.plugin:withStandby(function()
-        return self.plugin:probeTarget(self:targetFor(kind))
+        local last_err
+        for _, t in ipairs(targets) do
+            local ok_i, info_i, err_i = self.plugin:probeTarget(t)
+            if ok_i then
+                self.last_reachable_target = t
+                return true, info_i
+            end
+            last_err = err_i
+        end
+        self.last_reachable_target = nil
+        return nil, nil, last_err
     end)
     UIManager:close(checking)
-    if not run_ok then
-        self:showCheckFailure(kind, tostring(ok or "probe aborted"))
-        return
-    end
     local reach = self.plugin._reach or {}
     reach[kind] = ok and "ok" or "down"
     self.plugin._reach = reach
+    if not run_ok then
+        self:showCheckFailure(kind, tostring(info or "probe aborted"))
+        return
+    end
     if ok then
         local who = info and info.device and tostring(info.device) or "CrossDrop reader"
         local ver = info and info.version and tostring(info.version) or ""
@@ -736,29 +1017,347 @@ function HomeDialog:refresh()
     end)
 end
 
+-- ─────────── Stored Devices (inline manage, Collections-style) ───────────
+-- The Connections tab's saved-device area is a dashboard-within-a-dashboard
+-- exactly like Collections: openStoredDevices paints the LIST landing (the
+-- upsert form rows + every saved device) into the tab content region, and
+-- openStoredDevice paints a per-device detail page. Both live BELOW the
+-- always-visible brand header + tab bar, never a modal. connectionsBackOneStep
+-- walks one chevron back (detail → list → Connections landing); the showTab
+-- collapse handles the tab re-tap.
+function HomeDialog:openStoredDevices()
+    self.connections_screen = "stored_devices"
+    self:refresh()
+end
+
+function HomeDialog:renderStoredDevicesLanding(area_h)
+    local vg = VerticalGroup:new{ align = "left" }
+    local sc = function(v) return Device.screen:scaleBySize(v) end
+
+    table.insert(vg,self:screenTitle(_("Stored Devices"), function() self:connectionsBackOneStep() end))
+    table.insert(vg, VerticalSpan:new{ width = sc(8) })
+    table.insert(vg, TextBoxWidget:new{
+        text = _("These are the readers that keep the same WiFi IP through your router. Save them here and pick one — the connection test then also checks the stored device, not only the Set WiFi IP entry above."),
+        face = Font:getFace("xx_smallinfofont"),
+        width = self.row_w,
+    })
+    table.insert(vg, VerticalSpan:new{ width = sc(6) })
+
+    -- The upsert form caches its two inputs on the dialog object (they are
+    -- painted into the landing rows), exactly like the collections create
+    -- page. Selecting a saved device below (or tapping Save) walks back.
+    table.insert(vg,self:row(string.format(_("Device name%s"), self.stored_form_name or _("   \226\128\166  tap to set")), {
+        callback = function() self:inputStoredName() end,
+    }))
+    table.insert(vg,self:row(string.format(_("WiFi IP%s"), self.stored_form_ip or _("   \226\128\166  tap to set")), {
+        callback = function() self:inputStoredIp() end,
+    }))
+    table.insert(vg,self:row(_("Save Stored Device"), {
+        callback = function() self:saveStoredDevice() end,
+    }))
+    table.insert(vg, VerticalSpan:new{ width = sc(10) })
+    table.insert(vg, self:separator())
+
+    local devices = self.plugin:loadStoredDevices() or {}
+    if #devices == 0 then
+        table.insert(vg, TextBoxWidget:new{
+            text = _("No saved devices yet. Enter a name + WiFi IP above and tap \"Save Stored Device\"."),
+            face = Font:getFace("xx_smallinfofont"),
+            width = self.row_w,
+        })
+    else
+        for i, dev in ipairs(devices) do
+            table.insert(vg,self:row(string.format("%s   \226\128\164   %s", dev.name or "", dev.ip or ""), {
+                callback = function() self:openStoredDevice(dev) end,
+            }))
+            if i < #devices then table.insert(vg,self:separator()) end
+        end
+    end
+
+    table.insert(vg, VerticalSpan:new{ width = sc(12) })
+    table.insert(vg,self:row(_("Back"), {
+        callback = function() self:connectionsBackOneStep() end,
+    }))
+    return vg
+end
+
+function HomeDialog:openStoredDevice(dev)
+    if not dev then return end
+    self.connections_screen = "stored_device"
+    self.stored_view = dev
+    self:refresh()
+end
+
+function HomeDialog:renderStoredDeviceDetail(area_h)
+    local vg = VerticalGroup:new{ align = "left" }
+    local sc = function(v) return Device.screen:scaleBySize(v) end
+    local dev = self.stored_view
+    if not dev then return self:renderStoredDevicesLanding(area_h) end
+
+    table.insert(vg,self:screenTitle(dev.name or "", function() self:connectionsBackOneStep() end))
+    table.insert(vg, VerticalSpan:new{ width = sc(8) })
+    table.insert(vg, TextBoxWidget:new{
+        text = string.format(_("WiFi IP   \226\128\164   %s"), dev.ip or "?"),
+        face = Font:getFace("xx_smallinfofont"),
+        width = self.row_w,
+    })
+    table.insert(vg, VerticalSpan:new{ width = sc(10) })
+
+    table.insert(vg,self:row(_("Select Stored Device"), {
+        callback = function() self:selectStoredDevice(dev) end,
+    }))
+    table.insert(vg,self:row(_("Edit"), {
+        callback = function() self:editStoredDevice(dev) end,
+    }))
+    table.insert(vg,self:row(_("Delete"), {
+        callback = function() self:confirmDeleteStoredDevice(dev) end,
+    }))
+    table.insert(vg, VerticalSpan:new{ width = sc(12) })
+    table.insert(vg,self:row(_("Back"), {
+        callback = function() self:connectionsBackOneStep() end,
+    }))
+    return vg
+end
+
+-- One chevron back over the open stored-device page: detail → list, list →
+-- Connections landing. The TAB's re-tap collapse (showTab) is the fast
+-- walk; this is the single-step one, same as collectionsBackOneStep.
+function HomeDialog:connectionsBackOneStep()
+    if self.connections_screen == "stored_device" then
+        self.connections_screen = "stored_devices"
+        self.stored_view = nil
+    elseif self.connections_screen == "stored_devices" then
+        self.connections_screen = nil
+    end
+    self:refresh()
+end
+
+-- InputDialogs for the two upsert fields, driven the same way the harness
+-- drives the collections name / set-IP dialogs (getInputText stub + Save
+-- button tap). Both cache onto self.stored_form_* so the landing form rows
+-- repaint with what was entered.
+function HomeDialog:inputStoredName()
+    local iw
+    local function done()
+        local text = (iw and iw:getInputText()) or ""
+        UIManager:close(iw)
+        -- Close → re-init must not run inside the tap handler (the panel
+        -- froze once from that): defer the form repaint like the collections
+        -- name dialog does.
+        UIManager:nextTick(function()
+            self.stored_form_name = text:match("^%s*(.-)%s*$") or ""
+            self:refresh()
+        end)
+    end
+    iw = InputDialog:new{
+        title = _("Device name"),
+        input = self.stored_form_name or "",
+        type = "text",
+        modal = true,
+        buttons = {
+            {
+                { text = _("Save"), is_enter_default = true, callback = done },
+            },
+            {
+                { text = _("Cancel"), callback = function() UIManager:close(iw) end },
+            },
+        },
+    }
+    UIManager:show(iw)
+end
+
+function HomeDialog:inputStoredIp()
+    local iw
+    local function done()
+        local text = (iw and iw:getInputText()) or ""
+        UIManager:close(iw)
+        UIManager:nextTick(function()
+            self.stored_form_ip = text:match("^%s*(.-)%s*$") or ""
+            self:refresh()
+        end)
+    end
+    iw = InputDialog:new{
+        title = _("WiFi IP"),
+        input = self.stored_form_ip or "",
+        type = "text",
+        modal = true,
+        buttons = {
+            {
+                { text = _("Save"), is_enter_default = true, callback = done },
+            },
+            {
+                { text = _("Cancel"), callback = function() UIManager:close(iw) end },
+            },
+        },
+    }
+    UIManager:show(iw)
+end
+
+-- Upsert BY NAME (like collections create-name is the create key): the form
+-- name IS the device key, so a re-typed name REPLACES that device's IP.
+-- Validates only IPv4 (the day one manage recipe required it); everything is
+-- persisted through saveStoredDevices so a plugin update never loses it.
+function HomeDialog:saveStoredDevice()
+    local name = (self.stored_form_name or ""):match("^%s*(.-)%s*$") or ""
+    local ip = (self.stored_form_ip or ""):match("^%s*(.-)%s*$") or ""
+    if name == "" then
+        UIManager:show(Notification:new{ text = _("Enter a device name first."), timeout = 2 })
+        return
+    end
+    if not ip:match("^%d+%.%d+%.%d+%.%d+$") then
+        UIManager:show(Notification:new{ text = _("That WiFi IP doesn't look right. Try e.g. 192.168.1.50."), timeout = 2 })
+        return
+    end
+
+    local devices = self.plugin:loadStoredDevices() or {}
+    local replaced = false
+    for i, d in ipairs(devices) do
+        if d.name == name then
+            devices[i] = { name = name, ip = ip }
+            replaced = true
+            break
+        end
+    end
+    if not replaced then
+        table.insert(devices, { name = name, ip = ip })
+    end
+    self.plugin:saveStoredDevices(devices)
+
+    self.stored_form_name = nil
+    self.stored_form_ip = nil
+    self.connections_screen = "stored_devices"
+    self:refresh()
+end
+
+-- Select makes this the ACTIVE stored target (the plugin persists the
+-- selection to devices.json, the same way a manual selectDevice does) and
+-- walks back to the list landing.
+function HomeDialog:selectStoredDevice(dev)
+    if not dev then return end
+    self.plugin:selectDevice(dev)
+    self.connections_screen = "stored_devices"
+    self.stored_view = nil
+    self:refresh()
+end
+
+-- Edit reopens the form prefilled and remembers WHICH name is being edited,
+-- so Save REPLACES in place (upsert-by-name already does; stored_editing is
+-- there for the harness to confirm the prefill happened).
+function HomeDialog:editStoredDevice(dev)
+    if not dev then return end
+    self.stored_form_name = dev.name
+    self.stored_form_ip = dev.ip
+    self.stored_editing = dev.name
+    self.connections_screen = "stored_devices"
+    self.stored_view = nil
+    self:refresh()
+end
+
+-- Bare ConfirmBox delete, mirroring confirmDeleteCollection byte-for-byte:
+-- the harness shows it PRESENCE-ONLY (never taps Delete), because a real
+-- tap would remove a device the fixture depends on.
+function HomeDialog:confirmDeleteStoredDevice(dev)
+    local confirm = ConfirmBox:new{
+        text = string.format(_("Delete stored device \"%s\"?"), dev.name or ""),
+        ok_text = _("Delete"),
+        ok_callback = function()
+            UIManager:close(confirm)
+            self:deleteStoredDevice(dev)
+        end,
+    }
+    UIManager:show(confirm)
+end
+
+function HomeDialog:deleteStoredDevice(dev)
+    if not dev then return end
+    local devices = self.plugin:loadStoredDevices() or {}
+    local kept = {}
+    for _, d in ipairs(devices) do
+        if d.name ~= dev.name then table.insert(kept, d) end
+    end
+    self.plugin:saveStoredDevices(kept)
+    self.stored_view = nil
+    self.connections_screen = "stored_devices"
+    self:refresh()
+end
+
 function HomeDialog:renderConnections()
     local vg = VerticalGroup:new{ align = "left" }
     local reach = self.plugin._reach or {}
 
+    -- Handle different sub-screens within connections tab
+    if self.connections_screen == "instructions" then
+        return self:renderInstructions()
+    end
+
+    local vg = VerticalGroup:new{ align = "left" }
+    local reach = self.plugin._reach or {}
+
     table.insert(vg,self:header(_("WiFi connection")))
-    local wifi = self:targetFor("wifi")
-    if wifi then
+    -- The row IS the connection test: tapping it probes EVERY configured
+    -- connection — the manual "Set WiFi IP" slot always, plus the selected
+    -- Stored Device when one is active (accessory). The status word leads the
+    -- row and reports whichever of them answered the probe first; each
+    -- address is listed below so the test is never "only checking the stored
+    -- device". The status is the FIRST text so the TextWidget's max-width
+    -- truncation (which cuts from the tail) can never ellipsize it away.
+    local targets = {}
+    for _, t in ipairs(self.plugin:configuredTargets() or {}) do
+        if t.kind == "wifi" then
+            targets[#targets + 1] = t
+        end
+    end
+    if #targets > 0 then
+        local addr_lines = {}
+        for i, t in ipairs(targets) do
+            local head = "WiFi"
+            if i == 1 and t.selected and t.name and t.name ~= "" then
+                head = t.name
+            end
+            addr_lines[#addr_lines + 1] = string.format("%s   %s", head, ip_str(t))
+        end
+        -- Button text: leads with the status. Idle it reads "Test Device
+        -- Connection"; after a probe it shows WHICH target answered ("Reachable:
+        -- <name> (<ip>)") or "No Device Found" when none of them did.
+        local button_text
+        if self.last_reachable_target then
+            local head = self.last_reachable_target.name and self.last_reachable_target.name ~= "" and self.last_reachable_target.name or "WiFi"
+            button_text = string.format(_("Reachable: %s  (%s)"), head, ip_str(self.last_reachable_target))
+        elseif reach.wifi == "down" then
+            button_text = _("No Device Found")
+        else
+            button_text = _("Test Device Connection  \226\128\162  Tap to test")
+        end
         table.insert(vg,self:row(
-            string.format("WiFi   %s\n%s  \226\128\164  %s", ip_str(wifi),
-                _("File Transfer \226\134\146 Join Network"), status_word(reach.wifi)), {
+            button_text .. "\n"
+                .. table.concat(addr_lines, "\n") .. "\n"
+                .. _("File Transfer \226\134\146 Join a Network"), {
             callback = function() self:check("wifi") end,
         }))
     end
-    table.insert(vg,self:row(_("Set WiFi IP\226\128\166"), {
+    -- Set WiFi IP is the everyday manual method (a plain input for the
+    -- reader's current address). Stored Devices is the separate area for the
+    -- router-fixed devices you can save and select; a selection wins the
+    -- connection test until you clear it.
+    table.insert(vg,self:row(_("Set WiFi IP (may change)\226\128\166"), {
         callback = function() self.plugin:editIp("wifi", function() self:refresh() end) end,
     }))
+    table.insert(vg,self:row(_("Stored Devices\226\128\166"), {
+        callback = function() self:openStoredDevices() end,
+    }))
 
-    -- Setup guide for a first-time reader (the space the WiFi rows need
-    -- between the controls and the text). Steps mirror the buttons directly
-    -- above, so a new user reads exactly where each action happens. The
-    -- version line sits ABOVE the guide: at the guide's tail it ran off the
-    -- bottom of the panel. The guide itself uses the smaller info font so
-    -- the steps (some wrap to 2-3 lines) fit with room to spare.
+    -- Read position sync toggle
+    local send_read_pos = G_reader_settings:readSetting("crossdrop_send_read_pos") or false
+    table.insert(vg, self:row(
+        string.format(_("Send read position  \226\128\162  %s"), send_read_pos and _("ON") or _("OFF")), {
+        callback = function()
+            local new_val = not send_read_pos
+            G_reader_settings:saveSetting("crossdrop_send_read_pos", new_val)
+            self:refresh()
+        end,
+    }))
+
+    -- Instructions button
     local sc = function(v) return Device.screen:scaleBySize(v) end
     table.insert(vg, VerticalSpan:new{ width = sc(10) })
     table.insert(vg, TextBoxWidget:new{
@@ -767,20 +1366,813 @@ function HomeDialog:renderConnections()
         width = self.row_w,
     })
     table.insert(vg, VerticalSpan:new{ width = sc(6) })
+    table.insert(vg, self:row(_("Instructions\226\128\166"), {
+        callback = function()
+            self.connections_screen = "instructions"
+            self:refresh()
+        end,
+    }))
+
+    return vg
+end
+
+-- Instructions page with back button
+function HomeDialog:renderInstructions()
+    local vg = VerticalGroup:new{ align = "left" }
+    local sc = function(v) return Device.screen:scaleBySize(v) end
+
+    table.insert(vg, self:screenTitle(_("Instructions"), function()
+        self.connections_screen = nil
+        self:refresh()
+    end))
+    table.insert(vg, VerticalSpan:new{ width = sc(10) })
+
+    local guide_text = _("To receive files, set up your Xteink device like this:\n")
+        .. _("1. Put the Xteink and this Kindle on the same Wi-Fi network.\n")
+        .. _("2. With CrossPoint running on the Xteink, open File Transfer and tap \"Join WiFi Network\".\n")
+        .. _("3. On that screen, the device's IP address is below the QR code.\n")
+        .. _("4. Most routers hand out a new address occasionally, so start with \"Set WiFi IP\" \226\128\148 enter the address from step 3. If your router lets you reserve a fixed IP for the reader, add it under \"Stored Devices\" instead and you won't need to update it again.\n")
+        .. _("5. Then tap the connection row above to check \226\128\148 it should read \"Reachable\" when connected.\n")
+        .. _("6. Send from the Send A File tab: pick files from the list, or send the currently open file. Pick the destination folder there too \226\128\148 it defaults to CrossDropped Files on the reader.\n")
+        .. _("7. Using \"Set WiFi IP\"? If a connection ever fails, the router likely handed the reader a new address \226\128\148 check it on the reader's Join a Network screen and update it here. A Stored Device with a fixed IP shouldn't need this.")
+
+    local guide_widget = TextBoxWidget:new{
+        text = guide_text,
+        face = Font:getFace("xx_smallinfofont"),
+        width = self.row_w,
+    }
+
+    local guide_container = InputContainer:new{
+        guide_widget,
+        align = "left",
+    }
+    table.insert(vg, guide_container)
+
+    return vg
+end
+
+-- ─────────────────────── Collections tab ────────────────────────────────
+-- Landing: shows existing collections with actions, plus Create button.
+
+function HomeDialog:renderCollectionsLanding()
+    local vg = VerticalGroup:new{ align = "left" }
+    local sc = function(v) return Device.screen:scaleBySize(v) end
+
+    table.insert(vg, self:header(_("Your Collections")))
+
+    if self.collections_waiting then
+        -- A collection is being created (paint progress, then block): the
+        -- landing holds ONLY this message while the save runs, then the
+        -- refreshed landing lists the new collection and it disappears.
+        table.insert(vg, VerticalSpan:new{ width = sc(18) })
+        table.insert(vg, TextBoxWidget:new{
+            text = _("Please wait while the collection is created\226\128\166"),
+            face = Font:getFace("smallinfofont"),
+            width = self.row_w,
+        })
+        return vg
+    end
+
+    local collections = self:loadCollections()
+    if #collections == 0 then
+        table.insert(vg, VerticalSpan:new{ width = sc(10) })
+        table.insert(vg, TextBoxWidget:new{
+            text = _("No collections yet. Tap \"Create Collection\" to make one."),
+            face = Font:getFace("xx_smallinfofont"),
+            width = self.row_w,
+        })
+    else
+        for i, coll in ipairs(collections) do
+            local count = #coll.books
+            table.insert(vg, self:row(
+                string.format(_("%s  \226\128\162  %d book(s)"), coll.name, count), {
+                callback = function() self:openCollectionView(coll) end,
+            }))
+        end
+    end
+
+    table.insert(vg, VerticalSpan:new{ width = sc(18) })
+    table.insert(vg, self:row(_("Create Collection"), {
+        callback = function() self:openCollectionCreateName() end,
+    }))
+
+    return vg
+end
+
+-- Collections persistence lives OUTSIDE the plugin folder on purpose:
+-- Storefront replaces the whole crossdrop.koplugin directory on every update,
+-- so anything written there would be wiped the next time the plugin updates.
+-- The canonical KOReader data dir (DataStorage:getDataDir, the same root the
+-- Storefront plugin itself parks its settings/cache in) survives plugin
+-- replacement, so collections.json goes under <data dir>/crossdrop/.
+function HomeDialog:getCollectionsPath()
+    local base = nil
+    local ok, DataStorage = pcall(require, "datastorage")
+    if ok and DataStorage and type(DataStorage.getDataDir) == "function" then
+        local ok2, dd = pcall(function() return DataStorage:getDataDir() end)
+        if ok2 and type(dd) == "string" and dd ~= "" then
+            base = dd .. "/crossdrop"
+        end
+    end
+    if not base then
+        -- No DataStorage (bare test env / unusual build): fall back to the
+        -- plugin folder's PARENT — never the folder itself, which is exactly
+        -- the directory Storefront replaces.
+        local plugin_dir = self.plugin and self.plugin.path and tostring(self.plugin.path)
+        if plugin_dir then
+            base = plugin_dir:match("^(.*)/[^/]+$") .. "/crossdrop"
+        end
+    end
+    if not base then return nil end
+    local ok3, lfs = pcall(require, "libs/libkoreader-lfs")
+    if ok3 and lfs and type(lfs.mkdir) == "function" then
+        pcall(lfs.mkdir, base)
+    end
+    return base .. "/collections.json"
+end
+
+function HomeDialog:loadCollections()
+    local path = self:getCollectionsPath()
+    local ok, lfs = pcall(require, "libs/libkoreader-lfs")
+    if not ok or not lfs or not lfs.attributes then return {} end
+    if lfs.attributes(path, "mode") ~= "file" then return {} end
+    local file = io.open(path, "r")
+    if not file then return {} end
+    local content = file:read("*a")
+    file:close()
+    if not content or content == "" then return {} end
+    local ok, data = pcall(require("json").decode, content)
+    if ok and type(data) == "table" then return data end
+    return {}
+end
+
+function HomeDialog:saveCollections(collections)
+    local path = self:getCollectionsPath()
+    local content = require("json").encode(collections)
+    local file = io.open(path, "w")
+    if file then
+        file:write(content)
+        file:close()
+    end
+end
+
+-- Collections tab handlers
+function HomeDialog:openCollectionCreateName()
+    self.collections_screen = "create_name"
+    self.collections_new_name = ""
+    self:refresh()
+end
+
+function HomeDialog:openCollectionCreateSelect()
+    self.collections_screen = "create_select"
+    self.collections_new_picked = {}
+    self.collections_page = nil
+    self:refresh()
+end
+
+function HomeDialog:openCollectionView(coll)
+    self.collections_screen = "view"
+    self.collections_view = coll
+    self:refresh()
+end
+
+function HomeDialog:openCollectionEdit(coll)
+    self.collections_screen = "edit"
+    self.collections_edit = coll
+    self.collections_edit_picked = {}
+    self.collections_page = nil
+    for _, b in ipairs(coll.books) do
+        self.collections_edit_picked[b.path] = true
+    end
+    self:refresh()
+end
+
+function HomeDialog:openCollectionSend(coll)
+    self.collections_screen = "send"
+    self.collections_send = coll
+    -- Fresh folder tree under the send CTA, exactly like the Send tab's
+    -- destination picker (re-lists the reader root each open).
+    self:ensureDestBrowser()
+    self:refresh()
+end
+
+-- Collections render functions
+function HomeDialog:renderCollectionView(area_h)
+    local vg = VerticalGroup:new{ align = "left" }
+    local sc = function(v) return Device.screen:scaleBySize(v) end
+    local coll = self.collections_view
+    if not coll then return self:renderCollectionsLanding() end
+
+    table.insert(vg, self:screenTitle(coll.name, function() self:collectionsBackOneStep() end))
+    table.insert(vg, VerticalSpan:new{ width = sc(10) })
     table.insert(vg, TextBoxWidget:new{
-        text = _("To receive files, set up your Xteink device like this:\n")
-            .. _("1. Put the Xteink and this Kindle on the same Wi-Fi network.\n")
-            .. _("2. With CrossPoint running on the Xteink, open File Transfer and tap \"Join WiFi Network\".\n")
-            .. _("3. On that screen, the device's IP address is below the QR code.\n")
-            .. _("4. Tap \"Set WiFi IP\" to enter that address.\n")
-            .. _("5. Then tap the connection row above to check \226\128\148 it should read \"Reachable\" when connected.\n")
-            .. _("6. Send from the Send A File tab: pick files from the list, or send the currently open file. Pick the destination folder there too \226\128\148 it defaults to CrossDropped Files on the reader.\n")
-            .. _("7. Wi-Fi routers can hand the reader a new address from time to time. If you run into any connection issue, it may be because the IP has changed \226\128\148 check it on the reader's Join Network screen and update it with \"Set WiFi IP\"."),
+        text = string.format(_("%d book(s) in this collection"), #coll.books),
         face = Font:getFace("xx_smallinfofont"),
         width = self.row_w,
     })
+    table.insert(vg, VerticalSpan:new{ width = sc(8) })
+
+    -- The book list is the send picker's: bare boxless rows at one font size,
+    -- separated by hairlines — the books must not read as boxes, and every
+    -- row is the same size, exactly like Send A File.
+    for i, book in ipairs(coll.books) do
+        local name = book.name or book.path:match("([^/]+)$") or book.path
+        local size = book.size or 0
+        local meta = string.format("%.1f MB", math.max(size, 0) / 1048576)
+            .. _("  \226\128\148 in this collection")
+        table.insert(vg, self:bookRow(name .. "\n" .. meta, {
+            callback = function() end,
+        }))
+        if i < #coll.books then table.insert(vg, self:separator()) end
+    end
+
+    table.insert(vg, VerticalSpan:new{ width = sc(18) })
+    table.insert(vg, self:row(_("Send Collection"), {
+        callback = function() self:openCollectionSend(coll) end,
+    }))
+    table.insert(vg, self:row(_("Edit Collection"), {
+        callback = function() self:openCollectionEdit(coll) end,
+    }))
+    table.insert(vg, self:row(_("Rename Collection"), {
+        callback = function() self:renameCollection(coll) end,
+    }))
+    table.insert(vg, self:row(_("Delete Collection"), {
+        callback = function() self:confirmDeleteCollection(coll) end,
+    }))
+    table.insert(vg, self:row(_("Back"), {
+        callback = function() self.collections_screen = nil; self:refresh() end,
+    }))
 
     return vg
+end
+
+function HomeDialog:renderCollectionEdit(area_h)
+    return self:renderCollectionBookPicker(area_h, "edit")
+end
+
+-- Shared paged book-chooser behind the create-select and edit screens,
+-- laid out like the Send tab's picker: a fixed row of actions at the TOP
+-- (the save/keep path must never scroll off a long list), the paged book
+-- list below, and a pager strip strapped to the bottom. Rows-per-page is
+-- MEASURED from one real row against this exact layout (the picker's
+-- recipe) — never a fixed count, so any screen height just works.
+function HomeDialog:renderCollectionBookPicker(area_h, mode)
+    local vg = VerticalGroup:new{ align = "left" }
+    local sc = function(v) return Device.screen:scaleBySize(v) end
+    local h_of = function(w)
+        local s = w.getSize and w:getSize()
+        return (s and s.h) or 0
+    end
+    local edit = mode == "edit"
+    local coll = edit and self.collections_edit or nil
+    local picked = edit and self.collections_edit_picked or self.collections_new_picked
+    if not picked then
+        picked = {}
+        if edit then self.collections_edit_picked = picked
+        else self.collections_new_picked = picked end
+    end
+    local books = self:getAllBooks() or {}
+    local page = self.collections_page or 1
+    local max_page = 1
+
+    local function setEnabled(btn, enabled)
+        if btn and btn.enableDisable then
+            btn:enableDisable(enabled)
+        elseif btn then
+            btn.disabled = not enabled
+        end
+    end
+
+    -- Action rows use the picker's Button recipe (menu_style would force
+    -- align = "left" AND clobber the colors).
+    local function action(text, opts)
+        opts = opts or {}
+        return Button:new{
+            text = text,
+            width = self.row_w,
+            align = "left",
+            bordersize = Size.border.button,
+            radius = Size.radius.button - 1,
+            avoid_text_truncation = false,
+            padding_h = Size.padding.large,
+            text_font_face = "smallinfofont",
+            text_font_size = 22,
+            text_font_bold = opts.bold == true,
+            background = opts.background,
+            text_font_color = opts.text_color,
+            callback = opts.callback,
+        }
+    end
+
+    -- Book rows are the SEND PICKER'S row recipe verbatim (see
+    -- HomeDialog:bookRow): bare borderless text separated by hairlines below,
+    -- one font size for every row — so the collection chooser reads exactly
+    -- like Send A File. Picked books fill LightGray the same way the send
+    -- picker highlights picked rows.
+
+    local function showGotoPage()
+        if max_page <= 1 then return end
+        local ok, SpinWidget = pcall(require, "ui/widget/spinwidget")
+        if not ok or not SpinWidget then return end
+        UIManager:show(SpinWidget:new{
+            title_text = _("Go to page"),
+            value = page,
+            value_min = 1,
+            value_max = max_page,
+            ok_text = _("Go"),
+            callback = function(spin)
+                if spin and spin.value and spin.value ~= page then
+                    self.collections_page = spin.value
+                    self:refresh()
+                end
+            end,
+        })
+    end
+
+    -- Page N of M (tap = spin-to-page) flanked by chevrons, mirrors the
+    -- picker's buildPager. Closures read the render-time `page`/`max_page`.
+    local function buildPager()
+        local prev_btn = Button:new{
+            icon = "chevron.left",
+            icon_width = sc(24),
+            icon_height = sc(24),
+            width = sc(48),
+            height = sc(48),
+            bordersize = 0,
+            background = nil,
+            allow_flash = false,
+            show_parent = self,
+            callback = function()
+                self.collections_page = math.max(1, page - 1)
+                self:refresh()
+            end,
+        }
+        setEnabled(prev_btn, page > 1)
+        local page_btn = Button:new{
+            text = string.format(_("Page %d of %d"), page, math.max(1, max_page)),
+            width = sc(140),
+            height = sc(48),
+            bordersize = 0,
+            radius = Size.radius.button - 1,
+            background = nil,
+            align = "center",
+            text_font_face = "smallinfofont",
+            text_font_size = 18,
+            allow_flash = false,
+            show_parent = self,
+            callback = showGotoPage,
+        }
+        local next_btn = Button:new{
+            icon = "chevron.right",
+            icon_width = sc(24),
+            icon_height = sc(24),
+            width = sc(48),
+            height = sc(48),
+            bordersize = 0,
+            background = nil,
+            allow_flash = false,
+            show_parent = self,
+            callback = function()
+                self.collections_page = math.min(max_page, page + 1)
+                self:refresh()
+            end,
+        }
+        setEnabled(next_btn, page < max_page)
+        return CenterContainer:new{
+            dimen = Geom:new{ w = self.row_w, h = sc(48) },
+            HorizontalGroup:new{
+                prev_btn,
+                HorizontalSpan:new{ width = sc(24) },
+                page_btn,
+                HorizontalSpan:new{ width = sc(24) },
+                next_btn,
+            },
+        }
+    end
+
+    local selected = 0
+    for _, b in ipairs(books) do
+        if picked[b.path] then selected = selected + 1 end
+    end
+
+    -- The fixed top block: title, the action rows (primary, others, exit),
+    -- then a live hint line under a hairline.
+    local fixed = {}
+    if edit then
+        fixed[#fixed + 1] = self:screenTitle(
+            (_("Edit: ") .. (coll and coll.name or "")),
+            function() self:collectionsBackOneStep() end)
+    else
+        fixed[#fixed + 1] = self:screenTitle(
+            (_("Add Books to: ") .. (self.collections_new_name or "")),
+            function() self:collectionsBackOneStep() end)
+    end
+    fixed[#fixed + 1] = self:separator()
+    if edit then
+        fixed[#fixed + 1] = action(_("Save Changes"), {
+            bold = true,
+            background = Blitbuffer.COLOR_DARK_GRAY,
+            text_color = Blitbuffer.COLOR_WHITE,
+            callback = function() self:saveCollectionEdit(coll) end,
+        })
+        fixed[#fixed + 1] = self:separator()
+    else
+        fixed[#fixed + 1] = action(_("Save And Send"), {
+            bold = true,
+            background = Blitbuffer.COLOR_DARK_GRAY,
+            text_color = Blitbuffer.COLOR_WHITE,
+            callback = function() self:saveCollectionAndSend() end,
+        })
+        fixed[#fixed + 1] = self:separator()
+        fixed[#fixed + 1] = action(_("Save And Return To Collections"), {
+            callback = function() self:saveCollectionAndReturn() end,
+        })
+        fixed[#fixed + 1] = self:separator()
+    end
+    fixed[#fixed + 1] = action(_("Exit"), {
+        callback = function() self.collections_screen = nil; self:refresh() end,
+    })
+    fixed[#fixed + 1] = self:separator()
+    fixed[#fixed + 1] = TextBoxWidget:new{
+        text = string.format(_("%d book(s) \226\128\148 tap a name to toggle; %d selected"),
+            #books, selected),
+        face = Font:getFace("smallinfofont"),
+        width = self.row_w,
+    }
+    fixed[#fixed + 1] = self:separator()
+
+    -- Rows-per-page MEASURED against this exact layout, the picker's recipe
+    -- (TWO-line probe, exactly like the send picker's row_h measurement).
+    local row_h = h_of(self:bookRow("probe\nprobe", { bordersize = 0 }))
+    local sep_h = h_of(self:separator())
+    local pager_h = h_of(buildPager()) -- max_page still 1 here; text height is the same
+    local pager = nil
+    local top_h = 0
+    for _, w in ipairs(fixed) do top_h = top_h + h_of(w) end
+    local content_h = area_h or self.content_h
+        or math.floor(Device.screen:getHeight() - Size.padding.default * 2)
+    local avail = math.max(0, content_h - top_h - sep_h - pager_h)
+    local rpp = math.max(1, math.floor((avail + sep_h) / math.max(row_h + sep_h, 1)))
+    max_page = math.max(1, math.ceil(#books / rpp))
+    if page > max_page then page = max_page; self.collections_page = page end
+    pager = buildPager()
+    local lo = (page - 1) * rpp + 1
+    local hi = math.min(#books, page * rpp)
+
+    -- Book list re-slices on every refresh, so the toggled LightGray
+    -- highlight (and the "N selected" hint) repaint immediately.
+    for _, w in ipairs(fixed) do table.insert(vg, w) end
+
+    if #books == 0 then
+        table.insert(vg, TextBoxWidget:new{
+            text = _("No books found on this device."),
+            face = Font:getFace("smallinfofont"),
+            width = self.row_w,
+        })
+        table.insert(vg, VerticalSpan:new{ width = math.max(0, avail) })
+    else
+        for i = lo, hi do
+            local book = books[i]
+            local book_picked = picked[book.path]
+            local size = book.size or 0
+            local meta = string.format("%.1f MB", math.max(size, 0) / 1048576)
+                .. (book_picked and _("  \226\128\148 in collection, tap to remove")
+                    or _("  \226\128\148 tap to add"))
+            table.insert(vg, self:bookRow(
+                (book.title or book.name or book.path:match("([^/]+)$") or book.path) .. "\n" .. meta, {
+                bordersize = 0,
+                background = book_picked and Blitbuffer.COLOR_LIGHT_GRAY or nil,
+                callback = function()
+                    picked[book.path] = not book_picked
+                    self:refresh()
+                end,
+            }))
+            if i < hi then table.insert(vg, self:separator()) end
+        end
+        local rows_h = (hi - lo + 1) * row_h + math.max(0, hi - lo) * sep_h
+        local filler = math.floor(math.max(0, avail - rows_h))
+        if filler > 0 then table.insert(vg, VerticalSpan:new{ width = filler }) end
+        table.insert(vg, pager)
+    end
+
+    return vg
+end
+
+function HomeDialog:renderCollectionCreateName(area_h)
+    local vg = VerticalGroup:new{ align = "left" }
+    local sc = function(v) return Device.screen:scaleBySize(v) end
+
+    table.insert(vg, self:screenTitle(_("Create Collection"), function() self:collectionsBackOneStep() end))
+    table.insert(vg, VerticalSpan:new{ width = sc(10) })
+    table.insert(vg, TextBoxWidget:new{
+        text = _("Enter a name for your new collection:"),
+        face = Font:getFace("xx_smallinfofont"),
+        width = self.row_w,
+    })
+    table.insert(vg, VerticalSpan:new{ width = sc(10) })
+
+    -- Input field using a button that opens the dialog. The dialog mirrors
+    -- the device-proven IP/folder dialogs exactly: modal = true (the
+    -- dashboard is itself a modal full-screen dialog, and UIManager stacks a
+    -- NON-modal InputDialog BELOW it, so it would paint behind the card and
+    -- only surface after leaving CrossDrop), input = initial text, Save/Cancel
+    -- buttons as a ButtonTable (a button-less ButtonTable ships OK/Cancel
+    -- with nil callbacks — tapping one crashed the panel once).
+    table.insert(vg, self:row(_("Tap to enter name") .. (self.collections_new_name and ("  \226\128\162  " .. self.collections_new_name) or ""), {
+        callback = function()
+            local input_widget
+            local function done()
+                local text = (input_widget and input_widget:getInputText()) or ""
+                local name = text:match("^%s*(.-)%s*$") or ""
+                if name == "" then
+                    UIManager:show(Notification:new{ text = _("Enter a name for your collection first."), timeout = 3 })
+                    return
+                end
+                UIManager:close(input_widget)
+                -- Close → re-init must not run inside the tap handler (the
+                -- panel froze once from that).
+                UIManager:nextTick(function()
+                    self.collections_new_name = name
+                    self:openCollectionCreateSelect()
+                end)
+            end
+            input_widget = InputDialog:new{
+                title = _("Collection Name"),
+                input = self.collections_new_name or "",
+                type = "text",
+                modal = true,
+                buttons = {
+                    {
+                        {
+                            text = _("Save"),
+                            is_enter_default = true,
+                            callback = done,
+                        },
+                    },
+                    {
+                        {
+                            text = _("Cancel"),
+                            callback = function() UIManager:close(input_widget) end,
+                        },
+                    },
+                },
+            }
+            UIManager:show(input_widget)
+        end,
+    }))
+
+    return vg
+end
+
+function HomeDialog:renderCollectionCreateSelect(area_h)
+    return self:renderCollectionBookPicker(area_h, "create")
+end
+
+function HomeDialog:renderCollectionSend(area_h)
+    local vg = VerticalGroup:new{ align = "left" }
+    local sc = function(v) return Device.screen:scaleBySize(v) end
+    local coll = self.collections_send
+    if not coll then return self:renderCollectionsLanding() end
+    local h_of = function(w)
+        local s = w.getSize and w:getSize()
+        return (s and s.h) or 0
+    end
+
+    -- The send control below the tree, styled like the Send tab picker's
+    -- primary button (dark bold row reading "Send to Xteink … send N
+    -- book(s) now"): the destination browser above IS the destination
+    -- selection (pick a listed folder, or create one via its folder menu).
+    local send_cta = self:row(
+        string.format(_("Send to Xteink  \226\128\162  send %d book(s) now"), #coll.books), {
+        bold = true,
+        background = Blitbuffer.COLOR_DARK_GRAY,
+        text_color = Blitbuffer.COLOR_WHITE,
+        callback = function() self:sendCollection(coll) end,
+    })
+    local cancel_row = self:row(_("Cancel"), {
+        callback = function() self.collections_screen = nil; self:refresh() end,
+    })
+    local spacer = VerticalSpan:new{ width = sc(10) }
+    local below = VerticalGroup:new{ align = "left", spacer, send_cta, cancel_row }
+    local below_h = h_of(below)
+    local top = self:screenTitle(_("Send: ") .. coll.name, function() self:collectionsBackOneStep() end)
+    local top_h = h_of(top) + sc(10)
+
+    local tree_h = math.max(0, (area_h or self.content_h) - top_h - below_h)
+    self:ensureDestBrowser()
+    table.insert(vg, top)
+    table.insert(vg, VerticalSpan:new{ width = sc(10) })
+    self.dest_browser:renderInto(vg, self.row_w, tree_h)
+    table.insert(vg, spacer)
+    table.insert(vg, send_cta)
+    table.insert(vg, cancel_row)
+
+    return vg
+end
+
+-- Collections helper methods
+function HomeDialog:getAllBooks()
+    -- The SAME on-device library the Send tab lists (epub/xtc/xtch/txt/bmp
+    -- on this Kindle), so the pick set a user assembles here is exactly the
+    -- set they can send. Listing the READER's card instead was wrong: with no
+    -- reachable reader this returned {} and the select screen offered no
+    -- books at all. ensureReady paints its "Scanning…" notice first (paint
+    -- progress, then block) and caches the scan for the Home's lifetime.
+    local picker = self.send_picker
+    if not picker then
+        picker = pickerModule():new{ plugin = self.plugin, home = self }
+        self.send_picker = picker
+    end
+    if not picker.books then
+        pcall(function() picker:ensureReady() end)
+    end
+    return picker.books or {}
+end
+
+function HomeDialog:saveCollectionEdit(coll)
+    local collections = self:loadCollections()
+    local new_books = {}
+    local library = self:getAllBooks() or {}
+    for path, picked in pairs(self.collections_edit_picked or {}) do
+        if picked then
+            -- Find the book info in the ON-DEVICE LIBRARY, never in the
+            -- collection's own stale books list: books added during this
+            -- edit are new to the collection, so a lookup against
+            -- coll.books silently dropped every one of them.
+            for _, b in ipairs(library) do
+                if b.path == path then
+                    table.insert(new_books, { path = b.path, name = b.name })
+                    break
+                end
+            end
+        end
+    end
+    coll.books = new_books
+    for i, c in ipairs(collections) do
+        if c.name == coll.name then
+            collections[i] = coll
+            break
+        end
+    end
+    self:saveCollections(collections)
+    self.collections_screen = nil
+    self:refresh()
+end
+
+function HomeDialog:saveCollectionAndSend()
+    -- Paint progress, then block: paint the collections LANDING holding a
+    -- "Please wait while the collection is created\226\128\166" message FIRST
+    -- (defer via refresh + nextTick; the tap handler must not block with
+    -- nothing painted). The save plus openCollectionSend's reader-folder
+    -- listing then run under the wait message, and the final refresh replaces
+    -- it with the send screen.
+    self.collections_waiting = true
+    self.collections_screen = nil
+    self:refresh()
+    UIManager:nextTick(function()
+        local collections = self:loadCollections()
+        local new_books = {}
+        for path, picked in pairs(self.collections_new_picked or {}) do
+            if picked then
+                -- Find the book info from all_books
+                for _, b in ipairs(self:getAllBooks()) do
+                    if b.path == path then
+                        table.insert(new_books, { path = b.path, name = b.name })
+                        break
+                    end
+                end
+            end
+        end
+        local new_coll = {
+            name = self.collections_new_name,
+            books = new_books,
+        }
+        table.insert(collections, new_coll)
+        self:saveCollections(collections)
+        self.collections_new_name = nil
+        self.collections_new_picked = nil
+        self.collections_page = nil
+        self.collections_waiting = nil
+        self:openCollectionSend(new_coll)
+    end)
+end
+
+function HomeDialog:saveCollectionAndReturn()
+    -- Same paint-progress-then-block recipe as saveCollectionAndSend: paint
+    -- the collections landing with the "Please wait\226\128\166" message, then
+    -- save in a nextTick, then refresh so the landing lists the new
+    -- collection and the message disappears.
+    self.collections_waiting = true
+    self.collections_screen = nil
+    self:refresh()
+    UIManager:nextTick(function()
+        local collections = self:loadCollections()
+        local new_books = {}
+        for path, picked in pairs(self.collections_new_picked or {}) do
+            if picked then
+                for _, b in ipairs(self:getAllBooks()) do
+                    if b.path == path then
+                        table.insert(new_books, { path = b.path, name = b.name })
+                        break
+                    end
+                end
+            end
+        end
+        local new_coll = {
+            name = self.collections_new_name,
+            books = new_books,
+        }
+        table.insert(collections, new_coll)
+        self:saveCollections(collections)
+        self.collections_new_name = nil
+        self.collections_new_picked = nil
+        self.collections_page = nil
+        self.collections_waiting = nil
+        self:refresh()
+    end)
+end
+
+function HomeDialog:renameCollection(coll)
+    local input_widget
+    local function done()
+        local text = (input_widget and input_widget:getInputText()) or ""
+        local name = text:match("^%s*(.-)%s*$") or ""
+        if name ~= "" and name ~= coll.name then
+            local collections = self:loadCollections()
+            for i, c in ipairs(collections) do
+                if c.name == coll.name then
+                    collections[i].name = name
+                    break
+                end
+            end
+            self:saveCollections(collections)
+        end
+        UIManager:close(input_widget)
+        -- Back to the list (the view screen kept the pre-rename object); the
+        -- close → re-init chain is nextTick'd, never run in the tap handler.
+        UIManager:nextTick(function()
+            self.collections_screen = "list"
+            self.collections_view = nil
+            self:refresh()
+        end)
+    end
+    input_widget = InputDialog:new{
+        title = _("Rename Collection"),
+        input = coll.name,
+        type = "text",
+        modal = true,
+        buttons = {
+            {
+                {
+                    text = _("Save"),
+                    is_enter_default = true,
+                    callback = done,
+                },
+            },
+            {
+                {
+                    text = _("Cancel"),
+                    callback = function() UIManager:close(input_widget) end,
+                },
+            },
+        },
+    }
+    UIManager:show(input_widget)
+end
+
+function HomeDialog:confirmDeleteCollection(coll)
+    local confirm = ConfirmBox:new{
+        text = string.format(_("Delete collection \"%s\"?"), coll.name),
+        ok_text = _("Delete"),
+        ok_callback = function()
+            UIManager:close(confirm)
+            self:deleteCollection(coll)
+        end,
+    }
+    UIManager:show(confirm)
+end
+
+function HomeDialog:deleteCollection(coll)
+    local collections = self:loadCollections()
+    local new_collections = {}
+    for _, c in ipairs(collections) do
+        if c.name ~= coll.name then
+            table.insert(new_collections, c)
+        end
+    end
+    self:saveCollections(new_collections)
+    self.collections_screen = nil
+    self:refresh()
+end
+
+function HomeDialog:sendCollection(coll)
+    local paths = {}
+    for _, b in ipairs(coll.books) do
+        table.insert(paths, b.path)
+    end
+    self.collections_screen = nil
+    self:refresh()
+    self.plugin:sendBooks(paths, self)
 end
 
 -- ─────────────────────────── Send tab ───────────────────────────────────
@@ -1346,13 +2738,20 @@ end
 
 function DestinationDialog:foldersHeader(text)
     local sc = function(v) return Device.screen:scaleBySize(v) end
+    -- max_width keeps a long title from painting past its card and off the
+    -- right edge of the screen (TextWidget would otherwise spill unclipped).
+    -- padding_left/right = 0: the device FrameContainer default padding would
+    -- add sc(5) each side on top of max_width, pushing the frame past the card.
     return FrameContainer:new{
         padding_top = sc(6),
         padding_bottom = sc(2),
+        padding_left = 0,
+        padding_right = 0,
         bordersize = 0,
         TextWidget:new{
             text = text,
             face = Font:getFace("smallinfofont"),
+            max_width = self.row_w or 600,
         },
     }
 end
@@ -1553,6 +2952,33 @@ function FolderMenuDialog:onBack()
     return true
 end
 
+function HomeDialog:ensureDestBrowser()
+    -- One root folder-tree refresh shared by every entry point that opens the
+    -- destination browser (HomeDialog:chooseDestination on the Send tab and
+    -- HomeDialog:openCollectionSend when sending a collection). Lists the
+    -- reader's root once (bounded by socketutil), injects the nodes, and
+    -- clears the stale page/rows-per-page so the next render measures fresh.
+    -- Unreachable reader -> nodes stay nil and the tree shows ONLY the
+    -- "Device not found…" message (list_err).
+    if not self.dest_browser then
+        self.dest_browser = DestinationDialog:new{ plugin = self.plugin, home = self }
+    end
+    local target = self.plugin:resolveTarget()
+    local ok, folders = self.plugin:listFolders(target)
+    local nodes
+    if ok and folders then
+        nodes = {}
+        for _, name in ipairs(folders) do
+            nodes[#nodes + 1] = new_node(name, name, 0)
+        end
+    end
+    self.dest_browser.nodes = nodes
+    self.dest_browser.list_err = not ok
+    self.dest_browser.page = nil
+    self.dest_browser.rows_per_page = nil
+    return self.dest_browser
+end
+
 -- Choose the destination: the folder tree opens INSIDE the Send tab (below
 -- the brand header and tabs), never as a stacked full-screen dialog. The
 -- root listing is one bounded attempt (socketutil); if the reader does not
@@ -1571,27 +2997,7 @@ function HomeDialog:chooseDestination()
         })
         return
     end
-    local ok, folders = self.plugin:listFolders(target)
-    local nodes
-    if ok and folders then
-        nodes = {}
-        for _, name in ipairs(folders) do
-            nodes[#nodes + 1] = new_node(name, name, 0)
-        end
-    end
-    if self.dest_browser then
-        self.dest_browser.nodes = nodes
-        self.dest_browser.list_err = not ok
-        self.dest_browser.page = nil
-        self.dest_browser.rows_per_page = nil
-    else
-        self.dest_browser = DestinationDialog:new{
-            plugin = self.plugin,
-            home = self,
-            nodes = nodes,
-            list_err = not ok,
-        }
-    end
+    self:ensureDestBrowser()
     self.tab = "send"
     self.send_screen = "destination"
     self:refresh()
@@ -1623,7 +3029,22 @@ end
 -- as chooseDestination: one flashless "ui" pass, no notice.
 function HomeDialog:openDeleteTree()
     local InfoMessage = require("ui/widget/infomessage")
-    local target = self.plugin:resolveTarget()
+    -- Try all configured targets (stored device + manual WiFi), use first reachable
+    local targets = self.plugin:configuredTargets() or {}
+    local target = nil
+    for _, t in ipairs(targets) do
+        if t.kind == "wifi" and t.ip and t.ip ~= "" then
+            local ok = self.plugin:probeTarget(t)
+            if ok then
+                target = t
+                break
+            end
+        end
+    end
+    if not target then
+        -- No reachable target: fall back to first configured target for the error message
+        target = targets[1]
+    end
     if not target or not target.ip or target.ip == "" then
         UIManager:show(InfoMessage:new{
             text = _("Set the WiFi IP on the Connections tab first."),

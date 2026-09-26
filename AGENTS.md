@@ -107,5 +107,9 @@ Hard-won device lessons (KPW5SE, KOReader 2026.07.2):
   that field); the picker's picked set is named `picked`.
 - `UIManager:replace` does not exist in this KOReader build — re-init the
   same widget in place instead.
-- **WiFi only** — `configuredTargets()` returns exactly one `wifi` target
-  whose `ip` is `""` until the user sets it (probe answers "not set").
+- **WiFi only** — `configuredTargets()` always returns the manual "Set WiFi
+  IP" `wifi` target (`ip` is `""` until the user sets it — probe answers
+  "not set"). A selected Stored Device is ALSO returned (leading the list,
+  `selected = true`), so `resolveTarget()` prefers it for sends while the
+  connection-test row shows and probes every returned target: the first that
+  answers wins the status word.

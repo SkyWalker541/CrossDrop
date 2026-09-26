@@ -72,6 +72,16 @@ local VerticalSpan = require("ui/widget/verticalspan")
 local _ = require("gettext")
 local logger = require("logger")
 
+-- UTF-8 named constants (shared with main.lua for readability)
+local ELLIPSIS = "…"
+local EM_DASH = "—"
+local ARROW = "→"
+local BULLET = "•"
+local LDQUO = "“"
+local RDQUO = "”"
+local LSQUO = "‘"
+local RSQUO = "’"
+
 local lfs_ok, lfs = pcall(require, "libs/libkoreader-lfs")
 
 -- Where this module lives on disk: used for the durable title cache next to
@@ -96,6 +106,17 @@ end
 local SUPPORTED_EXT = {
     epub = true, xtc = true, xtch = true, txt = true, bmp = true,
 }
+
+-- Filenames that are never a book, however the extension sorts them: the
+-- KOReader crash log (crash.log, crash.log.1, …) and Kindle's KPPMainApp
+-- auto-generated blobs (KPPMainApp.*, KPPMain*). Matched on the LOWERCASED
+-- basename, so a real ebook or a user's own text file is never caught — only
+-- these two concrete auto-artifact families.
+local function isExcludedName(entry)
+    local lo = entry:lower()
+    return lo == "crash.log" or lo:match("^crash%.log%.")
+        or lo:match("^kppm")
+end
 
 -- Directory names never descended into: the KOReader install itself and the
 -- Kindle system/content dirs hold no sendable books (and walking them is
@@ -201,7 +222,7 @@ function PickerDialog:scanAllBooks(root)
                     elseif attr.mode == "file" then
                         local ext = entry:match("%.([^.]+)$")
                         ext = ext and ext:lower() or nil
-                        if ext and SUPPORTED_EXT[ext] then
+                        if ext and SUPPORTED_EXT[ext] and not isExcludedName(entry) then
                             local b = { name = entry, path = fp, ext = ext, size = attr.size or 0 }
                             self:titleFor(b)
                             out[#out + 1] = b
@@ -231,7 +252,7 @@ function PickerDialog:cleanTitle(name)
     t = t:gsub("_", " ")
     t = t:gsub("%s+", " ")
     -- Anna's Archive (straight or curly apostrophe) + tails
-    local APOSTROPHES = "'" .. string.char(226, 128, 152, 226, 128, 153)
+    local APOSTROPHES = "'" .. LSQUO .. RSQUO
     t = t:gsub("Anna[" .. APOSTROPHES .. "]s Archive", " ")
     t = t:gsub("%s+[Oo]ptimized%s*", " ")
     t = t:gsub("[Ii][Ss][Bb][Nn]13[%s%-]*%d%d%d%d%d%d%d%d%d?%d?%d?%s*", " ")
