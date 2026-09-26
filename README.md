@@ -10,40 +10,38 @@ Wi-Fi — no cable, no cloud.
 ## What it does
 
 - A full-screen CrossDrop dashboard (**Connections** / **Send A File** /
-  **Delete Files**) inside KOReader's Tools menu.
+  **Collections** / **Delete Files**) inside KOReader's Tools menu.
 - **Send A File** scans your device and lists only what the reader can
   actually open — **EPUB, XTC/XTCH, TXT, and BMP** (case-insensitive): search
   and multi-pick from the list, or send the file you're currently reading.
+- **Collections** tab: create named collections, add/remove books, send a
+  whole collection at once.
 - **Delete Files** is its own tab on purpose: deleting never lives among the
   send controls. It browses the reader as the same folder tree (files and
   folders), asks **"Delete file?"** / **"Delete folder and its contents?"**
   first, then removes it — a folder that still holds anything is purged
   depth-first first (the reader's WebDAV DELETE does not recurse), and the
   tree refreshes in place.
-- Books land in a **destination folder** on the reader. The destination picker
-  is a folder **tree**: tap a folder's ▸/▾ to scan its subfolders — they appear
-  indented right below it, and every other folder stays visible; tap a folder's
-  name for **Select / Create Subfolder / Cancel**. A new subfolder is picked
-  right away and is created on the reader when the books are sent (WebDAV
-  MKCOL, at any nesting depth). Nothing chosen = the **CrossDropped Files**
-  default, created automatically on the first send.
+- **Instructions** page: step-by-step setup guide accessible from the
+  Connections tab, with a back button to return.
+- **visibleTextOffset sync**: precise read-position restore on the reader
+  using the same ParagraphStreamer logic as CrossPoint's KoSync (spine +
+  visibleTextOffset in progress.bin).
 - A "… please wait" screen while a file streams, and a toast when it lands.
   There's deliberately no progress bar: the transfer drains faster than
   e-ink can repaint.
 
 ## Screenshots
 
-The three tabs of the dashboard:
+### The four tabs of the dashboard:
 
-| **Connections** — set the reader's IP, check it reads Reachable | **Send A File** — pick files and the destination folder | **Delete Files** — its own screen, away from the send controls |
-|:---:|:---:|:---:|
-| <img src="screenshots/connections-tab.png" width="280" alt="The Connections tab: WiFi row, Set WiFi IP, first-run setup guide" /> | <img src="screenshots/send-a-file-tab.png" width="280" alt="The Send A File tab: Click Here To Select File(s) and the Destination folder row" /> | <img src="screenshots/delete-files-tab.png" width="280" alt="The Delete Files tab: browse the reader and pick things to delete" /> |
-
-The two browsers, one visual language:
-
-| **Send A File** — only files the reader can open, searchable and paged | **Delete Folders/Files** — the same folder tree, with a confirmation before anything dies |
+| **Connections** — set the reader's IP, check it reads Reachable | **Send A File** — pick files and the destination folder |
 |:---:|:---:|
-| <img src="screenshots/file-picker.png" width="360" alt="The file picker: 36 files listed, Search files, Page 1 of 4 with Next page" /> | <img src="screenshots/delete-tree.png" width="360" alt="The delete tree: folders and files inline under Books, Page 1 of 2 with Next page" /> |
+| <img src="koreader-plugin/crossdrop.koplugin/assets/Connections Tab.png" width="320" alt="The Connections tab: WiFi row, Set WiFi IP, Stored Devices, Instructions button" /> | <img src="koreader-plugin/crossdrop.koplugin/assets/Send A File Tab.png" width="320" alt="The Send A File tab: file list, search, destination folder row" /> |
+
+| **Collections** — create, manage, and send collections | **Delete Files** — its own screen, away from the send controls |
+|:---:|:---:|
+| <img src="koreader-plugin/crossdrop.koplugin/assets/Collections Tab.png" width="320" alt="The Collections tab: create, view, edit, send collections" /> | <img src="koreader-plugin/crossdrop.koplugin/assets/Delete Files Tab.png" width="320" alt="The Delete Files tab: folder tree, files inline, paged" /> |
 
 ## Setup
 
@@ -55,6 +53,21 @@ The two browsers, one visual language:
 3. Open **Tools → CrossDrop → Connections → Set WiFi IP…** and enter the
    reader's IP. Tap the **WiFi** row to check it reads **Reachable**.
 4. Use the **Send A File** tab to pick files and choose a destination folder.
+
+## What's new in 2.0.0
+
+- **Instructions page** — dedicated guide with scrollable text and back button
+- **visibleTextOffset sync** — precise read-position restore using the same
+  ParagraphStreamer logic as CrossPoint's KoSync
+- **4-tab dashboard** — Connections, Send A File, Collections, Delete Files
+- **Collections tab** — create, manage, and send named collections
+- **Row label update**: "Set WiFi IP (may change)" clarifies dynamic vs fixed IP
+- **Guide text updated** — Steps 4 & 7 distinguish dynamic IP vs router-fixed Stored Devices
+- **Scrollable Instructions page** — no more overflow on small screens
+- **Widget dedup** — shared `crossdrop_widgets.lua` for separator/caption/menuRow
+- **Deduped position sync** — single `maybeSyncPosition()` method
+- **Lua scoping fix** — `visibleModule()` declared before use
+- All 470 tests pass, byte-identical deployments
 
 ## Build & test
 
